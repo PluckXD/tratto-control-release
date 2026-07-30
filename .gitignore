@@ -1,0 +1,15 @@
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*.tmp
+*.key
+*.pem
+*.p12
+*.pfx
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+artifacts/
+dist/
+
