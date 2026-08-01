@@ -13,7 +13,9 @@ import sys
 import tarfile
 from pathlib import Path
 
+import component_manifest as COMPONENT
 import control_ops_tree as TREE
+import runtime_policy as RUNTIME
 
 
 HERE = Path(__file__).resolve().parent
@@ -78,6 +80,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--archive", required=True, type=Path)
     parser.add_argument("--approval", required=True, type=Path)
+    parser.add_argument("--runtime-policy", required=True, type=Path)
     parser.add_argument("--release-sha", required=True)
     parser.add_argument("--expected-sha256", required=True)
     parser.add_argument("--expected-manifest-sha256", required=True)
@@ -110,6 +113,9 @@ def main() -> int:
             args.approval,
             args.release_sha,
         )
+        runtime_policy, runtime_policy_digest = RUNTIME.load(
+            args.runtime_policy
+        )
         try:
             archive = tarfile.open(args.archive, mode="r:gz")
         except (OSError, tarfile.TarError):
@@ -120,6 +126,7 @@ def main() -> int:
         payload_paths: set[str] = set()
         records: list[tuple[str, bytes]] = []
         markers: dict[str, bytes] = {}
+        embedded_runtime_policy: bytes | None = None
         total = 0
         with archive:
             if archive.pax_headers:
@@ -176,6 +183,11 @@ def main() -> int:
                     )
                 )
                 payload_paths.add(name)
+                if (
+                    name
+                    == "release-root/policies/control-runtime-v1.json"
+                ):
+                    embedded_runtime_policy = payload
 
         if set(markers) != TREE.MARKERS:
             reject("Ops archive markers are missing or ambiguous")
@@ -202,42 +214,20 @@ def main() -> int:
             manifest,
             "Ops component manifest",
         )
-        expected_manifest_without_build = {
-            "approval_manifest_sha256": hashlib.sha256(
+        COMPONENT.validate(
+            manifest,
+            kind="ops",
+            release_sha=args.release_sha,
+            approval_manifest_sha256=hashlib.sha256(
                 approval_raw
             ).hexdigest(),
-            "artifact_kind": "tratto-control-ops",
-            "migration": approval["migration"],
-            "release_sha": args.release_sha,
-            "schema_version": 3,
-        }
-        if set(manifest) != {*expected_manifest_without_build, "build"}:
-            reject("Ops component manifest keys diverge")
-        build = manifest["build"]
-        if (
-            not isinstance(build, dict)
-            or set(build)
-            != {
-                "arch",
-                "os",
-                "python",
-                "shell",
-                "tree_digest_algorithm",
-            }
-            or build["arch"] != "x86_64"
-            or build["os"] != "Linux"
-            or build["shell"] != "bash"
-            or build["tree_digest_algorithm"] != "tratto-tree-v1"
-            or not isinstance(build["python"], str)
-            or re.fullmatch(r"3\.12\.[0-9]+", build["python"]) is None
-        ):
-            reject("Ops build/runtime contract diverges")
-        if {
-            key: value
-            for key, value in manifest.items()
-            if key != "build"
-        } != expected_manifest_without_build:
-            reject("Ops component manifest contract diverges")
+            migration=approval["migration"],
+            runtime_policy_digest=runtime_policy_digest,
+        )
+        RUNTIME.validate_embedded(
+            embedded_runtime_policy,
+            manifest["runtime_policy"]["sha256"],
+        )
         print(
             json.dumps(
                 {
@@ -255,6 +245,8 @@ def main() -> int:
         OSError,
         UnicodeDecodeError,
         APPROVAL.ApprovalError,
+        COMPONENT.ComponentManifestError,
+        RUNTIME.RuntimePolicyError,
         TREE.OpsTreeError,
     ) as error:
         print(f"Ops artifact rejected: {error}", file=sys.stderr)

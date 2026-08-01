@@ -53,6 +53,10 @@ An approval under `approvals/<release_id>.json` is accepted only when it:
 8. pins the Control and tenant-fleet migration contract, tenant catalog digest,
    fleet preflight digest, and catalog count.
 
+The production policy also binds the exact canonical
+`policies/control-runtime-v1.json` digest. An approval cannot silently select a
+different interpreter, platform, or toolchain policy.
+
 Passing JSON Schema alone never authorizes a release. The normative contract is
 the schema plus `scripts/validate-approval.py`.
 
@@ -74,12 +78,13 @@ must equal `api.commit_sha`.
 `ops.tar.gz` has `RELEASE_SHA`, `artifact-manifest.json`, and the contents of
 `ops/control` at archive root. Its component manifest uses:
 
-- `schema_version: 3`;
+- `schema_version: 4`;
 - `artifact_kind: tratto-control-ops`;
 - the approved release SHA and approval-manifest SHA-256;
 - the exact migration/fleet block from the approval;
-- build metadata for Linux/x86_64, exact observed Python 3.12.x, shell, and the
-  canonical tree-digest algorithm.
+- build metadata for Linux/x86_64, exact CPython 3.12.13, shell, and the
+  canonical tree-digest algorithm;
+- the exact `control-runtime-v1` policy digest shared with API and Web.
 
 The Ops service digest uses `tratto-tree-v1`. Paths are sorted by their UTF-8
 bytes. Directories are excluded from the digest but must exist with mode 0555.
@@ -97,13 +102,44 @@ source commits is insufficient.
 The carrier remains non-authoritative in the envelope. The signer must validate
 the canonical envelope and exact downloaded bytes before signing.
 
+## Build and runtime boundary
+
+Build provenance and runtime compatibility are separate:
+
+- API and Ops are built with exact CPython 3.12.13. The supported host ABI is
+  non-debug CPython 3.12, cache tag `cpython-312`, and SOABI
+  `cpython-312-x86_64-linux-gnu`. Safe Python patch updates within 3.12 are
+  allowed; a build-version field may never be rewritten to the host patch.
+- Builders must observe and record their real platform. Ops rejects the build
+  unless it is actually Linux x86_64 CPython 3.12.13; the isolated API and Web
+  builders must provide the equivalent attested platform checks before
+  readiness.
+- Every Control unit uses the real, non-symlink
+  `/usr/bin/python3.12`. `/usr/bin/python3` and any interpreter shipped inside
+  an artifact are outside the host trust boundary.
+- The host baseline is Ubuntu 24.04 x86_64 with glibc 2.39 or later. Python
+  metadata is checked after dropping privileges to all six users that execute
+  it: API, executor, both migrators, proxy, and Web.
+- Web is built and run with exact Node v22.22.0. The system
+  `/usr/bin/node` v20 is deliberately not used. The dedicated executable is
+  `/opt/tratto-control/toolchains/node-v22.22.0-linux-x64/bin/node`.
+- The official Node tar.xz is pinned to 30,779,824 bytes and SHA-256
+  `9aa8e9d2298ab68c600bd6fb86a6c13bce11a4eca1ba9b39d79fa021755d7c37`.
+  The sole installed `bin/node` is pinned to 123,405,064 bytes and SHA-256
+  `1bec56ef7cfa9a76f3e0b7c0a87f220eb73f23102b9c0b4c7529a3f7c3ce7c31`.
+
+The canonical host policy is installed as root:root 0444 at
+`/etc/tratto-control/runtime-policy.json`. The normative host attestor rejects
+symlinks, writable or non-traversable ancestors, hardlinks, wrong modes,
+inode/metadata changes, unexpected users, and digest or ABI drift. It hashes
+stable open file descriptors, then executes only metadata probes after
+`setpriv`; it never executes artifact interpreters as root.
+
 ## Host requirement before readiness
 
-The current host contract accepts only API/Web and installs Operations from a
-worktree in place. That is unsafe and blocks signing.
-
-The host must ingest and validate the third archive, add the following trusted
-metadata to `release.env` and `bundle.env`, and reject any mismatch:
+The synchronized host candidate must ingest and validate the third archive, add
+the following trusted metadata to `release.env` and `bundle.env`, and reject
+any mismatch:
 
 ```text
 OPS_SHA
@@ -119,6 +155,21 @@ together. Before the first `current` exists, bootstrap/stage/recovery use their
 physical validated bootstrap paths and never the intentionally unresolved Ops
 convenience link. No release path may copy or overwrite active Operations
 files.
+
+The dedicated Node toolchain must be provisioned outside a release. Verify the
+bounded official archive first, read only its exact regular `bin/node` member,
+verify the bounded binary, and publish a new root-owned version directory
+with atomic no-replace semantics. Re-running an already satisfied operation
+must be idempotent only after revalidating the existing bytes and metadata.
+Never install npm/corepack links or trust archive owners/modes.
+Retain every toolchain needed by both current and rollback generations.
+
+The remaining stable-controller blocker is architectural: workflow execution
+must move to an immutable tagged controller SHA while approvals move to a
+separately protected append-only public ledger. The signer must revalidate that
+ledger and all external controls after environment approval and immediately
+before OIDC signing. Until that follow-up contract and the runtime
+provisioning/attestation evidence exist, readiness stays unavailable.
 
 Before switching or recovering a non-committed release, the host closes the
 proxy and stops every readiness/reconcile timer, oneshot, and service that may

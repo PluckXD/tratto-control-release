@@ -13,6 +13,7 @@ import base64
 import binascii
 import datetime as dt
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -23,6 +24,17 @@ import urllib.error
 import urllib.request
 from pathlib import Path, PurePosixPath
 from typing import Any
+
+
+HERE = Path(__file__).resolve().parent
+RUNTIME_SPEC = importlib.util.spec_from_file_location(
+    "control_release_runtime_policy",
+    HERE / "runtime_policy.py",
+)
+if RUNTIME_SPEC is None or RUNTIME_SPEC.loader is None:
+    raise RuntimeError("runtime policy validator is unavailable")
+RUNTIME = importlib.util.module_from_spec(RUNTIME_SPEC)
+RUNTIME_SPEC.loader.exec_module(RUNTIME)
 
 
 SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -86,6 +98,7 @@ POLICY_DOCUMENT_KEYS = {
     "migration_database_scope",
     "product_repositories",
     "required_ref",
+    "runtime_policy",
     "schema_version",
     "signer_allows_product_credentials",
     "signer_allows_source_checkout",
@@ -563,7 +576,10 @@ def validate_shape(
     return release_id, nonce
 
 
-def validate_policy_blob(raw: bytes, expected_digest: str) -> None:
+def validate_policy_blob(
+    raw: bytes,
+    expected_digest: str,
+) -> dict[str, str]:
     if hashlib.sha256(raw).hexdigest() != expected_digest:
         reject("policy digest does not match the controller base blob")
     value = parse_json(raw, "policy")
@@ -583,6 +599,11 @@ def validate_policy_blob(raw: bytes, expected_digest: str) -> None:
             "PluckXD/tratto-web",
         ],
         "required_ref": EXPECTED_REF,
+        "runtime_policy": {
+            "digest_sha256": RUNTIME.EXPECTED_POLICY_SHA256,
+            "name": "control-runtime-v1",
+            "path": "policies/control-runtime-v1.json",
+        },
         "schema_version": 1,
         "signer_allows_product_credentials": False,
         "signer_allows_source_checkout": False,
@@ -594,6 +615,7 @@ def validate_policy_blob(raw: bytes, expected_digest: str) -> None:
         or type(value["signer_allows_product_credentials"]) is not bool
         or type(value["signer_allows_source_checkout"]) is not bool
         or not isinstance(value["product_repositories"], list)
+        or not isinstance(value["runtime_policy"], dict)
         or not all(
             isinstance(repository, str)
             for repository in value["product_repositories"]
@@ -602,6 +624,7 @@ def validate_policy_blob(raw: bytes, expected_digest: str) -> None:
         reject("policy document field types diverge from the enforced contract")
     if value != expected:
         reject("policy document values diverge from the enforced contract")
+    return value["runtime_policy"]
 
 
 def historical_authorizations(
@@ -716,7 +739,21 @@ def verify_controller_commit(
     ):
         reject("workflow digest does not match the controller base blob")
     policy = git_blob(root, base_sha, value["policy"]["path"])
-    validate_policy_blob(policy, value["policy"]["digest_sha256"])
+    runtime_reference = validate_policy_blob(
+        policy,
+        value["policy"]["digest_sha256"],
+    )
+    runtime_policy = git_blob(
+        root,
+        base_sha,
+        runtime_reference["path"],
+    )
+    try:
+        _, observed_runtime_digest = RUNTIME.validate_bytes(runtime_policy)
+    except RUNTIME.RuntimePolicyError as error:
+        reject(f"runtime policy blob is invalid: {error}")
+    if observed_runtime_digest != runtime_reference["digest_sha256"]:
+        reject("runtime policy digest does not match the controller base blob")
 
 
 def validate(

@@ -41,11 +41,51 @@ evidence.
    A failed install must leave resumable/cleanable staging rather than a
    permanent partial bootstrap.
 11. Remove root execution of `bundle/api/runtime/bin/python` from bundle
-   validation. Root may inspect only a trusted system interpreter; artifact
-   runtime execution belongs in the unprivileged isolated verifier/unit.
-12. Use one explicit interpreter contract across API, executor, migrations, and
-   Operations; do not validate one Python while services execute another.
+   validation. Root opens only reviewed host binaries and drops to the actual
+   runtime users for metadata probes; artifact runtime execution belongs in the
+   unprivileged isolated verifier/unit.
+12. Use `/usr/bin/python3.12` across API, executor, migrators, proxy, Web
+   preflight, and Operations. Attest CPython 3.12/cpython-312, exact SOABI,
+   non-debug ABI, Ubuntu 24.04, and glibc 2.39 or later. Do not use the mutable
+   `/usr/bin/python3` alias.
 13. Record the accepted host commit as a required approval ancestor.
+14. Install canonical `control-runtime-v1.json` atomically as root:root 0444 at
+   `/etc/tratto-control/runtime-policy.json`; candidate/stage copies may be
+   root-only 0400, but the attestor accepts only the canonical installed path
+   and mode.
+
+### Dedicated Node v22 toolchain
+
+The toolchain is infrastructure, not a release payload. Provision it in a
+separate reviewed maintenance operation:
+
+1. obtain only
+   `https://nodejs.org/dist/v22.22.0/node-v22.22.0-linux-x64.tar.xz`;
+2. require exactly 30,779,824 bytes and SHA-256
+   `9aa8e9d2298ab68c600bd6fb86a6c13bce11a4eca1ba9b39d79fa021755d7c37`;
+3. stream only the exact regular member
+   `node-v22.22.0-linux-x64/bin/node` into a root-only staging directory.
+   Reject links, additional extraction, sparse/PAX surprises, or size drift;
+4. require exactly 123,405,064 binary bytes and SHA-256
+   `1bec56ef7cfa9a76f3e0b7c0a87f220eb73f23102b9c0b4c7529a3f7c3ce7c31`;
+5. run `scripts/extract-reviewed-node.py` against the already local archive and
+   canonical runtime policy. The script creates one root-only 0400 staging
+   file with `O_EXCL`; it performs no download or installation;
+6. in the separately reviewed host provisioner, chown root:root and chmod 0555,
+   fsync the file and every affected directory, then publish with atomic
+   no-replace semantics at
+   `/opt/tratto-control/toolchains/node-v22.22.0-linux-x64/bin/node`, fsync the
+   tree, and reject any pre-existing destination unless its exact bytes,
+   ownership, mode, and ancestors re-attest successfully. Do not install npm,
+   npx, corepack, or any tar symlink;
+7. make `tratto-control-web.service` use that exact path and retain toolchains
+   referenced by current and previous generations;
+8. run `scripts/attest-host-runtime.py` as root. It opens fixed root-owned
+   binaries without following links, checks stable inode metadata and hashes,
+   then uses `/usr/bin/setpriv` to probe Python as all six runtime users and
+   Node as `tratto-control-web`.
+
+No controller workflow downloads or provisions this toolchain.
 
 The previously reviewed candidate `025fb61` is not releasable because it lacks
 these guarantees. The boot fix at API `3a3b864` does not by itself close the
@@ -82,6 +122,9 @@ For `control-release`:
 3. set `can_admins_bypass=false`;
 4. allow OIDC only to the signer job on protected `main`;
 5. expose no product repository token or source checkout to the signer.
+6. after the environment reviewer admits the signer, revalidate branch,
+   selected-Actions, environment, and append-only ledger controls immediately
+   before requesting OIDC. A pre-build snapshot is not fresh enough.
 
 The currently observed administrator bypass is a blocker.
 
@@ -157,8 +200,13 @@ Collect, review, and retain outside the carrier:
 - protected-environment response showing no self-review or admin bypass;
 - reviewer identities and separation;
 - builder/verifier/signer image and binary digests;
+- builder evidence proving the recorded OS, architecture, and exact build
+  runtime are observed rather than hardcoded for API, Ops, and Web;
 - least-privilege token/app installation scopes;
 - host schema-v5 and atomic Ops test results;
+- component-manifest schema-v4 and host runtime-attestation results;
+- installed runtime-policy digest, Node archive/binary sizes and SHA-256s, and
+  current/rollback toolchain retention;
 - final workflow SHA-256 and controller commit;
 - exact required product ancestors.
 
@@ -166,3 +214,10 @@ Only then submit a dedicated PR that changes
 `release-readiness.json` to `state: ready` with an empty blocker list. The same
 review must pin the final controller/workflow values in host-owned provenance
 policy. Never reuse an expired approval or simulate missing evidence.
+
+The current append-only approvals and mutable controller HEAD cannot become
+ready as-is because the host controller pin would change on every release. A
+follow-up reviewed contract must dispatch an immutable controller tag/SHA, keep
+approvals in a separately protected linear append-only public ledger, recheck
+ledger ancestry in the signer, and rotate controller pins only with an audited
+dual-pin upgrade. This remains the `stable-controller-ledger` blocker.

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -13,6 +14,9 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
+
+import component_manifest as COMPONENT
+import runtime_policy as RUNTIME
 
 
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -23,6 +27,30 @@ BINDING_KEYS = {
     "service_digest",
     "sha256",
 }
+HERE = Path(__file__).resolve().parent
+APPROVAL_SPEC = importlib.util.spec_from_file_location(
+    "control_release_runtime_approval",
+    HERE / "validate-approval.py",
+)
+if APPROVAL_SPEC is None or APPROVAL_SPEC.loader is None:
+    raise RuntimeError("approval validator is unavailable")
+APPROVAL = importlib.util.module_from_spec(APPROVAL_SPEC)
+APPROVAL_SPEC.loader.exec_module(APPROVAL)
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Expose the original 3xx response instead of following its Location."""
+
+    def redirect_request(
+        self,
+        request: urllib.request.Request,
+        file_pointer: Any,
+        code: int,
+        message: str,
+        headers: Any,
+        new_url: str,
+    ) -> None:
+        return None
 
 
 def fail(message: str) -> None:
@@ -41,22 +69,50 @@ def canonical_bytes(value: dict[str, Any]) -> bytes:
     ).encode("utf-8")
 
 
+def stat_snapshot(info: os.stat_result) -> tuple[int, ...]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_nlink,
+        info.st_uid,
+        info.st_gid,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
 def regular_json(path: Path, label: str) -> tuple[bytes, dict[str, Any]]:
     try:
-        info = path.lstat()
-        raw = path.read_bytes()
-        value = json.loads(raw.decode("utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+    except OSError:
         fail(f"{label} is unavailable or invalid")
-    if (
-        not stat.S_ISREG(info.st_mode)
-        or stat.S_ISLNK(info.st_mode)
-        or info.st_nlink != 1
-        or stat.S_IMODE(info.st_mode) != 0o600
-        or not 0 < len(raw) <= 64 * 1024
-        or not isinstance(value, dict)
-        or raw != canonical_bytes(value)
-    ):
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or not 0 < info.st_size <= 64 * 1024
+        ):
+            fail(f"{label} must be canonical isolated output mode 0600")
+        raw = os.read(descriptor, 64 * 1024 + 1)
+        if (
+            len(raw) != info.st_size
+            or stat_snapshot(os.fstat(descriptor)) != stat_snapshot(info)
+        ):
+            fail(f"{label} changed while being read")
+    finally:
+        os.close(descriptor)
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        fail(f"{label} is unavailable or invalid")
+    if not isinstance(value, dict) or raw != canonical_bytes(value):
         fail(f"{label} must be canonical isolated output mode 0600")
     return raw, value
 
@@ -106,6 +162,110 @@ def validate_ops_verification(
         fail("Ops archive/tree verification does not match signed binding")
 
 
+def bounded_digest(path: Path, label: str, maximum: int) -> str:
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+    except OSError:
+        fail(f"{label} is unavailable")
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or stat.S_IMODE(info.st_mode) & 0o022
+            or not 0 < info.st_size <= maximum
+        ):
+            fail(f"{label} must be a bounded non-writable single-link file")
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+        if stat_snapshot(os.fstat(descriptor)) != stat_snapshot(info):
+            fail(f"{label} changed while being hashed")
+    except OSError:
+        fail(f"{label} cannot be read")
+    finally:
+        os.close(descriptor)
+    return digest.hexdigest()
+
+
+def validate_approval_component_shas(
+    approval: dict[str, Any],
+    *,
+    api_sha: str,
+    web_sha: str,
+) -> None:
+    if (
+        approval["api"]["commit_sha"] != api_sha
+        or approval["ops"]["commit_sha"] != api_sha
+        or approval["web"]["commit_sha"] != web_sha
+    ):
+        fail("runtime component SHAs are not authorized by the approval")
+
+
+def validate_component_manifests(
+    *,
+    approval_path: Path,
+    runtime_policy_path: Path,
+    api_manifest_path: Path,
+    ops_manifest_path: Path,
+    web_manifest_path: Path,
+    api_requirements_lock: Path,
+    bindings: dict[str, dict[str, Any]],
+    api_sha: str,
+    web_sha: str,
+) -> None:
+    approval_raw, approval = regular_json(approval_path, "approval")
+    try:
+        APPROVAL.validate_shape(approval, now=None, historical=True)
+        validate_approval_component_shas(
+            approval,
+            api_sha=api_sha,
+            web_sha=web_sha,
+        )
+        _, runtime_policy_digest = RUNTIME.load(runtime_policy_path)
+        manifests: dict[str, dict[str, Any]] = {}
+        for label, path in (
+            ("api", api_manifest_path),
+            ("ops", ops_manifest_path),
+            ("web", web_manifest_path),
+        ):
+            _, manifest, digest = COMPONENT.load(
+                path,
+                f"{label} component manifest",
+            )
+            if digest != bindings[label]["component_manifest_sha256"]:
+                fail(f"{label} component manifest is not bound to the artifact")
+            manifests[label] = manifest
+        requirements_digest = bounded_digest(
+            api_requirements_lock,
+            "API requirements lock",
+            16 * 1024 * 1024,
+        )
+        COMPONENT.validate_set(
+            manifests,
+            api_sha=api_sha,
+            web_sha=web_sha,
+            approval_manifest_sha256=hashlib.sha256(
+                approval_raw
+            ).hexdigest(),
+            migration=approval["migration"],
+            runtime_policy_digest=runtime_policy_digest,
+            requirements_lock_sha256=requirements_digest,
+        )
+    except (
+        APPROVAL.ApprovalError,
+        COMPONENT.ComponentManifestError,
+        RUNTIME.RuntimePolicyError,
+    ) as error:
+        fail(f"component runtime policy is invalid: {error}")
+
+
 def request(
     base: str,
     path: str,
@@ -124,7 +284,10 @@ def request(
         data=body,
         headers=headers,
     )
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        NoRedirect(),
+    )
     try:
         with opener.open(value, timeout=5) as response:
             response.read(1)
@@ -192,6 +355,12 @@ def main() -> None:
     parser.add_argument("--browser-report", required=True, type=Path)
     parser.add_argument("--artifact-bindings", required=True, type=Path)
     parser.add_argument("--ops-verification", required=True, type=Path)
+    parser.add_argument("--approval", required=True, type=Path)
+    parser.add_argument("--runtime-policy", required=True, type=Path)
+    parser.add_argument("--api-manifest", required=True, type=Path)
+    parser.add_argument("--ops-manifest", required=True, type=Path)
+    parser.add_argument("--web-manifest", required=True, type=Path)
+    parser.add_argument("--api-requirements-lock", required=True, type=Path)
     parser.add_argument("--api-sha", required=True)
     parser.add_argument("--web-sha", required=True)
     parser.add_argument("--output", required=True, type=Path)
@@ -203,6 +372,17 @@ def main() -> None:
         fail("component SHA is invalid")
     bindings = validate_bindings(args.artifact_bindings)
     validate_ops_verification(args.ops_verification, bindings["ops"])
+    validate_component_manifests(
+        approval_path=args.approval,
+        runtime_policy_path=args.runtime_policy,
+        api_manifest_path=args.api_manifest,
+        ops_manifest_path=args.ops_manifest,
+        web_manifest_path=args.web_manifest,
+        api_requirements_lock=args.api_requirements_lock,
+        bindings=bindings,
+        api_sha=args.api_sha,
+        web_sha=args.web_sha,
+    )
 
     observations: dict[str, int] = {}
     checks = (

@@ -17,7 +17,9 @@ import sys
 import tarfile
 from pathlib import Path, PurePosixPath
 
+import component_manifest as COMPONENT
 import control_ops_tree as TREE
+import runtime_policy as RUNTIME
 
 
 HERE = Path(__file__).resolve().parent
@@ -34,6 +36,26 @@ SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 def reject(message: str) -> None:
     raise TREE.OpsTreeError(message)
+
+
+def validate_builder_platform(
+    runtime_policy: dict,
+    *,
+    system: str,
+    architecture: str,
+    implementation: str,
+    python_version: str,
+) -> None:
+    if (
+        system != runtime_policy["operating_system"]
+        or architecture != runtime_policy["architecture"]
+        or implementation != runtime_policy["python"]["implementation"]
+        or python_version != runtime_policy["python"]["build_version"]
+    ):
+        reject(
+            "Ops builder host/runtime diverges from reviewed "
+            "Linux x86_64 CPython 3.12.13"
+        )
 
 
 def git(root: Path, arguments: list[str], *, binary: bool = False) -> bytes | str:
@@ -165,6 +187,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repository-root", required=True, type=Path)
     parser.add_argument("--approval", required=True, type=Path)
+    parser.add_argument("--runtime-policy", required=True, type=Path)
     parser.add_argument("--release-sha", required=True)
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
@@ -181,10 +204,34 @@ def main() -> int:
             args.approval,
             args.release_sha,
         )
+        runtime_policy, runtime_policy_digest = RUNTIME.load(
+            args.runtime_policy
+        )
         python_version = platform.python_version()
-        if re.fullmatch(r"3\.12\.[0-9]+", python_version) is None:
-            reject("Ops builder must run on an observed Python 3.12.x")
+        validate_builder_platform(
+            runtime_policy,
+            system=platform.system(),
+            architecture=platform.machine(),
+            implementation=platform.python_implementation(),
+            python_version=python_version,
+        )
         entries = git_entries(root, args.release_sha)
+        embedded_runtime_policy = next(
+            (
+                payload
+                for path, kind, payload in entries
+                if (
+                    kind == "file"
+                    and path
+                    == "release-root/policies/control-runtime-v1.json"
+                )
+            ),
+            None,
+        )
+        RUNTIME.validate_embedded(
+            embedded_runtime_policy,
+            runtime_policy_digest,
+        )
         tree_sha = git(root, ["rev-parse", f"{args.release_sha}^{{tree}}"])
         assert isinstance(tree_sha, str)
 
@@ -236,8 +283,19 @@ def main() -> int:
             },
             "migration": approval["migration"],
             "release_sha": args.release_sha,
-            "schema_version": 3,
+            "runtime_policy": RUNTIME.reference(runtime_policy_digest),
+            "schema_version": 4,
         }
+        COMPONENT.validate(
+            manifest,
+            kind="ops",
+            release_sha=args.release_sha,
+            approval_manifest_sha256=hashlib.sha256(
+                approval_raw
+            ).hexdigest(),
+            migration=approval["migration"],
+            runtime_policy_digest=runtime_policy_digest,
+        )
         manifest_raw = APPROVAL.canonical_bytes(manifest)
         release_raw = f"{args.release_sha}\n".encode("ascii")
 
@@ -306,6 +364,7 @@ def main() -> int:
                         manifest_raw
                     ).hexdigest(),
                     "python": python_version,
+                    "runtime_policy_sha256": runtime_policy_digest,
                     "service_digest": service_digest,
                     "sha256": hashlib.sha256(archive_raw).hexdigest(),
                     "size_bytes": len(archive_raw),
@@ -315,7 +374,13 @@ def main() -> int:
                 sort_keys=True,
             )
         )
-    except (OSError, UnicodeDecodeError, TREE.OpsTreeError) as error:
+    except (
+        OSError,
+        UnicodeDecodeError,
+        COMPONENT.ComponentManifestError,
+        RUNTIME.RuntimePolicyError,
+        TREE.OpsTreeError,
+    ) as error:
         print(f"Ops artifact build rejected: {error}", file=sys.stderr)
         return 78
     return 0

@@ -1,0 +1,258 @@
+{
+  "$id": "https://github.com/PluckXD/tratto-control-release/schemas/component-manifest.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "artifact_kind": {
+            "const": "tratto-control-api"
+          }
+        }
+      },
+      "then": {
+        "not": {
+          "required": [
+            "public_build"
+          ]
+        },
+        "properties": {
+          "build": {
+            "additionalProperties": false,
+            "properties": {
+              "arch": {
+                "const": "x86_64"
+              },
+              "os": {
+                "const": "Linux"
+              },
+              "python": {
+                "const": "3.12.13"
+              },
+              "requirements_lock_sha256": {
+                "$ref": "#/$defs/sha256"
+              }
+            },
+            "required": [
+              "arch",
+              "os",
+              "python",
+              "requirements_lock_sha256"
+            ],
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "artifact_kind": {
+            "const": "tratto-control-ops"
+          }
+        }
+      },
+      "then": {
+        "not": {
+          "required": [
+            "public_build"
+          ]
+        },
+        "properties": {
+          "build": {
+            "additionalProperties": false,
+            "properties": {
+              "arch": {
+                "const": "x86_64"
+              },
+              "os": {
+                "const": "Linux"
+              },
+              "python": {
+                "const": "3.12.13"
+              },
+              "shell": {
+                "const": "bash"
+              },
+              "tree_digest_algorithm": {
+                "const": "tratto-tree-v1"
+              }
+            },
+            "required": [
+              "arch",
+              "os",
+              "python",
+              "shell",
+              "tree_digest_algorithm"
+            ],
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "artifact_kind": {
+            "const": "tratto-control-web"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "build": {
+            "additionalProperties": false,
+            "properties": {
+              "arch": {
+                "const": "x86_64"
+              },
+              "node": {
+                "const": "v22.22.0"
+              },
+              "os": {
+                "const": "Linux"
+              }
+            },
+            "required": [
+              "arch",
+              "node",
+              "os"
+            ],
+            "type": "object"
+          },
+          "public_build": {
+            "additionalProperties": false,
+            "properties": {
+              "NEXT_PUBLIC_API_URL": {
+                "const": "/api"
+              },
+              "NEXT_PUBLIC_APP_SURFACE": {
+                "const": "control"
+              }
+            },
+            "required": [
+              "NEXT_PUBLIC_API_URL",
+              "NEXT_PUBLIC_APP_SURFACE"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "public_build"
+        ]
+      }
+    }
+  ],
+  "properties": {
+    "approval_manifest_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "artifact_kind": {
+      "enum": [
+        "tratto-control-api",
+        "tratto-control-ops",
+        "tratto-control-web"
+      ]
+    },
+    "build": {
+      "type": "object"
+    },
+    "migration": {
+      "$ref": "#/$defs/migration"
+    },
+    "public_build": {
+      "type": "object"
+    },
+    "release_sha": {
+      "$ref": "#/$defs/sha1"
+    },
+    "runtime_policy": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "const": "control-runtime-v1"
+        },
+        "sha256": {
+          "const": "c34e2b5655ed2df968b4f976db223bb9653a58e4aacce65f28300cb06b5dc5ae"
+        }
+      },
+      "required": [
+        "name",
+        "sha256"
+      ],
+      "type": "object"
+    },
+    "schema_version": {
+      "const": 4,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "approval_manifest_sha256",
+    "artifact_kind",
+    "build",
+    "migration",
+    "release_sha",
+    "runtime_policy",
+    "schema_version"
+  ],
+  "title": "Tratto Control signed component manifest",
+  "type": "object",
+  "$defs": {
+    "migration": {
+      "additionalProperties": false,
+      "properties": {
+        "base_revision": {
+          "pattern": "^[a-z0-9][a-z0-9_]{2,63}$",
+          "type": "string"
+        },
+        "database_scope": {
+          "const": "control-and-tenant-fleet"
+        },
+        "fleet_preflight_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "head_revision": {
+          "pattern": "^[a-z0-9][a-z0-9_]{2,63}$",
+          "type": "string"
+        },
+        "mode": {
+          "const": "expand-only"
+        },
+        "tenant_catalog_count": {
+          "maximum": 512,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "tenant_catalog_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "tenant_fleet_base_revision": {
+          "pattern": "^[a-z0-9][a-z0-9_]{2,63}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "base_revision",
+        "database_scope",
+        "fleet_preflight_sha256",
+        "head_revision",
+        "mode",
+        "tenant_catalog_count",
+        "tenant_catalog_sha256",
+        "tenant_fleet_base_revision"
+      ],
+      "type": "object"
+    },
+    "sha1": {
+      "pattern": "^[0-9a-f]{40}$",
+      "type": "string"
+    },
+    "sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    }
+  },
+  "$comment": "The component manifest hash is bound by envelope schema v5. Runtime policy and cross-artifact equality are enforced by the normative Python validators."
+}

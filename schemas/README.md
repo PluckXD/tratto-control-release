@@ -22,6 +22,17 @@ v5. Its normative validator is `scripts/validate-envelope.py`. Schema v5 adds a
 distinct signed Operations artifact and behavioral schema 3 binds API, Ops, and
 Web by asset ID and exact byte/manifests/service digests.
 
+`component-manifest.schema.json` documents component schema 4. API, Ops, and
+Web retain exact build provenance and all bind the same reviewed
+`control-runtime-v1` digest. `scripts/component_manifest.py` is normative and
+enforces the cross-artifact runtime/migration equality.
+
+`runtime-policy.schema.json` documents the exact Ubuntu 24.04, CPython cp312,
+and dedicated Node v22 contract. `scripts/runtime_policy.py` requires canonical
+bytes and the reviewed exact values. `host-runtime-attestation.schema.json`
+documents the output of `scripts/attest-host-runtime.py`; that script is
+normative and checks stable root-owned paths and unprivileged execution probes.
+
 The current host must not accept or sign this envelope until immutable
 `ops.tar.gz` ingestion, atomic bundle switching/recovery, and unprivileged
 runtime verification are implemented and independently approved. Until then,
