@@ -17,3 +17,12 @@ or whose JSON data-model semantics are broader than the canonical wire format:
 
 Passing the JSON Schema alone never authorizes a release.
 
+`release-envelope.schema.json` is the candidate host/signer shape for schema
+v5. Its normative validator is `scripts/validate-envelope.py`. Schema v5 adds a
+distinct signed Operations artifact and behavioral schema 3 binds API, Ops, and
+Web by asset ID and exact byte/manifests/service digests.
+
+The current host must not accept or sign this envelope until immutable
+`ops.tar.gz` ingestion, atomic bundle switching/recovery, and unprivileged
+runtime verification are implemented and independently approved. Until then,
+the controller returns code 78.

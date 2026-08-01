@@ -1,0 +1,367 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "approval": {
+      "additionalProperties": false,
+      "properties": {
+        "manifest": {
+          "type": "object"
+        },
+        "manifest_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "mode": {
+          "const": "protected-public-controller"
+        }
+      },
+      "required": [
+        "manifest",
+        "manifest_sha256",
+        "mode"
+      ],
+      "type": "object"
+    },
+    "artifacts": {
+      "additionalProperties": false,
+      "properties": {
+        "api": {
+          "$ref": "#/$defs/productArtifact"
+        },
+        "ops": {
+          "$ref": "#/$defs/productArtifact"
+        },
+        "web": {
+          "$ref": "#/$defs/productArtifact"
+        }
+      },
+      "required": [
+        "api",
+        "ops",
+        "web"
+      ],
+      "type": "object"
+    },
+    "behavioral_verification": {
+      "additionalProperties": false,
+      "properties": {
+        "artifacts": {
+          "additionalProperties": false,
+          "properties": {
+            "api": {
+              "$ref": "#/$defs/artifactBinding"
+            },
+            "ops": {
+              "$ref": "#/$defs/artifactBinding"
+            },
+            "web": {
+              "$ref": "#/$defs/artifactBinding"
+            }
+          },
+          "required": [
+            "api",
+            "ops",
+            "web"
+          ],
+          "type": "object"
+        },
+        "api_sha": {
+          "$ref": "#/$defs/sha1"
+        },
+        "browser_report_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "contracts": {
+          "additionalProperties": false,
+          "properties": {
+            "api_auth_surface_http": {
+              "const": true
+            },
+            "api_business_denylist_http": {
+              "const": true
+            },
+            "api_p2t_password_ack_http": {
+              "const": true
+            },
+            "api_reset_endpoint_http": {
+              "const": true
+            },
+            "edge_reset_url_redaction_http": {
+              "const": true
+            },
+            "ops_tree_digest_verified": {
+              "const": true
+            },
+            "web_exact_hostname_http": {
+              "const": true
+            },
+            "web_reset_fragment_browser": {
+              "const": true
+            },
+            "web_surface_denylist_http": {
+              "const": true
+            }
+          },
+          "required": [
+            "api_auth_surface_http",
+            "api_business_denylist_http",
+            "api_p2t_password_ack_http",
+            "api_reset_endpoint_http",
+            "edge_reset_url_redaction_http",
+            "ops_tree_digest_verified",
+            "web_exact_hostname_http",
+            "web_reset_fragment_browser",
+            "web_surface_denylist_http"
+          ],
+          "type": "object"
+        },
+        "observations": {
+          "type": "object"
+        },
+        "schema_version": {
+          "const": 3
+        },
+        "verdict": {
+          "const": "pass"
+        },
+        "web_sha": {
+          "$ref": "#/$defs/sha1"
+        }
+      },
+      "required": [
+        "artifacts",
+        "api_sha",
+        "browser_report_sha256",
+        "contracts",
+        "observations",
+        "schema_version",
+        "verdict",
+        "web_sha"
+      ],
+      "type": "object"
+    },
+    "carrier": {
+      "additionalProperties": false,
+      "properties": {
+        "authorizes_release": {
+          "const": false
+        },
+        "repository": {
+          "const": "PluckXD/tratto-control-release-carrier"
+        },
+        "trust": {
+          "const": "transport-only"
+        }
+      },
+      "required": [
+        "authorizes_release",
+        "repository",
+        "trust"
+      ],
+      "type": "object"
+    },
+    "controller": {
+      "additionalProperties": false,
+      "properties": {
+        "commit_sha": {
+          "$ref": "#/$defs/sha1"
+        },
+        "event_name": {
+          "const": "workflow_dispatch"
+        },
+        "repository": {
+          "const": "PluckXD/tratto-control-release"
+        },
+        "runner_arch": {
+          "const": "X64"
+        },
+        "runner_environment": {
+          "const": "github-hosted"
+        },
+        "runner_os": {
+          "const": "Linux"
+        },
+        "run_attempt": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "run_id": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "source_ref": {
+          "const": "refs/heads/main"
+        },
+        "workflow": {
+          "const": ".github/workflows/control-release.yml"
+        },
+        "workflow_ref": {
+          "const": "PluckXD/tratto-control-release/.github/workflows/control-release.yml@refs/heads/main"
+        },
+        "verifier_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      },
+      "required": [
+        "commit_sha",
+        "event_name",
+        "repository",
+        "runner_arch",
+        "runner_environment",
+        "runner_os",
+        "run_attempt",
+        "run_id",
+        "source_ref",
+        "verifier_sha256",
+        "workflow",
+        "workflow_ref"
+      ],
+      "type": "object"
+    },
+    "migration": {
+      "type": "object"
+    },
+    "schema_version": {
+      "const": 5
+    },
+    "supplemental_inventory": {
+      "additionalProperties": false,
+      "properties": {
+        "supplemental_only": {
+          "const": true
+        }
+      },
+      "required": [
+        "supplemental_only"
+      ],
+      "type": "object"
+    }
+  },
+  "required": [
+    "approval",
+    "artifacts",
+    "behavioral_verification",
+    "carrier",
+    "controller",
+    "migration",
+    "schema_version",
+    "supplemental_inventory"
+  ],
+  "title": "Tratto Control signed release envelope candidate",
+  "type": "object",
+  "$defs": {
+    "artifactBinding": {
+      "additionalProperties": false,
+      "properties": {
+        "artifact_id": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "component_manifest_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "service_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      },
+      "required": [
+        "artifact_id",
+        "component_manifest_sha256",
+        "service_digest",
+        "sha256"
+      ],
+      "type": "object"
+    },
+    "productArtifact": {
+      "additionalProperties": false,
+      "properties": {
+        "ancestor_verified": {
+          "const": true
+        },
+        "approved_ref": {
+          "const": "refs/heads/main"
+        },
+        "artifact_id": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "artifact_name": {
+          "type": "string"
+        },
+        "build_job": {
+          "enum": [
+            "build_api",
+            "build_ops",
+            "build_web"
+          ],
+          "type": "string"
+        },
+        "carrier_repository": {
+          "const": "PluckXD/tratto-control-release-carrier"
+        },
+        "commit_sha": {
+          "$ref": "#/$defs/sha1"
+        },
+        "component_manifest_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "repository": {
+          "type": "string"
+        },
+        "runner_arch": {
+          "const": "X64"
+        },
+        "runner_environment": {
+          "const": "github-hosted"
+        },
+        "runner_os": {
+          "const": "Linux"
+        },
+        "service_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "size_bytes": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "tree_sha": {
+          "$ref": "#/$defs/sha1"
+        }
+      },
+      "required": [
+        "ancestor_verified",
+        "approved_ref",
+        "artifact_id",
+        "artifact_name",
+        "build_job",
+        "carrier_repository",
+        "commit_sha",
+        "component_manifest_sha256",
+        "repository",
+        "runner_arch",
+        "runner_environment",
+        "runner_os",
+        "service_digest",
+        "sha256",
+        "size_bytes",
+        "tree_sha"
+      ],
+      "type": "object"
+    },
+    "sha1": {
+      "pattern": "^[0-9a-f]{40}$",
+      "type": "string"
+    },
+    "sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    }
+  },
+  "$comment": "The Python validator is normative and enforces cross-field bindings, canonical JSON, distinct carrier assets, and API/Operations commit equality."
+}

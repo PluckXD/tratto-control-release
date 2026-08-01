@@ -136,7 +136,10 @@
           "type": "string"
         },
         "database_scope": {
-          "const": "control"
+          "const": "control-and-tenant-fleet"
+        },
+        "fleet_preflight_sha256": {
+          "$ref": "#/$defs/sha256"
         },
         "head_revision": {
           "pattern": "^[a-z0-9][a-z0-9_]{2,63}$",
@@ -144,13 +147,29 @@
         },
         "mode": {
           "const": "expand-only"
+        },
+        "tenant_catalog_count": {
+          "maximum": 512,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "tenant_catalog_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "tenant_fleet_base_revision": {
+          "pattern": "^[a-z0-9][a-z0-9_]{2,63}$",
+          "type": "string"
         }
       },
       "required": [
         "base_revision",
         "database_scope",
+        "fleet_preflight_sha256",
         "head_revision",
-        "mode"
+        "mode",
+        "tenant_catalog_count",
+        "tenant_catalog_sha256",
+        "tenant_fleet_base_revision"
       ],
       "type": "object"
     },

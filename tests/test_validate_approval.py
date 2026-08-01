@@ -93,10 +93,14 @@ def approval(base_sha: str, *, suffix: str = "tests") -> dict:
         "expires_at": "2026-07-30T13:00:00Z",
         "issued_at": "2026-07-30T12:00:00Z",
         "migration": {
-            "base_revision": "f25p2tauth",
-            "database_scope": "control",
-            "head_revision": "f28controlrpc",
+            "base_revision": "j1transpcod",
+            "database_scope": "control-and-tenant-fleet",
+            "fleet_preflight_sha256": "9" * 64,
+            "head_revision": "f29controlexec",
             "mode": "expand-only",
+            "tenant_catalog_count": 1,
+            "tenant_catalog_sha256": "a" * 64,
+            "tenant_fleet_base_revision": "j1transpcod",
         },
         "nonce": "AAAAAAAAAAAAAAAAAAAAAA",
         "ops": {
@@ -403,9 +407,9 @@ def test_rejects_policy_numeric_boolean_alias(tmp_path: Path) -> None:
         ),
         (
             lambda value: value["migration"].update(
-                {"head_revision": "f25p2tauth"}
+                {"head_revision": "j1transpcod"}
             ),
-            "base and head",
+            "revision chain",
         ),
         (
             lambda value: value["policy"].update({"digest_sha256": "6" * 64}),

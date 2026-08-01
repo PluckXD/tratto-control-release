@@ -67,14 +67,21 @@ CONTROLLER_KEYS = {
 MIGRATION_KEYS = {
     "base_revision",
     "database_scope",
+    "fleet_preflight_sha256",
     "head_revision",
     "mode",
+    "tenant_catalog_count",
+    "tenant_catalog_sha256",
+    "tenant_fleet_base_revision",
 }
 POLICY_KEYS = {"digest_sha256", "name", "path", "repository"}
 POLICY_DOCUMENT_KEYS = {
     "approval_max_seconds",
     "approval_path_prefix",
     "artifact_transport",
+    "carrier_authorizes_release",
+    "carrier_repository",
+    "carrier_trust",
     "controller_repository",
     "migration_database_scope",
     "product_repositories",
@@ -89,6 +96,7 @@ EXPECTED_REPOSITORIES = {
     "web": "PluckXD/tratto-web",
 }
 EXPECTED_CONTROLLER_REPOSITORY = "PluckXD/tratto-control-release"
+EXPECTED_CARRIER_REPOSITORY = "PluckXD/tratto-control-release-carrier"
 EXPECTED_CONTROLLER_ORIGIN = (
     "https://github.com/PluckXD/tratto-control-release.git"
 )
@@ -460,8 +468,10 @@ def validate_migration(value: Any) -> None:
     if not isinstance(value, dict):
         reject("migration must be an object")
     exact_keys(value, MIGRATION_KEYS, "migration")
-    if value["database_scope"] != "control":
-        reject("migration.database_scope must be control")
+    if value["database_scope"] != "control-and-tenant-fleet":
+        reject(
+            "migration.database_scope must be control-and-tenant-fleet"
+        )
     if value["mode"] != "expand-only":
         reject("migration.mode must be expand-only")
     base = require_pattern(
@@ -470,8 +480,30 @@ def validate_migration(value: Any) -> None:
     head = require_pattern(
         value["head_revision"], REVISION_RE, "migration.head_revision"
     )
-    if base == head:
-        reject("migration base and head must differ")
+    tenant_base = require_pattern(
+        value["tenant_fleet_base_revision"],
+        REVISION_RE,
+        "migration.tenant_fleet_base_revision",
+    )
+    if (
+        base != "j1transpcod"
+        or tenant_base != "j1transpcod"
+        or head != "f29controlexec"
+    ):
+        reject("migration revision chain is not approved")
+    require_pattern(
+        value["tenant_catalog_sha256"],
+        SHA256_RE,
+        "migration.tenant_catalog_sha256",
+    )
+    require_pattern(
+        value["fleet_preflight_sha256"],
+        SHA256_RE,
+        "migration.fleet_preflight_sha256",
+    )
+    count = value["tenant_catalog_count"]
+    if type(count) is not int or not 1 <= count <= 512:
+        reject("migration tenant catalog count is invalid")
 
 
 def validate_policy(value: Any) -> None:
@@ -540,9 +572,12 @@ def validate_policy_blob(raw: bytes, expected_digest: str) -> None:
     expected = {
         "approval_max_seconds": 86400,
         "approval_path_prefix": "approvals/",
-        "artifact_transport": "private-only",
+        "artifact_transport": "private-untrusted-carrier",
+        "carrier_authorizes_release": False,
+        "carrier_repository": EXPECTED_CARRIER_REPOSITORY,
+        "carrier_trust": "transport-only",
         "controller_repository": EXPECTED_CONTROLLER_REPOSITORY,
-        "migration_database_scope": "control",
+        "migration_database_scope": "control-and-tenant-fleet",
         "product_repositories": [
             "PluckXD/tratto-api",
             "PluckXD/tratto-web",
@@ -555,6 +590,7 @@ def validate_policy_blob(raw: bytes, expected_digest: str) -> None:
     if (
         type(value["schema_version"]) is not int
         or type(value["approval_max_seconds"]) is not int
+        or type(value["carrier_authorizes_release"]) is not bool
         or type(value["signer_allows_product_credentials"]) is not bool
         or type(value["signer_allows_source_checkout"]) is not bool
         or not isinstance(value["product_repositories"], list)
