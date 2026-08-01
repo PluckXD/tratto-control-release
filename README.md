@@ -10,15 +10,45 @@ release binaries.
 
 `RELEASE_POLICY_UNAVAILABLE`
 
-`release-readiness.json` is normative and intentionally contains unresolved
-blockers. Every pre-sign job calls `scripts/policy-gate.py`; the source-free
-signer has an equivalent inline refusal. Unavailable or inconsistent state
-returns exit code 78. Removing a message from documentation does not enable a
-release. Readiness requires a reviewed commit that clears every
-machine-readable blocker and independent evidence for the external controls.
+Both `release-readiness.json` (the legacy v1/v5 candidate) and
+`release-readiness-v2.json` (the v2/v6 candidate) are intentionally
+unavailable. Unavailable or inconsistent state returns exit code 78. Removing
+a message from documentation does not enable a release. Readiness requires a
+reviewed commit that clears every machine-readable blocker and independent
+evidence for the external controls.
 
-The candidate workflow is manual-only. It cannot build, verify, sign, stage, or
-deploy a release in its current state.
+The workflow currently installed under `.github/workflows` remains
+manual-only and fail-closed. `workflow-v6-shape.yml` is deliberately outside
+that directory: it is a review artifact, not an executable workflow. Neither
+candidate can currently build, verify, sign, stage, or deploy a release.
+
+## Stable controller v2 / envelope v6
+
+The v2/v6 candidate separates stable release authority from product source and
+from the untrusted artifact carrier:
+
+- `policies/control-production-v2.json` is validated only against
+  compile-time audited pins; its production pins are deliberately empty;
+- approval schema v2 binds an immutable signed controller tag/release, the
+  exact workflow and signer-verifier bytes, and one entry in a separate
+  protected append-only ledger;
+- `scripts/validate-ledger.py` replays the full linear ledger instead of
+  trusting a selected JSON file;
+- envelope schema v6 embeds the validated approval, binds the ledger head,
+  immutable controller evidence, all three artifacts, behavioral evidence,
+  and an exact signer-freshness block;
+- the source-free signer must obtain a second authenticated observation of the
+  ledger, controller tag, and GitHub controls after environment approval and
+  immediately before requesting an OIDC signature.
+
+Raw GitHub API JSON, a carrier release, an embedded `verified` flag, or a tag
+name never authorizes promotion by itself. The fixed validators and their
+independently pinned trust roots must authenticate the evidence.
+
+The v2/v6 command-line gates remain unavailable until the separate ledger,
+owner-enforced immutable releases, selected/SHA-pinned Actions policy,
+two-person protection, source-free signer identity, cryptographic annotated-tag
+verifier, and the real Ubuntu HML kill/resume drill are provisioned and pinned.
 
 ## Trust split
 
