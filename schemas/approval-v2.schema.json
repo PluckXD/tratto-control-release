@@ -1,0 +1,332 @@
+{
+  "$comment": "Cross-field invariants for canonical JSON, canonical base64url, UTC validity, release timestamp binding, the approved migration chain, controller evidence, and ledger continuity are enforced by scripts/validate-approval-v2.py.",
+  "$defs": {
+    "apiComponent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/component"
+        },
+        {
+          "properties": {
+            "repository": {
+              "const": "PluckXD/tratto-api"
+            }
+          }
+        }
+      ]
+    },
+    "component": {
+      "additionalProperties": false,
+      "properties": {
+        "approved_ref": {
+          "const": "refs/heads/main"
+        },
+        "commit_sha": {
+          "$ref": "#/$defs/sha1"
+        },
+        "repository": {
+          "type": "string"
+        },
+        "required_ancestors": {
+          "items": {
+            "$ref": "#/$defs/sha1"
+          },
+          "maxItems": 32,
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "approved_ref",
+        "commit_sha",
+        "repository",
+        "required_ancestors"
+      ],
+      "type": "object"
+    },
+    "controller": {
+      "additionalProperties": false,
+      "properties": {
+        "commit_sha": {
+          "$ref": "#/$defs/sha1"
+        },
+        "immutable_release_id": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "repository": {
+          "const": "PluckXD/tratto-control-release"
+        },
+        "repository_id": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "signer_verifier_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "tag_object_sha": {
+          "$ref": "#/$defs/sha1"
+        },
+        "tag_ref": {
+          "pattern": "^refs/tags/control-controller-v6\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$",
+          "type": "string"
+        },
+        "workflow_path": {
+          "const": ".github/workflows/control-release.yml"
+        },
+        "workflow_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      },
+      "required": [
+        "commit_sha",
+        "immutable_release_id",
+        "repository",
+        "repository_id",
+        "signer_verifier_sha256",
+        "tag_object_sha",
+        "tag_ref",
+        "workflow_path",
+        "workflow_sha256"
+      ],
+      "type": "object"
+    },
+    "ledger": {
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "sequence": {
+                "const": 1
+              }
+            },
+            "required": [
+              "sequence"
+            ]
+          },
+          "then": {
+            "properties": {
+              "previous_manifest_sha256": {
+                "const": "0000000000000000000000000000000000000000000000000000000000000000"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "sequence": {
+                "minimum": 2
+              }
+            },
+            "required": [
+              "sequence"
+            ]
+          },
+          "then": {
+            "properties": {
+              "previous_manifest_sha256": {
+                "not": {
+                  "const": "0000000000000000000000000000000000000000000000000000000000000000"
+                }
+              }
+            }
+          }
+        }
+      ],
+      "properties": {
+        "genesis_sha": {
+          "$ref": "#/$defs/sha1"
+        },
+        "parent_commit_sha": {
+          "$ref": "#/$defs/sha1"
+        },
+        "previous_manifest_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "ref": {
+          "const": "refs/heads/main"
+        },
+        "repository": {
+          "const": "PluckXD/tratto-control-release-ledger"
+        },
+        "repository_id": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "sequence": {
+          "maximum": 100000,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "genesis_sha",
+        "parent_commit_sha",
+        "previous_manifest_sha256",
+        "ref",
+        "repository",
+        "repository_id",
+        "sequence"
+      ],
+      "type": "object"
+    },
+    "migration": {
+      "additionalProperties": false,
+      "properties": {
+        "base_revision": {
+          "pattern": "^[a-z0-9][a-z0-9_]{2,63}$",
+          "type": "string"
+        },
+        "database_scope": {
+          "const": "control-and-tenant-fleet"
+        },
+        "fleet_preflight_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "head_revision": {
+          "pattern": "^[a-z0-9][a-z0-9_]{2,63}$",
+          "type": "string"
+        },
+        "mode": {
+          "const": "expand-only"
+        },
+        "tenant_catalog_count": {
+          "maximum": 512,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "tenant_catalog_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "tenant_fleet_base_revision": {
+          "pattern": "^[a-z0-9][a-z0-9_]{2,63}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "base_revision",
+        "database_scope",
+        "fleet_preflight_sha256",
+        "head_revision",
+        "mode",
+        "tenant_catalog_count",
+        "tenant_catalog_sha256",
+        "tenant_fleet_base_revision"
+      ],
+      "type": "object"
+    },
+    "policy": {
+      "additionalProperties": false,
+      "properties": {
+        "digest_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "name": {
+          "const": "control-production-v2"
+        },
+        "path": {
+          "const": "policies/control-production-v2.json"
+        },
+        "repository": {
+          "const": "PluckXD/tratto-control-release"
+        }
+      },
+      "required": [
+        "digest_sha256",
+        "name",
+        "path",
+        "repository"
+      ],
+      "type": "object"
+    },
+    "sha1": {
+      "pattern": "^[0-9a-f]{40}$",
+      "type": "string"
+    },
+    "sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "timestamp": {
+      "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z$",
+      "type": "string"
+    },
+    "webComponent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/component"
+        },
+        {
+          "properties": {
+            "repository": {
+              "const": "PluckXD/tratto-web"
+            }
+          }
+        }
+      ]
+    }
+  },
+  "$id": "https://github.com/PluckXD/tratto-control-release/schemas/approval-v2.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "api": {
+      "$ref": "#/$defs/apiComponent"
+    },
+    "controller": {
+      "$ref": "#/$defs/controller"
+    },
+    "expires_at": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "issued_at": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "ledger": {
+      "$ref": "#/$defs/ledger"
+    },
+    "migration": {
+      "$ref": "#/$defs/migration"
+    },
+    "nonce": {
+      "pattern": "^[A-Za-z0-9_-]{22,86}$",
+      "type": "string"
+    },
+    "ops": {
+      "$ref": "#/$defs/apiComponent"
+    },
+    "policy": {
+      "$ref": "#/$defs/policy"
+    },
+    "release_id": {
+      "pattern": "^ctl-[0-9]{8}T[0-9]{6}Z-[a-z0-9][a-z0-9-]{2,31}$",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 2,
+      "type": "integer"
+    },
+    "web": {
+      "$ref": "#/$defs/webComponent"
+    }
+  },
+  "required": [
+    "api",
+    "controller",
+    "expires_at",
+    "issued_at",
+    "ledger",
+    "migration",
+    "nonce",
+    "ops",
+    "policy",
+    "release_id",
+    "schema_version",
+    "web"
+  ],
+  "title": "Tratto Control production-v2 release authorization",
+  "type": "object"
+}

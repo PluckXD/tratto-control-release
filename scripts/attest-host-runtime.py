@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import sys
+sys.dont_write_bytecode = True
+
 import argparse
 import hashlib
 import json
@@ -12,7 +15,6 @@ import pwd
 import re
 import stat
 import subprocess
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -291,7 +293,7 @@ def attest_python(
             raw = run_as(
                 setpriv_descriptor=setpriv_descriptor,
                 binary_descriptor=descriptor,
-                arguments=["-I", "-S", "-c", program],
+                arguments=["-I", "-B", "-S", "-c", program],
                 user=user,
                 label=f"trusted system Python/{user}",
             )

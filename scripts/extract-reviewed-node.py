@@ -3,12 +3,14 @@
 
 from __future__ import annotations
 
+import sys
+sys.dont_write_bytecode = True
+
 import argparse
 import hashlib
 import json
 import os
 import stat
-import sys
 import tarfile
 from pathlib import Path
 

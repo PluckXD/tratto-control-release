@@ -3,12 +3,14 @@
 
 from __future__ import annotations
 
+import sys
+sys.dont_write_bytecode = True
+
 import argparse
 import datetime as dt
 import importlib.util
 import os
 import subprocess
-import sys
 from pathlib import Path
 
 

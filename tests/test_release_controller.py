@@ -19,6 +19,8 @@ from types import SimpleNamespace
 import pytest
 
 
+sys.dont_write_bytecode = True
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -1389,6 +1391,8 @@ def test_workflow_uses_only_full_sha_actions_and_isolates_signer() -> None:
     assert all(re.fullmatch(r"[^@]+@[0-9a-f]{40}", item) for item in uses)
     assert set(uses) == set(CONTROLS.ALLOWED_ACTIONS)
     assert workflow.count("python-version: '3.12.13'") == 5
+    assert workflow.count("python3 -B scripts/") == 8
+    assert re.search(r"\bpython3 (?!-B)", workflow) is None
     assert "APPROVAL_PATH: ${{ inputs.approval_path }}" in workflow
     assert '"${{ inputs.approval_path }}"' not in workflow
     for job in ("build_api:", "build_ops:", "build_web:", "verify:"):
@@ -1399,6 +1403,24 @@ def test_workflow_uses_only_full_sha_actions_and_isolates_signer() -> None:
     assert "id-token: write" in signer
     assert "environment: control-release" in signer
     assert "exit 78" in signer
+
+
+def test_controller_entrypoints_disable_bytecode_before_local_imports() -> None:
+    scripts = sorted((ROOT / "scripts").glob("*.py"))
+    assert scripts
+    for script in scripts:
+        source = script.read_text(encoding="utf-8")
+        guard = source.index("sys.dont_write_bytecode = True")
+        local_imports = [
+            position
+            for needle in (
+                "import component_manifest",
+                "import runtime_policy",
+                "spec_from_file_location(",
+            )
+            if (position := source.find(needle)) >= 0
+        ]
+        assert not local_imports or guard < min(local_imports), script.name
 
 
 def git(root: Path, *arguments: str) -> str:

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import sys
+sys.dont_write_bytecode = True
+
 import hashlib
 import posixpath
 import re
@@ -27,10 +30,14 @@ REQUIRED_FILES = {
     "release-root/scripts/runtime_policy.py",
     "release-root/scripts/verify-runtime-contract.py",
     "scripts/activate-release.sh",
+    "scripts/attest-host-runtime.py",
     "scripts/install-host.sh",
     "scripts/lib/control_ops_tree.py",
     "scripts/link-bootstrap-contract.sh",
     "scripts/link-runtime-contract.sh",
+    "scripts/provision-node-runtime.py",
+    "scripts/publish-bootstrap-tree.py",
+    "scripts/publish-host-policies.py",
     "scripts/recover-interrupted.sh",
     "scripts/rollback-release.sh",
     "scripts/stage-release.sh",

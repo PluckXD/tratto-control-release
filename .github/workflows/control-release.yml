@@ -39,7 +39,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           RUNNER_ENVIRONMENT: ${{ runner.environment }}
         run: |
-          python3 scripts/validate-approval.py \
+          python3 -B scripts/validate-approval.py \
             "$APPROVAL_PATH" \
             --repository-root "$GITHUB_WORKSPACE" \
             >"$RUNNER_TEMP/approval-summary.json"
@@ -48,19 +48,19 @@ jobs:
         env:
           APPROVAL_PATH: ${{ inputs.approval_path }}
         run: |
-          python3 scripts/emit-approval-outputs.py \
+          python3 -B scripts/emit-approval-outputs.py \
             --summary "$RUNNER_TEMP/approval-summary.json" \
             --approval "$GITHUB_WORKSPACE/$APPROVAL_PATH" \
             --github-output "$GITHUB_OUTPUT"
       - name: Verify branch, environment, and Actions controls
         env:
           CONTROL_CONTROLLER_AUDIT_TOKEN: ${{ secrets.CONTROL_CONTROLLER_AUDIT_TOKEN }}
-        run: python3 scripts/verify-github-controls.py
+        run: python3 -B scripts/verify-github-controls.py
       - name: Enforce reviewed readiness
         env:
           RUNNER_ENVIRONMENT: ${{ runner.environment }}
         run: |
-          python3 scripts/policy-gate.py \
+          python3 -B scripts/policy-gate.py \
             --readiness release-readiness.json \
             --phase authorize
 
@@ -90,7 +90,7 @@ jobs:
         env:
           RUNNER_ENVIRONMENT: ${{ runner.environment }}
         run: |
-          python3 scripts/policy-gate.py \
+          python3 -B scripts/policy-gate.py \
             --readiness release-readiness.json \
             --phase build_api
       - name: Build API in reviewed isolated OCI image
@@ -124,7 +124,7 @@ jobs:
         env:
           RUNNER_ENVIRONMENT: ${{ runner.environment }}
         run: |
-          python3 scripts/policy-gate.py \
+          python3 -B scripts/policy-gate.py \
             --readiness release-readiness.json \
             --phase build_web
       - name: Build Web in reviewed isolated OCI image
@@ -158,7 +158,7 @@ jobs:
         env:
           RUNNER_ENVIRONMENT: ${{ runner.environment }}
         run: |
-          python3 scripts/policy-gate.py \
+          python3 -B scripts/policy-gate.py \
             --readiness release-readiness.json \
             --phase build_ops
       - name: Package reviewed ops/control as an immutable artifact
@@ -192,7 +192,7 @@ jobs:
         env:
           RUNNER_ENVIRONMENT: ${{ runner.environment }}
         run: |
-          python3 scripts/policy-gate.py \
+          python3 -B scripts/policy-gate.py \
             --readiness release-readiness.json \
             --phase verify
       - name: Verify carrier bytes and real isolated runtimes

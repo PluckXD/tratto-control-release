@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
+import sys
+sys.dont_write_bytecode = True
+
 import json
 import os
-import sys
 import urllib.error
 import urllib.request
 from typing import Any

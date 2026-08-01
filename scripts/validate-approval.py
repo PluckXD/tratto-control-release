@@ -8,6 +8,9 @@ caller-selected directory or a symlinkable working-tree path.
 
 from __future__ import annotations
 
+import sys
+sys.dont_write_bytecode = True
+
 import argparse
 import base64
 import binascii
@@ -19,7 +22,6 @@ import os
 import re
 import stat
 import subprocess
-import sys
 import urllib.error
 import urllib.request
 from pathlib import Path, PurePosixPath

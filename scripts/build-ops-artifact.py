@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import sys
+sys.dont_write_bytecode = True
+
 import argparse
 import gzip
 import hashlib
@@ -13,7 +16,6 @@ import os
 import platform
 import re
 import subprocess
-import sys
 import tarfile
 from pathlib import Path, PurePosixPath
 

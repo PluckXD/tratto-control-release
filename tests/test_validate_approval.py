@@ -13,6 +13,8 @@ from pathlib import Path
 import pytest
 
 
+sys.dont_write_bytecode = True
+
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "validate-approval.py"
 SPEC = importlib.util.spec_from_file_location("validate_approval", SCRIPT)
