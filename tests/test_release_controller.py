@@ -80,6 +80,10 @@ OPS_BUILDER = load_module(
     "release_controller_ops_builder",
     ROOT / "scripts" / "build-ops-artifact.py",
 )
+BOOTSTRAP_ENVELOPE = load_module(
+    "release_controller_bootstrap_envelope",
+    ROOT / "scripts" / "build-bootstrap-envelope.py",
+)
 
 
 def approval_value(api_sha: str = "1" * 40) -> dict:
@@ -1503,6 +1507,11 @@ def test_ops_artifact_round_trip_uses_canonical_modes_and_digest(
     assert (
         summary["runtime_policy_sha256"]
         == RUNTIME.EXPECTED_POLICY_SHA256
+    )
+    BOOTSTRAP_ENVELOPE.validate_summary(
+        summary,
+        label="ops",
+        release_sha=release_sha,
     )
     validate = subprocess.run(
         [
