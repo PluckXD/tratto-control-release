@@ -7,9 +7,13 @@ import importlib.util
 import io
 import json
 import os
+import shutil
+import stat
 import subprocess
 import sys
 import tarfile
+import tempfile
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -351,6 +355,30 @@ def fake_runtime() -> object:
     return KIT.Runtime(exchange=exchange, noreplace=noreplace)
 
 
+@pytest.fixture
+def secure_tmp_path() -> Iterator[Path]:
+    anchor = ROOT / ".pytest-secure"
+    anchor.mkdir(mode=0o700, exist_ok=True)
+    if anchor.is_symlink() or not anchor.is_dir():
+        raise AssertionError("secure test anchor is not a real directory")
+    anchor.chmod(0o700)
+    path = Path(tempfile.mkdtemp(prefix="source-kit-", dir=anchor))
+    try:
+        yield path
+    finally:
+        for directory, _children, _files in os.walk(
+            path,
+            topdown=True,
+            followlinks=False,
+        ):
+            Path(directory).chmod(0o700)
+        shutil.rmtree(path)
+        try:
+            anchor.rmdir()
+        except OSError:
+            pass
+
+
 def fixture(tmp_path: Path) -> tuple[Path, Path, list[str]]:
     uid = os.getuid()
     gid = os.getgid()
@@ -455,9 +483,9 @@ def install(
 
 
 def test_installs_signed_tree_retains_old_and_is_idempotent(
-    tmp_path: Path,
+    secure_tmp_path: Path,
 ) -> None:
-    incoming, state, calls = fixture(tmp_path)
+    incoming, state, calls = fixture(secure_tmp_path)
 
     assert install(incoming, state, calls) == "installed"
     assert calls == ["signature", "signature", "signature", "publisher"]
@@ -484,10 +512,10 @@ def test_installs_signed_tree_retains_old_and_is_idempotent(
     ],
 )
 def test_recovers_each_persistent_crash_boundary(
-    tmp_path: Path,
+    secure_tmp_path: Path,
     event: str,
 ) -> None:
-    incoming, state, calls = fixture(tmp_path)
+    incoming, state, calls = fixture(secure_tmp_path)
     fired = False
 
     def fault(observed: str) -> None:
@@ -507,10 +535,10 @@ def test_recovers_each_persistent_crash_boundary(
 
 @pytest.mark.parametrize("immutable_complete", [False, True])
 def test_recovers_partial_candidate_and_partial_intent_record(
-    tmp_path: Path,
+    secure_tmp_path: Path,
     immutable_complete: bool,
 ) -> None:
-    incoming, state, calls = fixture(tmp_path)
+    incoming, state, calls = fixture(secure_tmp_path)
     binding = KIT.validate_attestation(
         (incoming / KIT.ATTESTATION_NAME).read_bytes(),
         helper_sha256=hashlib.sha256(
@@ -567,9 +595,9 @@ def test_recovers_partial_candidate_and_partial_intent_record(
 
 
 def test_rejects_different_kit_after_intent(
-    tmp_path: Path,
+    secure_tmp_path: Path,
 ) -> None:
-    incoming, state, calls = fixture(tmp_path)
+    incoming, state, calls = fixture(secure_tmp_path)
 
     def stop(event: str) -> None:
         if event == "after_intent":
@@ -595,9 +623,9 @@ def test_rejects_different_kit_after_intent(
 
 
 def test_archive_rejects_links_before_any_mutation(
-    tmp_path: Path,
+    secure_tmp_path: Path,
 ) -> None:
-    incoming, state, calls = fixture(tmp_path)
+    incoming, state, calls = fixture(secure_tmp_path)
     archive = next(incoming.glob("tratto-control-ops-*.tar.gz"))
     archive.chmod(0o600)
     build_archive(archive, "a" * 40, link=True)
@@ -642,12 +670,12 @@ def test_archive_rejects_links_before_any_mutation(
     ),
 )
 def test_archive_rejects_invalid_quiescence_helper_before_source_exchange(
-    tmp_path: Path,
+    secure_tmp_path: Path,
     tamper: str,
     options: dict[str, object],
     message: str,
 ) -> None:
-    incoming, state, calls = fixture(tmp_path)
+    incoming, state, calls = fixture(secure_tmp_path)
     archive = next(incoming.glob("tratto-control-ops-*.tar.gz"))
     archive.chmod(0o600)
     build_archive(archive, "a" * 40, **options)
@@ -672,10 +700,10 @@ def test_archive_rejects_invalid_quiescence_helper_before_source_exchange(
 
 @pytest.mark.parametrize("tamper", ["traversal", "concatenated-gzip"])
 def test_archive_rejects_noncanonical_container_or_path(
-    tmp_path: Path,
+    secure_tmp_path: Path,
     tamper: str,
 ) -> None:
-    incoming, state, calls = fixture(tmp_path)
+    incoming, state, calls = fixture(secure_tmp_path)
     archive = next(incoming.glob("tratto-control-ops-*.tar.gz"))
     archive.chmod(0o600)
     if tamper == "traversal":
@@ -713,12 +741,12 @@ def test_archive_rejects_noncanonical_container_or_path(
     ],
 )
 def test_rejects_every_external_binding_before_signature_or_mutation(
-    tmp_path: Path,
+    secure_tmp_path: Path,
     field: str,
     replacement: str,
     message: str,
 ) -> None:
-    incoming, state, calls = fixture(tmp_path)
+    incoming, state, calls = fixture(secure_tmp_path)
     expected = expectations(incoming)
     values = {
         "helper_sha256": expected.helper_sha256,
@@ -746,10 +774,10 @@ def test_rejects_every_external_binding_before_signature_or_mutation(
 
 
 def test_rejects_execution_fd_not_bound_to_fixed_helper(
-    tmp_path: Path,
+    secure_tmp_path: Path,
 ) -> None:
-    incoming, state, calls = fixture(tmp_path)
-    other = tmp_path / "other-helper.py"
+    incoming, state, calls = fixture(secure_tmp_path)
+    other = secure_tmp_path / "other-helper.py"
     other.write_bytes((incoming / KIT.HELPER_NAME).read_bytes())
     other.chmod(0o400)
     execution = os.open(other, os.O_RDONLY)
@@ -773,8 +801,10 @@ def test_rejects_execution_fd_not_bound_to_fixed_helper(
     assert not (state / KIT.INTENT_NAME).exists()
 
 
-def test_rejects_writable_execution_fd(tmp_path: Path) -> None:
-    incoming, state, calls = fixture(tmp_path)
+def test_rejects_writable_execution_fd(
+    secure_tmp_path: Path,
+) -> None:
+    incoming, state, calls = fixture(secure_tmp_path)
     helper = incoming / KIT.HELPER_NAME
     helper.chmod(0o600)
     execution = os.open(helper, os.O_RDWR)
@@ -800,9 +830,9 @@ def test_rejects_writable_execution_fd(tmp_path: Path) -> None:
 
 
 def test_rejects_helper_block_size_drift_before_signature(
-    tmp_path: Path,
+    secure_tmp_path: Path,
 ) -> None:
-    incoming, state, calls = fixture(tmp_path)
+    incoming, state, calls = fixture(secure_tmp_path)
     attestation_path = incoming / KIT.ATTESTATION_NAME
     value = json.loads(attestation_path.read_text())
     value["bootstrap_source_helper"]["size_bytes"] += 1
@@ -822,10 +852,10 @@ def test_rejects_helper_block_size_drift_before_signature(
 
 @pytest.mark.parametrize("tamper", ["schema-5", "extra-helper-key"])
 def test_rejects_legacy_or_non_exact_helper_envelope_before_signature(
-    tmp_path: Path,
+    secure_tmp_path: Path,
     tamper: str,
 ) -> None:
-    incoming, state, calls = fixture(tmp_path)
+    incoming, state, calls = fixture(secure_tmp_path)
     attestation_path = incoming / KIT.ATTESTATION_NAME
     value = json.loads(attestation_path.read_text())
     if tamper == "schema-5":
@@ -1061,10 +1091,10 @@ def test_wrapper_preserves_fd0_into_proc_entrypoint_and_main(
 
 
 def test_requires_the_inherited_inode_to_be_actually_locked(
-    tmp_path: Path,
+    secure_tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    lock_directory = tmp_path / "run"
+    lock_directory = secure_tmp_path / "run"
     lock_directory.mkdir(mode=0o700)
     lock_path = lock_directory / KIT.LOCK_NAME
     lock_path.write_bytes(b"")
@@ -1091,6 +1121,31 @@ def test_requires_the_inherited_inode_to_be_actually_locked(
         ) == inherited
     finally:
         os.close(inherited)
+
+
+def test_open_path_chain_rejects_world_writable_parent(
+    secure_tmp_path: Path,
+) -> None:
+    untrusted_parent = secure_tmp_path / "untrusted"
+    untrusted_parent.mkdir(mode=0o700)
+    protected_leaf = untrusted_parent / "leaf"
+    protected_leaf.mkdir(mode=0o700)
+    untrusted_parent.chmod(0o1777)
+    assert stat.S_IMODE(untrusted_parent.stat().st_mode) == 0o1777
+
+    try:
+        with pytest.raises(
+            KIT.BootstrapSourceError,
+            match="pai não protegido",
+        ):
+            KIT.open_path_chain(
+                protected_leaf,
+                uid=os.getuid(),
+                gid=os.getgid(),
+                final_modes={0o700},
+            )
+    finally:
+        untrusted_parent.chmod(0o700)
 
 
 def test_cosign_claims_are_exact() -> None:
