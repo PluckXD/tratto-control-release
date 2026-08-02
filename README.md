@@ -254,6 +254,11 @@ must equal `api.commit_sha`.
 The Ops service digest uses `tratto-tree-v1`. Paths are sorted by their UTF-8
 bytes. Directories are excluded from the digest but must exist with mode 0555.
 Regular executables are normalized to 0555 and other regular files to 0444.
+The bootstrap source minimum is additionally fail-closed: the node
+provisioner, bootstrap-tree publisher, stack-quiescence verifier, and deploy
+lock wrapper must all be tracked as executables and must be 0555 in the Ops
+archive. Both the builder and the independent verifier enforce this shared
+mode contract.
 Each payload record is exactly `file\0mode4\0sha256\0path\0`, where the digest
 covers the file bytes. `RELEASE_SHA` and `artifact-manifest.json` are excluded.
 Symlinks, hardlinks, special files, duplicate/noncanonical paths, oversized

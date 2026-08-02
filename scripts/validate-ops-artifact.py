@@ -126,6 +126,7 @@ def main() -> int:
         seen: set[str] = set()
         directories: set[str] = set()
         payload_paths: set[str] = set()
+        payload_modes: dict[str, int] = {}
         records: list[tuple[str, bytes]] = []
         markers: dict[str, bytes] = {}
         embedded_runtime_policy: bytes | None = None
@@ -185,6 +186,7 @@ def main() -> int:
                     )
                 )
                 payload_paths.add(name)
+                payload_modes[name] = member.mode
                 if (
                     name
                     == "release-root/policies/control-runtime-v1.json"
@@ -194,6 +196,7 @@ def main() -> int:
         if set(markers) != TREE.MARKERS:
             reject("Ops archive markers are missing or ambiguous")
         TREE.validate_required_inventory(payload_paths)
+        TREE.validate_bootstrap_required_file_modes(payload_modes)
         for path in payload_paths:
             parent = str(Path(path).parent).replace("\\", "/")
             while parent not in {"", "."}:

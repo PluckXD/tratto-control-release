@@ -239,6 +239,7 @@ def main() -> int:
 
         records: list[tuple[str, bytes]] = []
         normalized: list[tuple[str, str, int, bytes, str | None]] = []
+        file_modes: dict[str, int] = {}
         directories: set[str] = set()
         for path, kind, payload in entries:
             parent = PurePosixPath(path).parent
@@ -257,6 +258,7 @@ def main() -> int:
             assert isinstance(source_mode, str)
             executable = source_mode.startswith("100755 ")
             mode = TREE.normalized_file_mode(executable=executable)
+            file_modes[path] = mode
             content_hash = hashlib.sha256(payload).hexdigest()
             normalized.append((path, kind, mode, payload, None))
             records.append(
@@ -270,6 +272,7 @@ def main() -> int:
                     ),
                 )
             )
+        TREE.validate_bootstrap_required_file_modes(file_modes)
         service_digest = TREE.service_digest(records)
         manifest = {
             "approval_manifest_sha256": hashlib.sha256(

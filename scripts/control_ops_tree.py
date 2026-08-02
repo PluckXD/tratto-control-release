@@ -9,6 +9,7 @@ import hashlib
 import posixpath
 import re
 import unicodedata
+from collections.abc import Mapping
 from pathlib import PurePosixPath
 
 
@@ -16,6 +17,12 @@ HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 MARKERS = {"RELEASE_SHA", "artifact-manifest.json"}
 MAX_MEMBERS = 10_000
 MAX_UNCOMPRESSED_BYTES = 512 * 1024 * 1024
+BOOTSTRAP_REQUIRED_FILE_MODES = {
+    "scripts/provision-node-runtime.py": 0o555,
+    "scripts/publish-bootstrap-tree.py": 0o555,
+    "scripts/verify-control-stack-quiescent.py": 0o555,
+    "scripts/with-deploy-lock.py": 0o555,
+}
 REQUIRED_FILES = {
     "config/provenance-policy.env",
     "nginx/tratto-control.conf",
@@ -49,7 +56,7 @@ REQUIRED_FILES = {
     "systemd/tratto-control-api.service",
     "systemd/tratto-control-recovery.service",
     "systemd/tratto-control-web.service",
-}
+} | set(BOOTSTRAP_REQUIRED_FILE_MODES)
 FORBIDDEN_BASENAMES = {
     ".env",
     ".netrc",
@@ -148,3 +155,24 @@ def validate_required_inventory(paths: set[str]) -> None:
     missing = REQUIRED_FILES - paths
     if missing:
         reject(f"Ops required inventory is incomplete: {sorted(missing)}")
+
+
+def validate_bootstrap_required_file_modes(
+    modes: Mapping[str, int],
+) -> None:
+    missing = set(BOOTSTRAP_REQUIRED_FILE_MODES) - set(modes)
+    if missing:
+        reject(
+            "Ops bootstrap executable inventory is incomplete: "
+            f"{sorted(missing)}"
+        )
+    mismatched = {
+        path: (BOOTSTRAP_REQUIRED_FILE_MODES[path], modes[path])
+        for path in BOOTSTRAP_REQUIRED_FILE_MODES
+        if modes[path] != BOOTSTRAP_REQUIRED_FILE_MODES[path]
+    }
+    if mismatched:
+        reject(
+            "Ops bootstrap executable mode contract diverges: "
+            f"{mismatched}"
+        )
