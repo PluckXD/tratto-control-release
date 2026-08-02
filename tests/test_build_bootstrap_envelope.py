@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import datetime as dt
 import json
 import subprocess
 import sys
@@ -28,7 +29,7 @@ def put(path: Path, value: dict) -> None:
     path.chmod(0o644)
 
 
-def approval() -> dict:
+def approval(*, expired: bool = False) -> dict:
     value = json.loads(
         (
             ROOT / "examples" / "approval.example.json"
@@ -38,6 +39,14 @@ def approval() -> dict:
     value["ops"]["commit_sha"] = "1" * 40
     value["web"]["commit_sha"] = "2" * 40
     value["controller"]["base_sha"] = "3" * 40
+    issued_at = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+    if expired:
+        issued_at -= dt.timedelta(days=2)
+    expires_at = issued_at + dt.timedelta(hours=1)
+    stamp = issued_at.strftime("%Y%m%dT%H%M%SZ")
+    value["release_id"] = f"ctl-{stamp}-bootstrap"
+    value["issued_at"] = issued_at.isoformat().replace("+00:00", "Z")
+    value["expires_at"] = expires_at.isoformat().replace("+00:00", "Z")
     return value
 
 
@@ -90,10 +99,11 @@ def run_builder(
     tmp_path: Path,
     *,
     ids: dict[str, int] | None = None,
+    expired: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     artifact_ids = ids or {"api": 11, "ops": 12, "web": 13}
     approval_path = tmp_path / "approval.json"
-    put(approval_path, approval())
+    put(approval_path, approval(expired=expired))
     summary_paths: dict[str, Path] = {}
     for label, release_sha in (
         ("api", "1" * 40),
@@ -176,4 +186,12 @@ def test_rejects_reused_artifact_id(tmp_path: Path) -> None:
 
     assert result.returncode == 78
     assert "distinct positive IDs" in result.stderr
+    assert not (tmp_path / "attestation.json").exists()
+
+
+def test_rejects_expired_bootstrap_approval(tmp_path: Path) -> None:
+    result = run_builder(tmp_path, expired=True)
+
+    assert result.returncode == 78
+    assert "expired" in result.stderr
     assert not (tmp_path / "attestation.json").exists()

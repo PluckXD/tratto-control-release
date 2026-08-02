@@ -10,6 +10,7 @@ OIDC job in the private bootstrap carrier.
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import hashlib
 import importlib.util
 import json
@@ -130,7 +131,11 @@ def read_json(path: Path, label: str) -> tuple[bytes, dict[str, Any]]:
 def read_approval(path: Path) -> tuple[bytes, dict[str, Any]]:
     raw, value = read_json(path, "bootstrap approval")
     try:
-        APPROVAL.validate_shape(value, now=None, historical=True)
+        APPROVAL.validate_shape(
+            value,
+            now=dt.datetime.now(dt.timezone.utc),
+            historical=False,
+        )
     except APPROVAL.ApprovalError as error:
         reject(f"bootstrap approval is invalid: {error}")
     return raw, value

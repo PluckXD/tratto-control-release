@@ -10,6 +10,7 @@ small and makes the resulting archive independently reproducible/verifiable.
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import gzip
 import hashlib
 import importlib.util
@@ -168,7 +169,11 @@ def load_approval(
         raw = path.read_bytes()
         value = APPROVAL.parse_json(raw, "approval")
         APPROVAL.require_canonical(raw, value, "approval")
-        APPROVAL.validate_shape(value, now=None, historical=True)
+        APPROVAL.validate_shape(
+            value,
+            now=dt.datetime.now(dt.timezone.utc),
+            historical=False,
+        )
     except (OSError, APPROVAL.ApprovalError) as error:
         reject(f"approval is invalid: {error}")
     approved = value["api" if kind == "api" else "web"]["commit_sha"]
