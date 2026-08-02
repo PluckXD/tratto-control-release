@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import importlib.util
 import io
@@ -1462,7 +1463,10 @@ def test_ops_artifact_round_trip_uses_canonical_modes_and_digest(
             )
         else:
             path.write_text(f"{relative}\n", encoding="utf-8")
-        if relative.endswith(".sh"):
+        if (
+            relative.endswith(".sh")
+            or TREE.BOOTSTRAP_REQUIRED_FILE_MODES.get(relative) == 0o555
+        ):
             path.chmod(0o755)
     git(source, "add", ".")
     git(source, "commit", "-m", "ops fixture")
@@ -1557,7 +1561,60 @@ def test_ops_artifact_round_trip_uses_canonical_modes_and_digest(
         for member in members
         if member.isfile()
     )
+    member_modes = {
+        member.name: member.mode
+        for member in members
+        if member.isfile()
+    }
+    assert {
+        path: member_modes[path]
+        for path in TREE.BOOTSTRAP_REQUIRED_FILE_MODES
+    } == TREE.BOOTSTRAP_REQUIRED_FILE_MODES
     assert not any(member.islnk() for member in members)
+
+
+@pytest.mark.parametrize(
+    "path",
+    sorted(TREE.BOOTSTRAP_REQUIRED_FILE_MODES),
+)
+def test_ops_bootstrap_mode_contract_rejects_each_non_executable(
+    path: str,
+) -> None:
+    modes = dict(TREE.BOOTSTRAP_REQUIRED_FILE_MODES)
+    modes[path] = 0o444
+    with pytest.raises(
+        TREE.OpsTreeError,
+        match="bootstrap executable mode contract diverges",
+    ):
+        TREE.validate_bootstrap_required_file_modes(modes)
+
+
+def test_ops_mode_contract_matches_bootstrap_source_helper_minimum() -> None:
+    helper = ast.parse(
+        (ROOT / "scripts/install-bootstrap-source-kit.py").read_text(
+            encoding="utf-8"
+        )
+    )
+    assignments = [
+        node
+        for node in helper.body
+        if (
+            isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name)
+                and target.id == "REQUIRED_FILES"
+                for target in node.targets
+            )
+        )
+    ]
+    assert len(assignments) == 1
+    required_files = ast.literal_eval(assignments[0].value)
+    helper_executables = {
+        path: mode
+        for path, mode in required_files.items()
+        if mode == 0o555
+    }
+    assert helper_executables == TREE.BOOTSTRAP_REQUIRED_FILE_MODES
 
 
 def test_ops_builder_process_rejects_unreviewed_host_platform(
