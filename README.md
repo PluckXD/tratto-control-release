@@ -367,6 +367,73 @@ inconclusive quiescence proof, staged bundle, marker, or replay after stage is
 rejected before further mutation and without a cleanup bypass. Never delete,
 edit, or manually move these journals.
 
+### One-use schema-v6 post-stage quarantine
+
+A stricter extension covers the single later boundary where the predecessor
+source and publisher are terminal, `stage-release.sh` atomically published its
+only bundle, and the predecessor `validate-bundle.py` then rejected the
+canonical schema-v6 attestation because it only implements schema v5. It does
+not make that bundle valid and it does not create a bootstrap marker, switch
+`current`, write release state, or activate anything.
+
+The same six post-publisher bindings are mandatory, plus:
+
+```text
+--expected-post-publisher-staged-bundle-id HASH
+--expected-post-publisher-staged-bundle-tree-sha256 HASH
+```
+
+The tree hash is obtained without improvised host code. Run the same
+Cosign-verified helper FD ceremony with all ordinary helper bindings, the six
+post-publisher bindings, the staged bundle ID, and:
+
+```text
+--inspect-post-publisher-staged-bundle-tree
+```
+
+Omit the tree-hash option in that inspection invocation. Under the same fixed
+deploy lock, the signed helper verifies the successor inputs and signatures,
+the complete predecessor source/publisher state, the active schema-v6 bundle,
+the absence of every later marker, and quiescence before and after hashing. It
+prints one canonical
+`tratto-control-bootstrap-post-stage-observation-v1` JSON document and creates
+no journal, archive, rename, marker, or release state. Transport that document
+outside the node, compare and approve it with the retained stage evidence, then
+repeat the signed FD ceremony without the inspection flag and with
+`--expected-post-publisher-staged-bundle-tree-sha256` set to the approved
+observation. Never pipe inspection output directly into the mutating command.
+
+The bundle ID must equal the predecessor source intent's signed
+`attestation_sha256`. The tree hash uses
+`tratto-control-staged-bundle-tree-v1` and must be authenticated outside the
+host from the exact retained stage evidence. Before mutation the helper opens
+every path with no-follow semantics, permits only protected regular files,
+directories, and the fixed Web cache link, hashes every byte and mode, requires
+the bound type, owner, group, size, path, and fixed link target, requires the
+root-owned canonical schema-v6 attestation to hash to the bundle ID, and
+requires that this is the only bundle. `current`, bootstrap/release markers,
+activation journals, activation epoch, and bootstrap consumption must all be
+absent.
+
+The helper records the exact bundle ID and tree hash in schema 3 of the
+post-publisher journal (schema 4 when nested supersede history is also
+present), then moves the inert bundle with atomic no-replace semantics to:
+
+```text
+/opt/tratto-control/.staging/.bootstrap-post-stage.bundle.<bundle-id>
+```
+
+Only after that durable quarantine may the existing source/publisher
+supersede sequence begin. Replays require the same twelve values, reject
+active/archive coexistence and any foreign bundle, and resume each prefix
+idempotently. There is no delete, overwrite, alternate name, force flag, or
+manual cleanup path.
+
+The signed successor Ops tree must already contain the schema-v6
+`validate-bundle.py`. This bridge only makes room for that corrected successor;
+it never upgrades the predecessor validator and must not be used with another
+schema-v5 Ops tree.
+
 ## Stable controller v2 / envelope v6
 
 The v2/v6 candidate separates stable release authority from product source and

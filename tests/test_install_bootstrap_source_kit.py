@@ -380,12 +380,39 @@ def fake_runtime() -> object:
             pass
         else:
             raise FileExistsError(new_name)
-        os.rename(
-            old_name,
-            new_name,
-            src_dir_fd=old_parent,
-            dst_dir_fd=new_parent,
-        )
+        try:
+            os.rename(
+                old_name,
+                new_name,
+                src_dir_fd=old_parent,
+                dst_dir_fd=new_parent,
+            )
+        except PermissionError:
+            # Production executes as root. The test process emulates that
+            # bounded rename while retaining the protected parent modes.
+            old_mode = stat.S_IMODE(os.fstat(old_parent).st_mode)
+            new_mode = stat.S_IMODE(os.fstat(new_parent).st_mode)
+            moved = os.open(
+                old_name,
+                os.O_RDONLY | os.O_DIRECTORY,
+                dir_fd=old_parent,
+            )
+            moved_mode = stat.S_IMODE(os.fstat(moved).st_mode)
+            os.fchmod(old_parent, old_mode | 0o700)
+            os.fchmod(new_parent, new_mode | 0o700)
+            os.fchmod(moved, moved_mode | 0o700)
+            try:
+                os.rename(
+                    old_name,
+                    new_name,
+                    src_dir_fd=old_parent,
+                    dst_dir_fd=new_parent,
+                )
+            finally:
+                os.fchmod(moved, moved_mode)
+                os.close(moved)
+                os.fchmod(new_parent, new_mode)
+                os.fchmod(old_parent, old_mode)
 
     def exchange(
         old_parent: int,
@@ -513,6 +540,7 @@ def install(
     post_predecessor: (
         tuple[str, str, str, str, str, str] | None
     ) = None,
+    post_stage: tuple[str, str] | None = None,
     publisher_callback=None,
     quiescence_callback=None,
 ) -> str:
@@ -597,6 +625,12 @@ def install(
                 post_publisher_publisher_used_sha256=(
                     post_predecessor[5] if post_predecessor else None
                 ),
+                post_publisher_staged_bundle_id=(
+                    post_stage[0] if post_stage else None
+                ),
+                post_publisher_staged_bundle_tree_sha256=(
+                    post_stage[1] if post_stage else None
+                ),
             ),
             runtime=fake_runtime(),
             signature_verifier=verifier,
@@ -604,6 +638,54 @@ def install(
             lock_descriptor=99,
             quiescence=quiescence,
             fault=fault,
+        )
+    finally:
+        os.close(execution_descriptor)
+
+
+def inspect_post_stage(
+    incoming: Path,
+    state: Path,
+    bindings: tuple[str, str, str, str, str, str],
+    bundle_id: str,
+    calls: list[str],
+) -> bytes:
+    def verifier(
+        _cosign: int,
+        _target: int,
+        _bundle: int,
+        carrier_sha: str,
+    ) -> None:
+        assert carrier_sha == "b" * 40
+        calls.append("signature")
+
+    helper_path = incoming / KIT.HELPER_NAME
+    execution_descriptor = os.open(helper_path, os.O_RDONLY)
+    try:
+        return KIT.inspect_post_stage(
+            incoming=incoming,
+            state_root=state,
+            uid=os.getuid(),
+            gid=os.getgid(),
+            execution_descriptor=execution_descriptor,
+            expectations=KIT.BootstrapExpectations(
+                helper_sha256=expectations(incoming).helper_sha256,
+                attestation_sha256=(
+                    expectations(incoming).attestation_sha256
+                ),
+                carrier_sha=expectations(incoming).carrier_sha,
+                controller_sha=expectations(incoming).controller_sha,
+                post_publisher_predecessor_kit_id=bindings[0],
+                post_publisher_predecessor_controller_sha=bindings[1],
+                post_publisher_source_intent_sha256=bindings[2],
+                post_publisher_source_used_sha256=bindings[3],
+                post_publisher_publisher_intent_sha256=bindings[4],
+                post_publisher_publisher_used_sha256=bindings[5],
+                post_publisher_staged_bundle_id=bundle_id,
+            ),
+            signature_verifier=verifier,
+            lock_descriptor=99,
+            quiescence=lambda *_args: calls.append("quiescence"),
         )
     finally:
         os.close(execution_descriptor)
@@ -878,6 +960,50 @@ def prepare_post_publisher_fixture(
         str(publisher["used_sha256"]),
     )
     return incoming, state, calls, bindings, control
+
+
+def stage_predecessor_schema6_bundle(
+    incoming: Path,
+    state: Path,
+    control: Path,
+    *,
+    required_ancestors: tuple[str, ...] = ("0" * 40,),
+) -> tuple[str, str]:
+    source_intent = json.loads((state / KIT.INTENT_NAME).read_text())
+    bundle_id = str(source_intent["attestation_sha256"])
+    api_sha = str(source_intent["api_sha"])
+    old_archive = (
+        incoming / f"tratto-control-ops-{api_sha}.tar.gz"
+    )
+    old_raw = attestation(
+        api_sha=api_sha,
+        carrier_sha="b" * 40,
+        controller_sha="c" * 40,
+        archive_hash=hashlib.sha256(old_archive.read_bytes()).hexdigest(),
+        archive_size=old_archive.stat().st_size,
+        helper_hash=hashlib.sha256(SCRIPT.read_bytes()).hexdigest(),
+        helper_size=SCRIPT.stat().st_size,
+        required_ancestors=required_ancestors,
+    )
+    assert hashlib.sha256(old_raw).hexdigest() == bundle_id
+    target = control / KIT.BUNDLES_NAME / bundle_id
+    target.mkdir(mode=0o700)
+    attestation_path = target / KIT.ATTESTATION_NAME
+    attestation_path.write_bytes(old_raw)
+    attestation_path.chmod(0o444)
+    empty_marker = target / "empty-package-marker"
+    empty_marker.write_bytes(b"")
+    empty_marker.chmod(0o444)
+    target.chmod(0o555)
+    descriptor = os.open(target, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        tree_digest = KIT.staged_bundle_tree_digest(
+            descriptor,
+            uid=os.getuid(),
+        )
+    finally:
+        os.close(descriptor)
+    return bundle_id, tree_digest
 
 
 def publish_fake_successor_bootstrap(control: Path) -> None:
@@ -2545,6 +2671,451 @@ def test_post_publisher_successor_archives_terminal_evidence_and_replays(
         predecessor_digest,
         successor_digest,
     ]
+
+
+def test_post_stage_successor_quarantines_exact_schema6_bundle_and_replays(
+    secure_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    incoming, state, calls, bindings, control = (
+        prepare_post_publisher_fixture(secure_tmp_path, monkeypatch)
+    )
+    post_stage = stage_predecessor_schema6_bundle(
+        incoming,
+        state,
+        control,
+    )
+
+    assert (
+        install(
+            incoming,
+            state,
+            calls,
+            post_predecessor=bindings,
+            post_stage=post_stage,
+            publisher_callback=lambda: publish_fake_successor_bootstrap(
+                control
+            ),
+        )
+        == "installed"
+    )
+    assert not any((control / KIT.BUNDLES_NAME).iterdir())
+    archive = (
+        control
+        / ".staging"
+        / KIT.post_stage_bundle_archive_name(post_stage[0])
+    )
+    assert archive.is_dir()
+    journal = json.loads(
+        (state / KIT.POST_PUBLISHER_SUPERSEDE_NAME).read_text()
+    )
+    assert journal["schema_version"] == 3
+    assert journal["staged_bundle_id"] == post_stage[0]
+    assert journal["staged_bundle_tree_sha256"] == post_stage[1]
+
+    before = immutable_tree_snapshot(control)
+    calls.clear()
+    assert (
+        install(
+            incoming,
+            state,
+            calls,
+            post_predecessor=bindings,
+            post_stage=post_stage,
+        )
+        == "already-installed"
+    )
+    assert immutable_tree_snapshot(control) == before
+
+
+def test_post_stage_signed_inspection_is_canonical_and_read_only(
+    secure_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    incoming, state, calls, bindings, control = (
+        prepare_post_publisher_fixture(secure_tmp_path, monkeypatch)
+    )
+    bundle_id, tree_digest = stage_predecessor_schema6_bundle(
+        incoming,
+        state,
+        control,
+    )
+    state_before = immutable_tree_snapshot(state)
+    control_before = immutable_tree_snapshot(control)
+    raw = inspect_post_stage(
+        incoming,
+        state,
+        bindings,
+        bundle_id,
+        calls,
+    )
+    value = json.loads(raw)
+
+    assert raw == canonical(value)
+    assert value["bundle_id"] == bundle_id
+    assert value["bundle_tree_sha256"] == tree_digest
+    assert calls == [
+        "signature",
+        "signature",
+        "signature",
+        "quiescence",
+    ]
+    assert immutable_tree_snapshot(state) == state_before
+    assert immutable_tree_snapshot(control) == control_before
+
+
+def test_post_stage_signed_inspection_rejects_tamper_without_mutation(
+    secure_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    incoming, state, calls, bindings, control = (
+        prepare_post_publisher_fixture(secure_tmp_path, monkeypatch)
+    )
+    bundle_id, _tree_digest = stage_predecessor_schema6_bundle(
+        incoming,
+        state,
+        control,
+    )
+    target = (
+        control
+        / KIT.BUNDLES_NAME
+        / bundle_id
+        / KIT.ATTESTATION_NAME
+    )
+    target.chmod(0o600)
+    target.write_bytes(target.read_bytes() + b" ")
+    target.chmod(0o444)
+    state_before = immutable_tree_snapshot(state)
+    control_before = immutable_tree_snapshot(control)
+
+    with pytest.raises(
+        KIT.BootstrapSourceError,
+        match="atestado post-stage diverge",
+    ):
+        inspect_post_stage(
+            incoming,
+            state,
+            bindings,
+            bundle_id,
+            calls,
+        )
+    assert immutable_tree_snapshot(state) == state_before
+    assert immutable_tree_snapshot(control) == control_before
+
+
+def test_post_stage_successor_recovers_sigkill_after_bundle_quarantine(
+    secure_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    incoming, state, calls, bindings, control = (
+        prepare_post_publisher_fixture(secure_tmp_path, monkeypatch)
+    )
+    post_stage = stage_predecessor_schema6_bundle(
+        incoming,
+        state,
+        control,
+    )
+
+    def stop(event: str) -> None:
+        if event == "after_post_publisher_staged_bundle_archive":
+            raise RuntimeError("simulated crash")
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        install(
+            incoming,
+            state,
+            calls,
+            post_predecessor=bindings,
+            post_stage=post_stage,
+            fault=stop,
+        )
+    assert not any((control / KIT.BUNDLES_NAME).iterdir())
+
+    calls.clear()
+    assert (
+        install(
+            incoming,
+            state,
+            calls,
+            post_predecessor=bindings,
+            post_stage=post_stage,
+            publisher_callback=lambda: publish_fake_successor_bootstrap(
+                control
+            ),
+        )
+        == "installed"
+    )
+
+
+def test_post_stage_rejects_wrong_tree_binding_without_mutation(
+    secure_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    incoming, state, calls, bindings, control = (
+        prepare_post_publisher_fixture(secure_tmp_path, monkeypatch)
+    )
+    bundle_id, _tree_digest = stage_predecessor_schema6_bundle(
+        incoming,
+        state,
+        control,
+    )
+    state_before = immutable_tree_snapshot(state)
+    control_before = immutable_tree_snapshot(control)
+
+    with pytest.raises(
+        KIT.BootstrapSourceError,
+        match="árvore do bundle post-stage diverge",
+    ):
+        install(
+            incoming,
+            state,
+            calls,
+            post_predecessor=bindings,
+            post_stage=(bundle_id, "9" * 64),
+        )
+    assert immutable_tree_snapshot(state) == state_before
+    assert immutable_tree_snapshot(control) == control_before
+
+
+def test_post_stage_rejects_hardlink_race_between_lstat_and_open(
+    secure_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    incoming, state, calls, bindings, control = (
+        prepare_post_publisher_fixture(secure_tmp_path, monkeypatch)
+    )
+    post_stage = stage_predecessor_schema6_bundle(
+        incoming,
+        state,
+        control,
+    )
+    target = (
+        control
+        / KIT.BUNDLES_NAME
+        / post_stage[0]
+        / "empty-package-marker"
+    )
+    target_inode = target.stat().st_ino
+    real_fstat = os.fstat
+
+    def raced_fstat(descriptor: int) -> os.stat_result:
+        observed = real_fstat(descriptor)
+        if observed.st_ino != target_inode:
+            return observed
+        fields = list(observed)
+        fields[3] = 2
+        return os.stat_result(fields)
+
+    state_before = immutable_tree_snapshot(state)
+    control_before = immutable_tree_snapshot(control)
+    monkeypatch.setattr(KIT.os, "fstat", raced_fstat)
+    with pytest.raises(
+        KIT.BootstrapSourceError,
+        match="arquivo regular protegido",
+    ):
+        install(
+            incoming,
+            state,
+            calls,
+            post_predecessor=bindings,
+            post_stage=post_stage,
+        )
+    assert immutable_tree_snapshot(state) == state_before
+    assert immutable_tree_snapshot(control) == control_before
+
+
+@pytest.mark.parametrize(
+    "residue",
+    (
+        "active-and-archive",
+        "extra-bundle",
+        "unknown-quarantine",
+    ),
+)
+def test_post_stage_rejects_collision_or_foreign_state_without_mutation(
+    secure_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    residue: str,
+) -> None:
+    incoming, state, calls, bindings, control = (
+        prepare_post_publisher_fixture(secure_tmp_path, monkeypatch)
+    )
+    post_stage = stage_predecessor_schema6_bundle(
+        incoming,
+        state,
+        control,
+    )
+    active = control / KIT.BUNDLES_NAME / post_stage[0]
+    archive = (
+        control
+        / ".staging"
+        / KIT.post_stage_bundle_archive_name(post_stage[0])
+    )
+    if residue in {"active-and-archive", "unknown-quarantine"}:
+        shutil.copytree(active, archive, symlinks=True)
+        if residue == "unknown-quarantine":
+            active.chmod(0o700)
+            shutil.rmtree(active)
+    else:
+        bundles = control / KIT.BUNDLES_NAME
+        bundles.chmod(0o700)
+        foreign = bundles / ("9" * 64)
+        foreign.mkdir(mode=0o555)
+        bundles.chmod(0o711)
+    state_before = immutable_tree_snapshot(state)
+    control_before = immutable_tree_snapshot(control)
+
+    with pytest.raises(KIT.BootstrapSourceError):
+        install(
+            incoming,
+            state,
+            calls,
+            post_predecessor=bindings,
+            post_stage=(
+                None if residue == "unknown-quarantine" else post_stage
+            ),
+        )
+    assert immutable_tree_snapshot(state) == state_before
+    assert immutable_tree_snapshot(control) == control_before
+
+
+def test_post_stage_rejects_bundle_id_not_bound_by_source_intent(
+    secure_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    incoming, state, calls, bindings, control = (
+        prepare_post_publisher_fixture(secure_tmp_path, monkeypatch)
+    )
+    _bundle_id, tree_digest = stage_predecessor_schema6_bundle(
+        incoming,
+        state,
+        control,
+    )
+    state_before = immutable_tree_snapshot(state)
+    control_before = immutable_tree_snapshot(control)
+    with pytest.raises(
+        KIT.BootstrapSourceError,
+        match="não pertence ao source predecessor",
+    ):
+        install(
+            incoming,
+            state,
+            calls,
+            post_predecessor=bindings,
+            post_stage=("9" * 64, tree_digest),
+        )
+    assert immutable_tree_snapshot(state) == state_before
+    assert immutable_tree_snapshot(control) == control_before
+
+
+def test_nested_post_stage_journal_binds_both_histories_and_bundle(
+    secure_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    incoming, state, calls, bindings, control = (
+        prepare_nested_post_publisher_fixture(
+            secure_tmp_path,
+            monkeypatch,
+        )
+    )
+    post_stage = stage_predecessor_schema6_bundle(
+        incoming,
+        state,
+        control,
+        required_ancestors=("a" * 40,),
+    )
+
+    assert (
+        install(
+            incoming,
+            state,
+            calls,
+            post_predecessor=bindings,
+            post_stage=post_stage,
+            publisher_callback=lambda: publish_fake_successor_bootstrap(
+                control
+            ),
+        )
+        == "installed"
+    )
+    journal = json.loads(
+        (state / KIT.POST_PUBLISHER_SUPERSEDE_NAME).read_text()
+    )
+    assert journal["schema_version"] == 4
+    assert journal["staged_bundle_id"] == post_stage[0]
+    assert "nested_source_supersede_sha256" in journal
+    assert "nested_publisher_supersede_sha256" in journal
+    before = immutable_tree_snapshot(control)
+    calls.clear()
+    assert (
+        install(
+            incoming,
+            state,
+            calls,
+            post_predecessor=bindings,
+            post_stage=post_stage,
+        )
+        == "already-installed"
+    )
+    assert immutable_tree_snapshot(control) == before
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "fork"),
+    reason="fault harness exige fork",
+)
+def test_nested_post_stage_recovers_sigkill_after_quarantine(
+    secure_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    incoming, state, _calls, bindings, control = (
+        prepare_nested_post_publisher_fixture(
+            secure_tmp_path,
+            monkeypatch,
+        )
+    )
+    post_stage = stage_predecessor_schema6_bundle(
+        incoming,
+        state,
+        control,
+        required_ancestors=("a" * 40,),
+    )
+    child = os.fork()
+    if child == 0:
+        def kill_at(event: str) -> None:
+            if event == "after_post_publisher_staged_bundle_archive":
+                os.kill(os.getpid(), signal.SIGKILL)
+
+        try:
+            install(
+                incoming,
+                state,
+                [],
+                post_predecessor=bindings,
+                post_stage=post_stage,
+                fault=kill_at,
+            )
+        except BaseException:
+            os._exit(92)
+        os._exit(91)
+    _, status = os.waitpid(child, 0)
+    assert os.WIFSIGNALED(status)
+    assert os.WTERMSIG(status) == signal.SIGKILL
+    assert not any((control / KIT.BUNDLES_NAME).iterdir())
+
+    assert (
+        install(
+            incoming,
+            state,
+            [],
+            post_predecessor=bindings,
+            post_stage=post_stage,
+            publisher_callback=lambda: publish_fake_successor_bootstrap(
+                control
+            ),
+        )
+        == "installed"
+    )
 
 
 def test_post_publisher_successor_preserves_nested_supersede_and_replays(
@@ -4366,6 +4937,91 @@ def test_cli_requires_fd_and_all_external_bindings() -> None:
         post_publisher.expected_post_publisher_predecessor_kit_id
         == "5" * 64
     )
+    post_stage = KIT.parse_cli(
+        [
+            "--helper-fd",
+            "0",
+            "--expected-helper-sha256",
+            "1" * 64,
+            "--expected-attestation-sha256",
+            "2" * 64,
+            "--expected-carrier-sha",
+            "3" * 40,
+            "--expected-controller-sha",
+            "4" * 40,
+            "--expected-post-publisher-predecessor-kit-id",
+            "5" * 64,
+            "--expected-post-publisher-predecessor-controller-sha",
+            "6" * 40,
+            "--expected-post-publisher-source-intent-sha256",
+            "7" * 64,
+            "--expected-post-publisher-source-used-sha256",
+            "8" * 64,
+            "--expected-post-publisher-publisher-intent-sha256",
+            "9" * 64,
+            "--expected-post-publisher-publisher-used-sha256",
+            "a" * 64,
+            "--expected-post-publisher-staged-bundle-id",
+            "b" * 64,
+            "--expected-post-publisher-staged-bundle-tree-sha256",
+            "c" * 64,
+        ]
+    )
+    assert post_stage.expected_post_publisher_staged_bundle_id == "b" * 64
+    inspection = KIT.parse_cli(
+        [
+            "--helper-fd",
+            "0",
+            "--expected-helper-sha256",
+            "1" * 64,
+            "--expected-attestation-sha256",
+            "2" * 64,
+            "--expected-carrier-sha",
+            "3" * 40,
+            "--expected-controller-sha",
+            "4" * 40,
+            "--expected-post-publisher-predecessor-kit-id",
+            "5" * 64,
+            "--expected-post-publisher-predecessor-controller-sha",
+            "6" * 40,
+            "--expected-post-publisher-source-intent-sha256",
+            "7" * 64,
+            "--expected-post-publisher-source-used-sha256",
+            "8" * 64,
+            "--expected-post-publisher-publisher-intent-sha256",
+            "9" * 64,
+            "--expected-post-publisher-publisher-used-sha256",
+            "a" * 64,
+            "--expected-post-publisher-staged-bundle-id",
+            "b" * 64,
+            "--inspect-post-publisher-staged-bundle-tree",
+        ]
+    )
+    assert inspection.inspect_post_publisher_staged_bundle_tree is True
+    assert (
+        inspection.expected_post_publisher_staged_bundle_tree_sha256
+        is None
+    )
+    with pytest.raises(
+        KIT.BootstrapSourceError,
+        match="exatamente",
+    ):
+        KIT.parse_cli(
+            [
+                "--helper-fd",
+                "0",
+                "--expected-helper-sha256",
+                "1" * 64,
+                "--expected-attestation-sha256",
+                "2" * 64,
+                "--expected-carrier-sha",
+                "3" * 40,
+                "--expected-controller-sha",
+                "4" * 40,
+                "--expected-post-publisher-staged-bundle-id",
+                "b" * 64,
+            ]
+        )
     with pytest.raises(KIT.BootstrapSourceError, match="CLI"):
         KIT.parse_cli(
             [
@@ -4799,6 +5455,89 @@ def test_post_publisher_main_rejects_any_inherited_lock_environment(
         os.close(helper_fd)
 
     assert acquired is False
+
+
+def test_post_stage_inspection_main_uses_direct_lock_and_never_installs(
+    secure_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+) -> None:
+    helper_fd = os.open(SCRIPT, os.O_RDONLY)
+    args = KIT.parse_cli(
+        [
+            "--helper-fd",
+            str(helper_fd),
+            "--expected-helper-sha256",
+            "1" * 64,
+            "--expected-attestation-sha256",
+            "2" * 64,
+            "--expected-carrier-sha",
+            "3" * 40,
+            "--expected-controller-sha",
+            "4" * 40,
+            "--expected-post-publisher-predecessor-kit-id",
+            "5" * 64,
+            "--expected-post-publisher-predecessor-controller-sha",
+            "6" * 40,
+            "--expected-post-publisher-source-intent-sha256",
+            "7" * 64,
+            "--expected-post-publisher-source-used-sha256",
+            "8" * 64,
+            "--expected-post-publisher-publisher-intent-sha256",
+            "9" * 64,
+            "--expected-post-publisher-publisher-used-sha256",
+            "a" * 64,
+            "--expected-post-publisher-staged-bundle-id",
+            "b" * 64,
+            "--inspect-post-publisher-staged-bundle-tree",
+        ]
+    )
+    observed_locks: list[int] = []
+    payload = canonical(
+        {
+            "bundle_id": "b" * 64,
+            "bundle_tree_sha256": "c" * 64,
+        }
+    )
+
+    monkeypatch.setattr(KIT, "parse_cli", lambda _argv: args)
+    monkeypatch.setattr(
+        KIT,
+        "validate_execution_entrypoint",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(KIT, "EXPECTED_UID", os.geteuid())
+    monkeypatch.setattr(KIT, "EXPECTED_GID", os.getegid())
+    monkeypatch.delenv(KIT.LOCK_FD_ENV, raising=False)
+    monkeypatch.delenv(KIT.LOCK_HELD_ENV, raising=False)
+    monkeypatch.setattr(
+        KIT,
+        "acquire_fixed_deploy_lock",
+        lambda **_kwargs: os.dup(helper_fd),
+    )
+    monkeypatch.setattr(
+        KIT,
+        "inspect_post_stage",
+        lambda **kwargs: (
+            observed_locks.append(kwargs["lock_descriptor"]) or payload
+        ),
+    )
+    monkeypatch.setattr(
+        KIT,
+        "install_source",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("inspection must not install")
+        ),
+    )
+    try:
+        assert KIT.main() == 0
+    finally:
+        os.close(helper_fd)
+
+    assert capsysbinary.readouterr().out == payload
+    assert len(observed_locks) == 1
+    with pytest.raises(OSError):
+        os.fstat(observed_locks[0])
 
 
 @pytest.mark.parametrize("install_fails", (False, True))

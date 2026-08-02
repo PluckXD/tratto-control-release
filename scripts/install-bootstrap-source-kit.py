@@ -26,7 +26,7 @@ import stat
 import subprocess
 import tarfile
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Mapping
 
@@ -80,6 +80,7 @@ POST_PUBLISHER_ARCHIVE_PREFIX = ".bootstrap-post-publisher."
 NESTED_POST_PUBLISHER_ARCHIVE_PREFIX = (
     ".bootstrap-post-publisher.nested-"
 )
+POST_STAGE_BUNDLE_ARCHIVE_PREFIX = ".bootstrap-post-stage.bundle."
 BOOTSTRAP_RELEASE_MARKER = Path(
     "/etc/tratto-control/bootstrap-release.env"
 )
@@ -135,6 +136,9 @@ MAX_TREE_BYTES = 64 * 1024 * 1024
 MAX_PACKAGED_UNITS_BYTES = 64 * 1024
 MAX_PACKAGED_UNIT_BYTES = 1024 * 1024
 MAX_GUARDIAN_REPORT_BYTES = 4096
+MAX_STAGED_BUNDLE_ENTRIES = 32768
+MAX_STAGED_BUNDLE_BYTES = 512 * 1024 * 1024
+MAX_STAGED_BUNDLE_MEMBER_BYTES = 32 * 1024 * 1024
 QUIESCENCE_SUCCESS = (
     b"stack Control totalmente parada e sem concorr\xc3\xaancia systemd\n"
 )
@@ -504,6 +508,8 @@ class BootstrapExpectations:
     post_publisher_source_used_sha256: str | None = None
     post_publisher_publisher_intent_sha256: str | None = None
     post_publisher_publisher_used_sha256: str | None = None
+    post_publisher_staged_bundle_id: str | None = None
+    post_publisher_staged_bundle_tree_sha256: str | None = None
 
 
 def validate_expectations(
@@ -585,6 +591,23 @@ def validate_expectations(
         require_hash(
             expectations.post_publisher_publisher_used_sha256,
             "publisher used post-publisher esperado",
+        )
+    post_stage_values = (
+        expectations.post_publisher_staged_bundle_id,
+        expectations.post_publisher_staged_bundle_tree_sha256,
+    )
+    if any(item is not None for item in post_stage_values):
+        if not all(item is not None for item in post_stage_values):
+            reject("bindings do bundle post-stage precisam vir juntos")
+        if not all(item is not None for item in post_publisher_values):
+            reject("bundle post-stage exige recovery post-publisher completo")
+        require_hash(
+            expectations.post_publisher_staged_bundle_id,
+            "bundle ID post-stage esperado",
+        )
+        require_hash(
+            expectations.post_publisher_staged_bundle_tree_sha256,
+            "árvore do bundle post-stage esperada",
         )
 
 
@@ -2496,6 +2519,8 @@ class PostPublisherRecovery:
     publisher_previous_name: str
     successor_kit_id: str
     successor_new_digest: str
+    staged_bundle_id: str | None = None
+    staged_bundle_tree_sha256: str | None = None
     nested_source_supersede_sha256: str | None = None
     nested_publisher_supersede_sha256: str | None = None
     nested_history: NestedSupersedeHistory | None = None
@@ -2507,6 +2532,11 @@ def post_publisher_archive_name(kind: str, kit_id: str) -> str:
         reject("tipo de arquivo post-publisher inválido")
     suffix = ".json" if kind in {"intent", "used"} else ""
     return f"{POST_PUBLISHER_ARCHIVE_PREFIX}{kind}.{kit_id}{suffix}"
+
+
+def post_stage_bundle_archive_name(bundle_id: str) -> str:
+    require_hash(bundle_id, "bundle ID do arquivo post-stage")
+    return f"{POST_STAGE_BUNDLE_ARCHIVE_PREFIX}{bundle_id}"
 
 
 def nested_source_archive_name(kind: str, kit_id: str) -> str:
@@ -3242,6 +3272,10 @@ def post_publisher_supersede_payload(
         recovery.nested_source_supersede_sha256,
         recovery.nested_publisher_supersede_sha256,
     )
+    staged_hashes = (
+        recovery.staged_bundle_id,
+        recovery.staged_bundle_tree_sha256,
+    )
     if any(item is not None for item in nested_hashes):
         if not all(item is not None for item in nested_hashes):
             reject("bindings do histórico aninhado estão incompletos")
@@ -3251,6 +3285,14 @@ def post_publisher_supersede_payload(
         )
         value["nested_publisher_supersede_sha256"] = (
             recovery.nested_publisher_supersede_sha256
+        )
+    if any(item is not None for item in staged_hashes):
+        if not all(item is not None for item in staged_hashes):
+            reject("bindings do bundle post-stage estão incompletos")
+        value["schema_version"] = 4 if value["schema_version"] == 2 else 3
+        value["staged_bundle_id"] = recovery.staged_bundle_id
+        value["staged_bundle_tree_sha256"] = (
+            recovery.staged_bundle_tree_sha256
         )
     return canonical_bytes(value)
 
@@ -3287,12 +3329,26 @@ def validate_post_publisher_supersede(
     schema_version = value.get("schema_version")
     if type(schema_version) is not int:
         reject("post-publisher supersede possui schema inválido")
+    staged = schema_version in {3, 4}
+    nested = schema_version in {2, 4}
     if schema_version == 1:
         expected_keys = base_keys
     elif schema_version == 2:
         expected_keys = base_keys | {
             "nested_source_supersede_sha256",
             "nested_publisher_supersede_sha256",
+        }
+    elif schema_version == 3:
+        expected_keys = base_keys | {
+            "staged_bundle_id",
+            "staged_bundle_tree_sha256",
+        }
+    elif schema_version == 4:
+        expected_keys = base_keys | {
+            "nested_source_supersede_sha256",
+            "nested_publisher_supersede_sha256",
+            "staged_bundle_id",
+            "staged_bundle_tree_sha256",
         }
     else:
         reject("post-publisher supersede possui schema inválido")
@@ -3375,7 +3431,7 @@ def validate_post_publisher_supersede(
             value["nested_source_supersede_sha256"],
             "source supersede aninhado no recovery",
         )
-        if schema_version == 2
+        if nested
         else None
     )
     nested_publisher_supersede_sha256 = (
@@ -3383,7 +3439,23 @@ def validate_post_publisher_supersede(
             value["nested_publisher_supersede_sha256"],
             "publisher supersede aninhado no recovery",
         )
-        if schema_version == 2
+        if nested
+        else None
+    )
+    staged_bundle_id = (
+        require_hash(
+            value["staged_bundle_id"],
+            "bundle ID post-stage no recovery",
+        )
+        if staged
+        else None
+    )
+    staged_bundle_tree_sha256 = (
+        require_hash(
+            value["staged_bundle_tree_sha256"],
+            "árvore do bundle post-stage no recovery",
+        )
+        if staged
         else None
     )
     return PostPublisherRecovery(
@@ -3397,6 +3469,8 @@ def validate_post_publisher_supersede(
         publisher_previous_name=publisher_previous_name,
         successor_kit_id=successor_kit_id,
         successor_new_digest=successor_new_digest,
+        staged_bundle_id=staged_bundle_id,
+        staged_bundle_tree_sha256=staged_bundle_tree_sha256,
         nested_source_supersede_sha256=(
             nested_source_supersede_sha256
         ),
@@ -3414,12 +3488,330 @@ def require_absent_path(path: Path, label: str) -> None:
     reject(f"{label} precisa estar ausente no estado pré-stage")
 
 
-def validate_post_publisher_pre_stage(
-    state_descriptor: int,
+def staged_bundle_tree_digest(
+    descriptor: int,
     *,
+    uid: int,
+) -> str:
+    """Hash one already-published, inert stage tree without following links."""
+
+    digest = hashlib.sha256()
+    digest.update(b"tratto-control-staged-bundle-tree-v1\0")
+    entries = 0
+    total_bytes = 0
+
+    def record(
+        *,
+        kind: str,
+        relative: str,
+        info: os.stat_result,
+        content_sha256: str,
+    ) -> None:
+        nonlocal entries
+        entries += 1
+        if entries > MAX_STAGED_BUNDLE_ENTRIES:
+            reject("bundle post-stage excede o limite de entradas")
+        digest.update(
+            (
+                f"{kind}\0{stat.S_IMODE(info.st_mode):04o}\0"
+                f"{info.st_uid}\0{info.st_gid}\0{info.st_size}\0"
+                f"{content_sha256}\0{relative}\0"
+            ).encode("utf-8")
+        )
+
+    def visit(current: int, relative: str) -> None:
+        nonlocal total_bytes
+        before = os.fstat(current)
+        if (
+            not stat.S_ISDIR(before.st_mode)
+            or before.st_uid != uid
+            or stat.S_IMODE(before.st_mode) not in {0o550, 0o555}
+        ):
+            reject("diretório do bundle post-stage possui metadata insegura")
+        record(
+            kind="directory",
+            relative=relative or ".",
+            info=before,
+            content_sha256="-",
+        )
+        try:
+            names = sorted(
+                os.listdir(current),
+                key=lambda item: item.encode("utf-8"),
+            )
+        except (OSError, UnicodeError):
+            reject("bundle post-stage não pôde ser inventariado")
+        for name in names:
+            path = f"{relative}/{name}" if relative else name
+            if (
+                canonical_member_path(path) != path
+                or len(path.encode("utf-8")) > MAX_PATH_BYTES
+            ):
+                reject("bundle post-stage contém caminho não canônico")
+            try:
+                info = os.stat(
+                    name,
+                    dir_fd=current,
+                    follow_symlinks=False,
+                )
+            except OSError:
+                reject("entrada do bundle post-stage sumiu")
+            mode = stat.S_IMODE(info.st_mode)
+            if info.st_uid != uid:
+                reject("entrada do bundle post-stage não pertence a root")
+            if stat.S_ISDIR(info.st_mode):
+                try:
+                    child = os.open(
+                        name,
+                        os.O_RDONLY
+                        | os.O_DIRECTORY
+                        | os.O_CLOEXEC
+                        | os.O_NOFOLLOW,
+                        dir_fd=current,
+                    )
+                except OSError:
+                    reject("diretório post-stage não pôde ser aberto")
+                try:
+                    require_same_mount(
+                        current,
+                        child,
+                        f"diretório post-stage {path}",
+                    )
+                    visit(child, path)
+                finally:
+                    os.close(child)
+                continue
+            if stat.S_ISREG(info.st_mode):
+                validate_regular(
+                    info,
+                    f"arquivo post-stage {path}",
+                    uid=uid,
+                    gid=info.st_gid,
+                    modes={0o440, 0o444, 0o550, 0o555},
+                    maximum=MAX_STAGED_BUNDLE_MEMBER_BYTES,
+                    allow_empty=True,
+                )
+                try:
+                    file_descriptor = os.open(
+                        name,
+                        os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                        dir_fd=current,
+                    )
+                except OSError:
+                    reject("arquivo post-stage não pôde ser aberto")
+                try:
+                    opened = os.fstat(file_descriptor)
+                    validate_regular(
+                        opened,
+                        f"arquivo post-stage aberto {path}",
+                        uid=uid,
+                        gid=info.st_gid,
+                        modes={0o440, 0o444, 0o550, 0o555},
+                        maximum=MAX_STAGED_BUNDLE_MEMBER_BYTES,
+                        allow_empty=True,
+                    )
+                    require_same_mount(
+                        current,
+                        file_descriptor,
+                        f"arquivo post-stage {path}",
+                    )
+                    if (
+                        opened.st_dev,
+                        opened.st_ino,
+                        opened.st_mode,
+                        opened.st_uid,
+                        opened.st_gid,
+                        opened.st_size,
+                        opened.st_nlink,
+                        opened.st_mtime_ns,
+                        opened.st_ctime_ns,
+                    ) != (
+                        info.st_dev,
+                        info.st_ino,
+                        info.st_mode,
+                        info.st_uid,
+                        info.st_gid,
+                        info.st_size,
+                        info.st_nlink,
+                        info.st_mtime_ns,
+                        info.st_ctime_ns,
+                    ):
+                        reject("arquivo post-stage mudou antes da leitura")
+                    content_sha256 = digest_fd(
+                        file_descriptor,
+                        opened,
+                        f"arquivo post-stage {path}",
+                    )
+                finally:
+                    os.close(file_descriptor)
+                total_bytes += opened.st_size
+                if total_bytes > MAX_STAGED_BUNDLE_BYTES:
+                    reject("bundle post-stage excede o limite de bytes")
+                record(
+                    kind="file",
+                    relative=path,
+                    info=opened,
+                    content_sha256=content_sha256,
+                )
+                continue
+            if stat.S_ISLNK(info.st_mode):
+                if (
+                    path != "web/.next/cache"
+                    or mode != 0o777
+                    or info.st_nlink != 1
+                ):
+                    reject("bundle post-stage contém link não autorizado")
+                if not hasattr(os, "O_PATH"):
+                    reject("mount do link post-stage não é verificável")
+                try:
+                    link_descriptor = os.open(
+                        name,
+                        os.O_PATH | os.O_CLOEXEC | os.O_NOFOLLOW,
+                        dir_fd=current,
+                    )
+                except OSError:
+                    reject("link post-stage não pôde ser aberto")
+                try:
+                    require_same_mount(
+                        current,
+                        link_descriptor,
+                        f"link post-stage {path}",
+                    )
+                    target = os.readlink(name, dir_fd=current)
+                    after = os.stat(
+                        name,
+                        dir_fd=current,
+                        follow_symlinks=False,
+                    )
+                except OSError:
+                    reject("link post-stage não pôde ser lido")
+                finally:
+                    os.close(link_descriptor)
+                if (
+                    target != "/var/cache/tratto-control/web"
+                    or (
+                        info.st_dev,
+                        info.st_ino,
+                        info.st_mode,
+                        info.st_uid,
+                        info.st_gid,
+                        info.st_size,
+                        info.st_mtime_ns,
+                        info.st_ctime_ns,
+                    )
+                    != (
+                        after.st_dev,
+                        after.st_ino,
+                        after.st_mode,
+                        after.st_uid,
+                        after.st_gid,
+                        after.st_size,
+                        after.st_mtime_ns,
+                        after.st_ctime_ns,
+                    )
+                ):
+                    reject("link post-stage diverge do cache fixo")
+                record(
+                    kind="symlink",
+                    relative=path,
+                    info=info,
+                    content_sha256=hashlib.sha256(
+                        target.encode("utf-8")
+                    ).hexdigest(),
+                )
+                continue
+            reject("bundle post-stage contém entrada especial")
+        after = os.fstat(current)
+        stable = (
+            "st_dev",
+            "st_ino",
+            "st_mode",
+            "st_nlink",
+            "st_uid",
+            "st_gid",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+        if any(
+            getattr(before, field) != getattr(after, field)
+            for field in stable
+        ):
+            reject("diretório do bundle post-stage mudou durante o hash")
+
+    visit(descriptor, "")
+    return digest.hexdigest()
+
+
+def validate_staged_bundle_attestation(
+    bundle: int,
+    *,
+    bundle_id: str,
     uid: int,
     gid: int,
 ) -> None:
+    try:
+        descriptor = os.open(
+            "release-attestation.json",
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=bundle,
+        )
+    except OSError:
+        reject("atestado do bundle post-stage não pôde ser aberto")
+    try:
+        info = os.fstat(descriptor)
+        validate_regular(
+            info,
+            "atestado do bundle post-stage",
+            uid=uid,
+            gid=gid,
+            modes={0o444},
+            maximum=MAX_JSON_BYTES,
+        )
+        raw = read_all(
+            descriptor,
+            info,
+            maximum=MAX_JSON_BYTES,
+            label="atestado do bundle post-stage",
+        )
+    finally:
+        os.close(descriptor)
+    if hashlib.sha256(raw).hexdigest() != bundle_id:
+        reject("atestado post-stage diverge do bundle ID")
+    value = parse_canonical_json(raw, "atestado do bundle post-stage")
+    if (
+        value.get("schema_version") != 6
+        or set(value)
+        != {
+            "approval",
+            "artifacts",
+            "behavioral_verification",
+            "bootstrap_source_helper",
+            "carrier",
+            "controller",
+            "migration",
+            "schema_version",
+            "supplemental_inventory",
+        }
+    ):
+        reject("recovery post-stage exige o atestado schema 6 exato")
+
+
+def source_intent_attestation_sha256(raw: bytes) -> str:
+    value = parse_canonical_json(raw, "source intent do bundle post-stage")
+    return require_hash(
+        value.get("attestation_sha256"),
+        "atestado no source intent post-stage",
+    )
+
+
+def validate_post_publisher_pre_stage(
+    state_descriptor: int,
+    *,
+    recovery: PostPublisherRecovery | None = None,
+    uid: int,
+    gid: int,
+) -> bool:
+    bundle_archived = False
     control = open_path_chain(
         CONTROL_ROOT,
         uid=uid,
@@ -3447,8 +3839,109 @@ def validate_post_publisher_pre_stage(
         if bundles is None:
             reject("diretório de bundles pré-stage está ausente")
         try:
-            if os.listdir(bundles):
-                reject("recovery post-publisher encontrou bundle staged")
+            expected_id = (
+                recovery.staged_bundle_id
+                if recovery is not None
+                else None
+            )
+            expected_tree = (
+                recovery.staged_bundle_tree_sha256
+                if recovery is not None
+                else None
+            )
+            if (expected_id is None) != (expected_tree is None):
+                reject("journal post-stage possui bindings incompletos")
+            names = set(os.listdir(bundles))
+            staging = _open_named_directory(
+                control,
+                ".staging",
+                uid=uid,
+                gid=gid,
+                modes={0o700},
+            )
+            if staging is None:
+                reject("staging post-stage está ausente")
+            try:
+                archive_name = (
+                    post_stage_bundle_archive_name(expected_id)
+                    if expected_id is not None
+                    else None
+                )
+                archived = (
+                    _open_named_directory(
+                        staging,
+                        archive_name,
+                        uid=uid,
+                        gid=gid,
+                        modes={0o555},
+                    )
+                    if archive_name is not None
+                    else None
+                )
+                active = (
+                    _open_named_directory(
+                        bundles,
+                        expected_id,
+                        uid=uid,
+                        gid=gid,
+                        modes={0o555},
+                    )
+                    if expected_id is not None
+                    else None
+                )
+                try:
+                    if expected_id is None:
+                        if names or any(
+                            name.startswith(
+                                POST_STAGE_BUNDLE_ARCHIVE_PREFIX
+                            )
+                            for name in os.listdir(staging)
+                        ):
+                            reject(
+                                "recovery post-publisher encontrou "
+                                "bundle staged"
+                            )
+                    else:
+                        if active is not None and archived is not None:
+                            reject(
+                                "bundle post-stage coexiste com sua "
+                                "quarentena"
+                            )
+                        if active is None and archived is None:
+                            reject(
+                                "bundle post-stage autorizado está ausente"
+                            )
+                        if names not in ({expected_id}, set()):
+                            reject(
+                                "diretório de bundles contém release estranho"
+                            )
+                        selected = (
+                            archived if archived is not None else active
+                        )
+                        assert (
+                            selected is not None
+                            and expected_tree is not None
+                        )
+                        validate_staged_bundle_attestation(
+                            selected,
+                            bundle_id=expected_id,
+                            uid=uid,
+                            gid=gid,
+                        )
+                        observed_tree = staged_bundle_tree_digest(
+                            selected,
+                            uid=uid,
+                        )
+                        if observed_tree != expected_tree:
+                            reject("árvore do bundle post-stage diverge")
+                        bundle_archived = archived is not None
+                finally:
+                    if active is not None:
+                        os.close(active)
+                    if archived is not None:
+                        os.close(archived)
+            finally:
+                os.close(staging)
         finally:
             os.close(bundles)
     finally:
@@ -3470,6 +3963,7 @@ def validate_post_publisher_pre_stage(
         pass
     else:
         reject("bootstrap consumption marker já existe")
+    return bundle_archived
 
 
 def validate_fixed_post_publisher_state(
@@ -3723,6 +4217,16 @@ def build_initial_post_publisher_recovery(
         ).hexdigest(),
         publisher_authorization_required=False,
     )
+    staged_bundle_id = expectations.post_publisher_staged_bundle_id
+    staged_bundle_tree_sha256 = (
+        expectations.post_publisher_staged_bundle_tree_sha256
+    )
+    if (
+        staged_bundle_id is not None
+        and staged_bundle_id
+        != source_intent_attestation_sha256(intent_raw)
+    ):
+        reject("bundle post-stage não pertence ao source predecessor")
     recovery = PostPublisherRecovery(
         predecessor=predecessor,
         source_intent_sha256=hashlib.sha256(intent_raw).hexdigest(),
@@ -3738,6 +4242,8 @@ def build_initial_post_publisher_recovery(
         publisher_previous_name=publisher.previous_name,
         successor_kit_id=successor_kit_id,
         successor_new_digest=successor_new_digest,
+        staged_bundle_id=staged_bundle_id,
+        staged_bundle_tree_sha256=staged_bundle_tree_sha256,
         nested_source_supersede_sha256=(
             hashlib.sha256(
                 nested_history.source_supersede_raw
@@ -3756,6 +4262,7 @@ def build_initial_post_publisher_recovery(
     )
     validate_post_publisher_pre_stage(
         state_descriptor,
+        recovery=recovery,
         uid=uid,
         gid=gid,
     )
@@ -3898,6 +4405,10 @@ def _post_publisher_recovery_from_record(
         != expectations.post_publisher_publisher_intent_sha256
         or recovery.publisher_used_sha256
         != expectations.post_publisher_publisher_used_sha256
+        or recovery.staged_bundle_id
+        != expectations.post_publisher_staged_bundle_id
+        or recovery.staged_bundle_tree_sha256
+        != expectations.post_publisher_staged_bundle_tree_sha256
         or predecessor.api_sha not in binding.api_required_ancestors
         or predecessor.api_sha not in binding.ops_required_ancestors
     ):
@@ -3921,6 +4432,12 @@ def _post_publisher_recovery_from_record(
         != recovery.source_intent_sha256
     ):
         reject("source intent post-publisher não está recuperável")
+    if (
+        recovery.staged_bundle_id is not None
+        and recovery.staged_bundle_id
+        != source_intent_attestation_sha256(intent_raw)
+    ):
+        reject("bundle post-stage diverge do source predecessor")
     parsed = validate_source_intent(intent_raw)
     if (
         parsed.kit_id != predecessor.kit_id
@@ -3995,6 +4512,10 @@ def _post_publisher_recovery_from_record(
         publisher_previous_name=recovery.publisher_previous_name,
         successor_kit_id=recovery.successor_kit_id,
         successor_new_digest=recovery.successor_new_digest,
+        staged_bundle_id=recovery.staged_bundle_id,
+        staged_bundle_tree_sha256=(
+            recovery.staged_bundle_tree_sha256
+        ),
         nested_source_supersede_sha256=(
             recovery.nested_source_supersede_sha256
         ),
@@ -4519,8 +5040,9 @@ def validate_existing_post_publisher_recovery(
     uid: int,
     gid: int,
 ) -> str:
-    validate_post_publisher_pre_stage(
+    staged_bundle_archived = validate_post_publisher_pre_stage(
         state_descriptor,
+        recovery=recovery,
         uid=uid,
         gid=gid,
     )
@@ -4591,8 +5113,12 @@ def validate_existing_post_publisher_recovery(
             gid=gid,
         )
         archive_steps = (
-            source_used_archived,
-            *publisher_archived,
+            (
+                (staged_bundle_archived,)
+                if recovery.staged_bundle_id is not None
+                else ()
+            )
+            + (source_used_archived, *publisher_archived)
         )
         archive_count = sum(archive_steps)
         if archive_steps != (True,) * archive_count + (False,) * (
@@ -4718,6 +5244,15 @@ def validate_existing_post_publisher_recovery(
             )
             if archived
         }
+        if (
+            recovery.staged_bundle_id is not None
+            and staged_bundle_archived
+        ):
+            allowed_staging.add(
+                post_stage_bundle_archive_name(
+                    recovery.staged_bundle_id
+                )
+            )
         allowed_staging.update(nested_publisher_allowed)
         for kind, active_name, archived in (
             ("used", PUBLISHER_USED_NAME, publisher_archived[0]),
@@ -5196,6 +5731,144 @@ def archive_nested_supersede_history(
         os.close(control)
 
 
+def archive_post_stage_bundle(
+    state_descriptor: int,
+    recovery: PostPublisherRecovery,
+    *,
+    uid: int,
+    gid: int,
+    runtime: Runtime,
+) -> None:
+    if recovery.staged_bundle_id is None:
+        return
+    if recovery.staged_bundle_tree_sha256 is None:
+        reject("recovery post-stage perdeu o hash da árvore")
+    if validate_post_publisher_pre_stage(
+        state_descriptor,
+        recovery=recovery,
+        uid=uid,
+        gid=gid,
+    ):
+        return
+    control = open_path_chain(
+        CONTROL_ROOT,
+        uid=uid,
+        gid=gid,
+        final_modes={0o711},
+    )
+    bundles: int | None = None
+    staging: int | None = None
+    try:
+        bundles = _open_named_directory(
+            control,
+            BUNDLES_NAME,
+            uid=uid,
+            gid=gid,
+            modes={0o711},
+        )
+        staging = _open_named_directory(
+            control,
+            ".staging",
+            uid=uid,
+            gid=gid,
+            modes={0o700},
+        )
+        if bundles is None or staging is None:
+            reject("raízes do bundle post-stage estão ausentes")
+        require_same_mount(
+            bundles,
+            staging,
+            "quarentena do bundle post-stage",
+        )
+        bundle = _open_named_directory(
+            bundles,
+            recovery.staged_bundle_id,
+            uid=uid,
+            gid=gid,
+            modes={0o555},
+        )
+        if bundle is None:
+            reject("bundle post-stage sumiu antes da quarentena")
+        try:
+            validated_info = os.fstat(bundle)
+            validate_staged_bundle_attestation(
+                bundle,
+                bundle_id=recovery.staged_bundle_id,
+                uid=uid,
+                gid=gid,
+            )
+            if (
+                staged_bundle_tree_digest(bundle, uid=uid)
+                != recovery.staged_bundle_tree_sha256
+            ):
+                reject("bundle post-stage mudou antes da quarentena")
+            archive_name = post_stage_bundle_archive_name(
+                recovery.staged_bundle_id
+            )
+            try:
+                runtime.noreplace(
+                    bundles,
+                    recovery.staged_bundle_id,
+                    staging,
+                    archive_name,
+                )
+            except FileExistsError:
+                reject("quarentena post-stage concorrente foi recusada")
+            archived = _open_named_directory(
+                staging,
+                archive_name,
+                uid=uid,
+                gid=gid,
+                modes={0o555},
+            )
+            if archived is None:
+                reject("quarentena post-stage não foi publicada")
+            try:
+                archived_info = os.fstat(archived)
+                stable_identity = (
+                    "st_dev",
+                    "st_ino",
+                    "st_mode",
+                    "st_uid",
+                    "st_gid",
+                    "st_size",
+                )
+                if any(
+                    getattr(validated_info, field)
+                    != getattr(archived_info, field)
+                    for field in stable_identity
+                ):
+                    reject(
+                        "inode post-stage trocado durante a quarentena"
+                    )
+                if (
+                    staged_bundle_tree_digest(archived, uid=uid)
+                    != recovery.staged_bundle_tree_sha256
+                ):
+                    reject(
+                        "bundle post-stage mudou durante a quarentena"
+                    )
+            finally:
+                os.close(archived)
+            os.fsync(bundles)
+            os.fsync(staging)
+        finally:
+            os.close(bundle)
+    finally:
+        if staging is not None:
+            os.close(staging)
+        if bundles is not None:
+            os.close(bundles)
+        os.close(control)
+    if not validate_post_publisher_pre_stage(
+        state_descriptor,
+        recovery=recovery,
+        uid=uid,
+        gid=gid,
+    ):
+        reject("bundle post-stage não convergiu para a quarentena")
+
+
 def reconcile_post_publisher_prelude(
     state_descriptor: int,
     recovery: PostPublisherRecovery,
@@ -5216,6 +5889,22 @@ def reconcile_post_publisher_prelude(
         runtime=runtime,
     )
     fault("after_post_publisher_supersede")
+    validate_existing_post_publisher_recovery(
+        state_descriptor,
+        recovery,
+        observed_source_digest=observed_source_digest,
+        uid=uid,
+        gid=gid,
+    )
+    archive_post_stage_bundle(
+        state_descriptor,
+        recovery,
+        uid=uid,
+        gid=gid,
+        runtime=runtime,
+    )
+    if recovery.staged_bundle_id is not None:
+        fault("after_post_publisher_staged_bundle_archive")
     validate_existing_post_publisher_recovery(
         state_descriptor,
         recovery,
@@ -7114,6 +7803,242 @@ def run_publisher(
     return output
 
 
+def observe_active_post_stage_bundle(
+    bundle_id: str,
+    *,
+    uid: int,
+    gid: int,
+) -> str:
+    require_hash(bundle_id, "bundle ID observado post-stage")
+    control = open_path_chain(
+        CONTROL_ROOT,
+        uid=uid,
+        gid=gid,
+        final_modes={0o711},
+    )
+    bundles: int | None = None
+    staging: int | None = None
+    bundle: int | None = None
+    try:
+        bundles = _open_named_directory(
+            control,
+            BUNDLES_NAME,
+            uid=uid,
+            gid=gid,
+            modes={0o711},
+        )
+        staging = _open_named_directory(
+            control,
+            ".staging",
+            uid=uid,
+            gid=gid,
+            modes={0o700},
+        )
+        if bundles is None or staging is None:
+            reject("raízes post-stage observadas estão ausentes")
+        if set(os.listdir(bundles)) != {bundle_id}:
+            reject("observação post-stage exige somente o bundle esperado")
+        archive_name = post_stage_bundle_archive_name(bundle_id)
+        try:
+            os.stat(
+                archive_name,
+                dir_fd=staging,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            reject("observação post-stage encontrou quarentena existente")
+        bundle = _open_named_directory(
+            bundles,
+            bundle_id,
+            uid=uid,
+            gid=gid,
+            modes={0o555},
+        )
+        if bundle is None:
+            reject("bundle post-stage observado está ausente")
+        validate_staged_bundle_attestation(
+            bundle,
+            bundle_id=bundle_id,
+            uid=uid,
+            gid=gid,
+        )
+        return staged_bundle_tree_digest(bundle, uid=uid)
+    finally:
+        if bundle is not None:
+            os.close(bundle)
+        if staging is not None:
+            os.close(staging)
+        if bundles is not None:
+            os.close(bundles)
+        os.close(control)
+
+
+def inspect_post_stage(
+    *,
+    incoming: Path,
+    state_root: Path,
+    uid: int,
+    gid: int,
+    execution_descriptor: int,
+    expectations: BootstrapExpectations,
+    signature_verifier: (
+        Callable[[int, int, int, str], None] | None
+    ),
+    lock_descriptor: int,
+    quiescence: Callable[
+        [
+            int,
+            os.stat_result,
+            ArchiveInventory,
+            str,
+            int,
+            str,
+        ],
+        None,
+    ],
+) -> bytes:
+    bundle_id = expectations.post_publisher_staged_bundle_id
+    if (
+        bundle_id is None
+        or expectations.post_publisher_staged_bundle_tree_sha256 is not None
+    ):
+        reject("observação post-stage exige ID sem tree hash prévio")
+    base_expectations = replace(
+        expectations,
+        post_publisher_staged_bundle_id=None,
+        post_publisher_staged_bundle_tree_sha256=None,
+    )
+    validate_expectations(base_expectations)
+    require_hash(bundle_id, "bundle ID observado post-stage")
+    inputs = open_and_validate_inputs(
+        incoming,
+        uid=uid,
+        gid=gid,
+        execution_descriptor=execution_descriptor,
+        expectations=base_expectations,
+        signature_verifier=signature_verifier,
+    )
+    try:
+        inventory = validate_ops_archive(
+            inputs.archive_descriptor,
+            inputs.archive_info,
+            inputs.binding,
+        )
+        successor_kit_id = kit_identity(inputs.binding, inventory)
+        state = open_path_chain(
+            state_root,
+            uid=uid,
+            gid=gid,
+            final_modes={0o555, 0o755},
+        )
+        try:
+            source = _open_named_directory(
+                state,
+                SOURCE_NAME,
+                uid=uid,
+                gid=gid,
+                modes={0o555},
+            )
+            if source is None:
+                reject("source post-stage observado está ausente")
+            try:
+                observed_source_digest = tree_digest(
+                    scan_tree(source, uid=uid, gid=gid)
+                )
+            finally:
+                os.close(source)
+            observed_tree = observe_active_post_stage_bundle(
+                bundle_id,
+                uid=uid,
+                gid=gid,
+            )
+            bound = replace(
+                expectations,
+                post_publisher_staged_bundle_tree_sha256=observed_tree,
+            )
+            recovery = build_initial_post_publisher_recovery(
+                state,
+                observed_source_digest=observed_source_digest,
+                binding=inputs.binding,
+                successor_kit_id=successor_kit_id,
+                successor_new_digest=inventory.tree_sha256,
+                expectations=bound,
+                uid=uid,
+                gid=gid,
+            )
+            quiescence(
+                inputs.archive_descriptor,
+                inputs.archive_info,
+                inventory,
+                inputs.binding.ops_sha256,
+                lock_descriptor,
+                recovery.publisher_new_digest,
+            )
+            source_after = _open_named_directory(
+                state,
+                SOURCE_NAME,
+                uid=uid,
+                gid=gid,
+                modes={0o555},
+            )
+            if source_after is None:
+                reject("source sumiu durante a observação post-stage")
+            try:
+                if (
+                    tree_digest(
+                        scan_tree(source_after, uid=uid, gid=gid)
+                    )
+                    != observed_source_digest
+                ):
+                    reject("source mudou durante a observação post-stage")
+            finally:
+                os.close(source_after)
+            if (
+                observe_active_post_stage_bundle(
+                    bundle_id,
+                    uid=uid,
+                    gid=gid,
+                )
+                != observed_tree
+            ):
+                reject("bundle mudou durante a observação post-stage")
+            repeated = build_initial_post_publisher_recovery(
+                state,
+                observed_source_digest=observed_source_digest,
+                binding=inputs.binding,
+                successor_kit_id=successor_kit_id,
+                successor_new_digest=inventory.tree_sha256,
+                expectations=bound,
+                uid=uid,
+                gid=gid,
+            )
+            if repeated != recovery:
+                reject("bindings mudaram durante a observação post-stage")
+            return canonical_bytes(
+                {
+                    "bundle_id": bundle_id,
+                    "bundle_tree_sha256": observed_tree,
+                    "contract": (
+                        "tratto-control-bootstrap-post-stage-observation-v1"
+                    ),
+                    "predecessor_source_intent_sha256": (
+                        recovery.source_intent_sha256
+                    ),
+                    "schema_version": 1,
+                    "successor_controller_sha": (
+                        inputs.binding.controller_sha
+                    ),
+                    "successor_kit_id": successor_kit_id,
+                }
+            )
+        finally:
+            os.close(state)
+    finally:
+        inputs.close()
+
+
 def install_source(
     *,
     incoming: Path,
@@ -7710,6 +8635,14 @@ def parse_cli(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--expected-post-publisher-source-used-sha256")
     parser.add_argument("--expected-post-publisher-publisher-intent-sha256")
     parser.add_argument("--expected-post-publisher-publisher-used-sha256")
+    parser.add_argument("--expected-post-publisher-staged-bundle-id")
+    parser.add_argument(
+        "--expected-post-publisher-staged-bundle-tree-sha256"
+    )
+    parser.add_argument(
+        "--inspect-post-publisher-staged-bundle-tree",
+        action="store_true",
+    )
     required_options = (
         "--helper-fd",
         "--expected-helper-sha256",
@@ -7730,21 +8663,38 @@ def parse_cli(argv: list[str]) -> argparse.Namespace:
         "--expected-post-publisher-publisher-intent-sha256",
         "--expected-post-publisher-publisher-used-sha256",
     )
+    post_stage_options = (
+        "--expected-post-publisher-staged-bundle-id",
+        "--expected-post-publisher-staged-bundle-tree-sha256",
+    )
     predecessor_present = [
         option for option in predecessor_options if option in argv
     ]
     post_publisher_present = [
         option for option in post_publisher_options if option in argv
     ]
-    expected_length = 2 * (
-        len(required_options)
-        + (len(predecessor_options) if predecessor_present else 0)
-        + (
-            len(post_publisher_options)
-            if post_publisher_present
-            else 0
+    post_stage_present = [
+        option for option in post_stage_options if option in argv
+    ]
+    inspect_option = "--inspect-post-publisher-staged-bundle-tree"
+    inspect_present = inspect_option in argv
+    if inspect_present:
+        expected_length = 2 * (
+            len(required_options)
+            + len(post_publisher_options)
+            + 1
+        ) + 1
+    else:
+        expected_length = 2 * (
+            len(required_options)
+            + (len(predecessor_options) if predecessor_present else 0)
+            + (
+                len(post_publisher_options)
+                if post_publisher_present
+                else 0
+            )
+            + (len(post_stage_options) if post_stage_present else 0)
         )
-    )
     if (
         len(argv) != expected_length
         or any(
@@ -7759,6 +8709,36 @@ def parse_cli(argv: list[str]) -> argparse.Namespace:
             and any(
                 argv.count(option) != 1
                 for option in post_publisher_options
+            )
+        )
+        or (
+            post_stage_present
+            and (
+                not post_publisher_present
+                or (
+                    inspect_present
+                    and (
+                        argv.count(post_stage_options[0]) != 1
+                        or post_stage_options[1] in argv
+                    )
+                )
+                or (
+                    not inspect_present
+                    and any(
+                        argv.count(option) != 1
+                        for option in post_stage_options
+                    )
+                )
+            )
+        )
+        or (
+            inspect_present
+            and (
+                argv.count(inspect_option) != 1
+                or predecessor_present
+                or len(post_publisher_present)
+                != len(post_publisher_options)
+                or post_stage_present != [post_stage_options[0]]
             )
         )
         or (predecessor_present and post_publisher_present)
@@ -7836,8 +8816,15 @@ def main() -> int:
         post_publisher_publisher_used_sha256=(
             args.expected_post_publisher_publisher_used_sha256
         ),
+        post_publisher_staged_bundle_id=(
+            args.expected_post_publisher_staged_bundle_id
+        ),
+        post_publisher_staged_bundle_tree_sha256=(
+            args.expected_post_publisher_staged_bundle_tree_sha256
+        ),
     )
-    validate_expectations(expectations)
+    if not args.inspect_post_publisher_staged_bundle_tree:
+        validate_expectations(expectations)
     previous_umask = os.umask(0o077)
     acquired_lock = False
     lock_descriptor = -1
@@ -7860,6 +8847,20 @@ def main() -> int:
                 uid=EXPECTED_UID,
                 gid=EXPECTED_GID,
             )
+        if args.inspect_post_publisher_staged_bundle_tree:
+            observation = inspect_post_stage(
+                incoming=INCOMING,
+                state_root=STATE_ROOT,
+                uid=EXPECTED_UID,
+                gid=EXPECTED_GID,
+                execution_descriptor=args.helper_fd,
+                expectations=expectations,
+                signature_verifier=None,
+                lock_descriptor=lock_descriptor,
+                quiescence=run_quiescence_verifier,
+            )
+            sys.stdout.buffer.write(observation)
+            return 0
         result = install_source(
             incoming=INCOMING,
             state_root=STATE_ROOT,
