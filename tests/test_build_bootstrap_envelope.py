@@ -61,17 +61,24 @@ def approval(*, expired: bool = False) -> dict:
 
 
 def summary(label: str, release_sha: str) -> dict:
-    return {
+    value = {
         "artifact_name": (
             f"tratto-control-{label}-{release_sha}.tar.gz"
         ),
         "component_manifest_sha256": "4" * 64,
-        "runtime_policy_sha256": "5" * 64,
+        "runtime_policy_sha256": (
+            MODULE.RUNTIME.EXPECTED_POLICY_SHA256
+        ),
         "service_digest": "6" * 64,
         "sha256": "7" * 64,
         "size_bytes": 123,
         "tree_sha": "8" * 40,
     }
+    if label == "ops":
+        value["python"] = MODULE.RUNTIME.EXPECTED_POLICY[
+            "python"
+        ]["build_version"]
+    return value
 
 
 def behavior(ids: dict[str, int]) -> dict:
@@ -112,6 +119,7 @@ def run_builder(
     expired: bool = False,
     helper_receipt: dict | None = None,
     helper_receipt_raw: bytes | None = None,
+    summaries: dict[str, dict] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     artifact_ids = ids or {"api": 11, "ops": 12, "web": 13}
     approval_path = tmp_path / "approval.json"
@@ -123,7 +131,12 @@ def run_builder(
         ("web", "2" * 40),
     ):
         path = tmp_path / f"{label}.json"
-        put(path, summary(label, release_sha))
+        value = (
+            summaries[label]
+            if summaries is not None and label in summaries
+            else summary(label, release_sha)
+        )
+        put(path, value)
         summary_paths[label] = path
     behavior_path = tmp_path / "behavior.json"
     put(behavior_path, behavior(artifact_ids))
@@ -211,6 +224,82 @@ def test_builds_canonical_single_operator_envelope(
     assert summary_value["attestation_sha256"] == hashlib.sha256(
         raw
     ).hexdigest()
+
+
+def test_rejects_ops_summary_without_python(tmp_path: Path) -> None:
+    value = summary("ops", "1" * 40)
+    del value["python"]
+
+    result = run_builder(tmp_path, summaries={"ops": value})
+
+    assert result.returncode == 78
+    assert "ops summary has invalid keys" in result.stderr
+    assert not (tmp_path / "attestation.json").exists()
+
+
+def test_rejects_ops_summary_with_wrong_python(tmp_path: Path) -> None:
+    value = summary("ops", "1" * 40)
+    value["python"] = "3.12.12"
+
+    result = run_builder(tmp_path, summaries={"ops": value})
+
+    assert result.returncode == 78
+    assert "ops summary Python diverges" in result.stderr
+    assert not (tmp_path / "attestation.json").exists()
+
+
+@pytest.mark.parametrize("label,release_sha", [
+    ("api", "1" * 40),
+    ("web", "2" * 40),
+])
+def test_rejects_python_in_non_ops_summary(
+    tmp_path: Path,
+    label: str,
+    release_sha: str,
+) -> None:
+    value = summary(label, release_sha)
+    value["python"] = MODULE.RUNTIME.EXPECTED_POLICY[
+        "python"
+    ]["build_version"]
+
+    result = run_builder(tmp_path, summaries={label: value})
+
+    assert result.returncode == 78
+    assert f"{label} summary has invalid keys" in result.stderr
+    assert not (tmp_path / "attestation.json").exists()
+
+
+@pytest.mark.parametrize("label,release_sha", [
+    ("api", "1" * 40),
+    ("ops", "1" * 40),
+    ("web", "2" * 40),
+])
+def test_rejects_extra_summary_key(
+    tmp_path: Path,
+    label: str,
+    release_sha: str,
+) -> None:
+    value = summary(label, release_sha)
+    value["extra"] = "forbidden"
+
+    result = run_builder(tmp_path, summaries={label: value})
+
+    assert result.returncode == 78
+    assert f"{label} summary has invalid keys" in result.stderr
+    assert not (tmp_path / "attestation.json").exists()
+
+
+def test_rejects_runtime_policy_outside_compiled_contract(
+    tmp_path: Path,
+) -> None:
+    value = summary("api", "1" * 40)
+    value["runtime_policy_sha256"] = "5" * 64
+
+    result = run_builder(tmp_path, summaries={"api": value})
+
+    assert result.returncode == 78
+    assert "runtime policy is not the reviewed contract" in result.stderr
+    assert not (tmp_path / "attestation.json").exists()
 
 
 def test_rejects_reused_artifact_id(tmp_path: Path) -> None:

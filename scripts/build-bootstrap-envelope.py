@@ -34,6 +34,14 @@ if APPROVAL_SPEC is None or APPROVAL_SPEC.loader is None:
     raise RuntimeError("approval validator unavailable")
 APPROVAL = importlib.util.module_from_spec(APPROVAL_SPEC)
 APPROVAL_SPEC.loader.exec_module(APPROVAL)
+RUNTIME_SPEC = importlib.util.spec_from_file_location(
+    "control_bootstrap_envelope_runtime_policy",
+    HERE / "runtime_policy.py",
+)
+if RUNTIME_SPEC is None or RUNTIME_SPEC.loader is None:
+    raise RuntimeError("runtime policy validator unavailable")
+RUNTIME = importlib.util.module_from_spec(RUNTIME_SPEC)
+RUNTIME_SPEC.loader.exec_module(RUNTIME)
 
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -49,7 +57,7 @@ REPOSITORIES = {
     "ops": "PluckXD/tratto-api",
     "web": "PluckXD/tratto-web",
 }
-SUMMARY_KEYS = {
+COMMON_SUMMARY_KEYS = frozenset({
     "artifact_name",
     "component_manifest_sha256",
     "runtime_policy_sha256",
@@ -57,6 +65,11 @@ SUMMARY_KEYS = {
     "sha256",
     "size_bytes",
     "tree_sha",
+})
+SUMMARY_KEYS_BY_LABEL = {
+    "api": COMMON_SUMMARY_KEYS,
+    "ops": COMMON_SUMMARY_KEYS | {"python"},
+    "web": COMMON_SUMMARY_KEYS,
 }
 BEHAVIOR_KEYS = {
     "api_sha",
@@ -194,7 +207,8 @@ def validate_summary(
     label: str,
     release_sha: str,
 ) -> None:
-    if set(value) != SUMMARY_KEYS:
+    expected_keys = SUMMARY_KEYS_BY_LABEL.get(label)
+    if expected_keys is None or set(value) != expected_keys:
         reject(f"{label} summary has invalid keys")
     expected_name = f"tratto-control-{label}-{release_sha}.tar.gz"
     if (
@@ -212,6 +226,17 @@ def validate_summary(
     ):
         if HASH_RE.fullmatch(str(value[key])) is None:
             reject(f"{label} summary digest is invalid: {key}")
+    if (
+        value["runtime_policy_sha256"]
+        != RUNTIME.EXPECTED_POLICY_SHA256
+    ):
+        reject(f"{label} summary runtime policy is not the reviewed contract")
+    if label == "ops" and (
+        type(value["python"]) is not str
+        or value["python"]
+        != RUNTIME.EXPECTED_POLICY["python"]["build_version"]
+    ):
+        reject("ops summary Python diverges from the reviewed runtime policy")
 
 
 def validate_helper_receipt(
