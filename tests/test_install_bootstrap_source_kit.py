@@ -65,6 +65,9 @@ def build_archive(
     *,
     extra: tuple[str, bytes, int] | None = None,
     link: bool = False,
+    omit: str | None = None,
+    quiescence_kind: bytes = tarfile.REGTYPE,
+    quiescence_mode: int = 0o555,
 ) -> None:
     approval = {
         "api": {"commit_sha": api_sha},
@@ -98,10 +101,16 @@ def build_archive(
         "artifact-manifest.json": (manifest, 0o444),
         "scripts/provision-node-runtime.py": (b"provision\n", 0o555),
         "scripts/publish-bootstrap-tree.py": (b"publisher\n", 0o555),
+        "scripts/verify-control-stack-quiescent.py": (
+            b"quiescence\n",
+            quiescence_mode,
+        ),
         "scripts/with-deploy-lock.py": (b"lock\n", 0o555),
     }
     if extra is not None:
         files[extra[0]] = (extra[1], extra[2])
+    if omit is not None:
+        files.pop(omit)
     with path.open("wb") as raw:
         with gzip.GzipFile(
             filename="",
@@ -134,7 +143,16 @@ def build_archive(
                     )
                 for name in sorted(files):
                     payload, mode = files[name]
-                    if link and name == "scripts/with-deploy-lock.py":
+                    special_kind = (
+                        quiescence_kind
+                        if name
+                        == "scripts/verify-control-stack-quiescent.py"
+                        else tarfile.REGTYPE
+                    )
+                    if (
+                        (link and name == "scripts/with-deploy-lock.py")
+                        or special_kind == tarfile.SYMTYPE
+                    ):
                         info = tar_info(
                             name,
                             mode=mode,
@@ -597,6 +615,59 @@ def test_archive_rejects_links_before_any_mutation(
     with pytest.raises(KIT.BootstrapSourceError, match="proibido"):
         install(incoming, state, calls)
     assert not (state / KIT.INTENT_NAME).exists()
+
+
+@pytest.mark.parametrize(
+    ("tamper", "options", "message"),
+    (
+        (
+            "missing",
+            {
+                "omit": (
+                    "scripts/verify-control-stack-quiescent.py"
+                )
+            },
+            "inventário bootstrap mínimo",
+        ),
+        (
+            "type",
+            {"quiescence_kind": tarfile.SYMTYPE},
+            "tipo, modo ou tamanho proibido",
+        ),
+        (
+            "mode",
+            {"quiescence_mode": 0o444},
+            "inventário bootstrap mínimo",
+        ),
+    ),
+)
+def test_archive_rejects_invalid_quiescence_helper_before_source_exchange(
+    tmp_path: Path,
+    tamper: str,
+    options: dict[str, object],
+    message: str,
+) -> None:
+    incoming, state, calls = fixture(tmp_path)
+    archive = next(incoming.glob("tratto-control-ops-*.tar.gz"))
+    archive.chmod(0o600)
+    build_archive(archive, "a" * 40, **options)
+    archive.chmod(0o400)
+    raw = json.loads((incoming / KIT.ATTESTATION_NAME).read_text())
+    raw["artifacts"]["ops"]["sha256"] = hashlib.sha256(
+        archive.read_bytes()
+    ).hexdigest()
+    raw["artifacts"]["ops"]["size_bytes"] = archive.stat().st_size
+    attestation_path = incoming / KIT.ATTESTATION_NAME
+    attestation_path.chmod(0o600)
+    attestation_path.write_bytes(canonical(raw))
+    attestation_path.chmod(0o400)
+
+    with pytest.raises(KIT.BootstrapSourceError, match=message):
+        install(incoming, state, calls)
+    assert (state / "bootstrap-source" / "old.txt").read_bytes() == (
+        b"old source\n"
+    )
+    assert not (state / KIT.INTENT_NAME).exists(), tamper
 
 
 @pytest.mark.parametrize("tamper", ["traversal", "concatenated-gzip"])

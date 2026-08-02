@@ -93,6 +93,7 @@ REQUIRED_FILES = {
     "artifact-manifest.json": 0o444,
     "scripts/provision-node-runtime.py": 0o555,
     "scripts/publish-bootstrap-tree.py": 0o555,
+    "scripts/verify-control-stack-quiescent.py": 0o555,
     "scripts/with-deploy-lock.py": 0o555,
 }
 
