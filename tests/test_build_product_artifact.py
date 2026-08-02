@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import datetime as dt
 import hashlib
 import importlib.util
+import json
 import os
 import sys
 from pathlib import Path
@@ -183,4 +185,34 @@ def test_archive_is_exclusive_and_contains_canonical_markers(
             entries=entries,
             release_sha="1" * 40,
             manifest_raw=manifest,
+        )
+
+
+def test_product_builder_rejects_expired_approval(
+    tmp_path: Path,
+) -> None:
+    value = json.loads(
+        (ROOT / "examples" / "approval.example.json").read_text()
+    )
+    issued_at = dt.datetime.now(dt.timezone.utc).replace(
+        microsecond=0
+    ) - dt.timedelta(days=2)
+    expires_at = issued_at + dt.timedelta(hours=1)
+    value["release_id"] = (
+        f"ctl-{issued_at.strftime('%Y%m%dT%H%M%SZ')}-bootstrap"
+    )
+    value["issued_at"] = issued_at.isoformat().replace("+00:00", "Z")
+    value["expires_at"] = expires_at.isoformat().replace("+00:00", "Z")
+    value["api"]["commit_sha"] = "1" * 40
+    approval_path = tmp_path / "approval.json"
+    approval_path.write_bytes(MODULE.canonical_bytes(value))
+
+    with pytest.raises(
+        MODULE.ProductArtifactError,
+        match="expired",
+    ):
+        MODULE.load_approval(
+            approval_path,
+            kind="api",
+            release_sha="1" * 40,
         )
