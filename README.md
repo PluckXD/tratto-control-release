@@ -189,6 +189,167 @@ read-only pipe. A used predecessor, a post-exchange publisher, missing rollback
 evidence, mixed digests, partial records, or any different successor remains
 fail-closed.
 
+### One-use post-publisher/pre-stage recovery
+
+One additional bridge exists for a narrower terminal state: the source kit
+and bootstrap publisher both completed and wrote their exact `used` records,
+but runtime staging never began because the newly published lock wrapper
+cannot classify the installed systemd fleet. This is not a second bootstrap
+authorization and cannot recover a host after stage or activation.
+
+Every attempt requires:
+
+- six values authenticated outside `incoming`: predecessor source kit ID,
+  predecessor controller SHA, SHA-256 of the canonical source `intent` and
+  `used` records, and SHA-256 of the canonical publisher `intent` and `used`
+  records;
+- the predecessor API commit in both signed successor `required_ancestors`
+  lists, a different signed successor kit/tree, the exact immutable source,
+  source rollback, published bootstrap, and publisher rollback;
+- no `current`, bundles, bootstrap-release, release-state, activation,
+  activation-epoch, or bootstrap-consumption marker;
+- a corrected quiescence verifier from the newly signed Ops archive, copied
+  only to a sealed anonymous Linux `memfd`, plus a canonical catalog in a
+  separate sealed read-only `memfd`. The catalog has the exact unit names and
+  `0444` modes required by the signed successor inventory, but hashes the
+  corresponding files in the currently published, journal-authenticated
+  `/opt/tratto-control/bootstrap/systemd` tree. Under the same deploy lock,
+  the helper runs the verifier through `/proc/self/fd` first with
+  `--sealed-packaged-unit-catalog-pre-reload-fd`, then executes the fixed
+  `/usr/bin/systemctl --no-ask-password daemon-reload`, and finally runs the
+  same verifier and catalog with
+  `--sealed-packaged-unit-catalog-fd`. Both verifier processes inherit that
+  same lock descriptor. Each proof also snapshots the system manager's
+  authoritative `UnitPath` twice and rejects applicable drop-ins, aliases,
+  dependency directories, generated/transient duplicates, and load-path
+  drift for every signed unit, including templates with no runtime instance.
+
+The currently published lock wrapper is deliberately not part of this
+bridge. The separately signed and already Cosign-verified helper acquires the
+fixed root-owned `/run/tratto-control/deploy.lock` itself with a non-blocking
+exclusive `flock`, retains that descriptor for its entire execution, and
+passes the same valid lock to the successor publisher. The signed helper
+forks a guardian for the pre-verifier, `daemon-reload`, and final verifier;
+the guardian inherits the same open-file-description lock, so a `SIGKILL` of
+the main helper cannot expose an unlocked reload window. The lock becomes
+available only after the guardian terminates. Normal installs and
+pre-publisher recovery continue to require the inherited lock wrapper.
+
+Populate the ten values below only from authenticated evidence outside the
+seven transferred files. The ceremony repeats the same descriptor identity,
+metadata, digest, and Cosign checks as the normal path, then invokes the
+helper FD directly with the complete post-publisher binding group:
+
+```bash
+/usr/bin/env -i \
+  HOME=/nonexistent \
+  LANG=C \
+  LC_ALL=C \
+  NO_COLOR=1 \
+  PATH=/usr/bin:/bin \
+  XDG_CACHE_HOME=/var/cache/tratto-control/cosign \
+  EXPECTED_HELPER_SHA256="$EXPECTED_HELPER_SHA256" \
+  EXPECTED_ATTESTATION_SHA256="$EXPECTED_ATTESTATION_SHA256" \
+  EXPECTED_CARRIER_SHA="$EXPECTED_CARRIER_SHA" \
+  EXPECTED_CONTROLLER_SHA="$EXPECTED_CONTROLLER_SHA" \
+  EXPECTED_POST_PUBLISHER_PREDECESSOR_KIT_ID="$EXPECTED_POST_PUBLISHER_PREDECESSOR_KIT_ID" \
+  EXPECTED_POST_PUBLISHER_PREDECESSOR_CONTROLLER_SHA="$EXPECTED_POST_PUBLISHER_PREDECESSOR_CONTROLLER_SHA" \
+  EXPECTED_POST_PUBLISHER_SOURCE_INTENT_SHA256="$EXPECTED_POST_PUBLISHER_SOURCE_INTENT_SHA256" \
+  EXPECTED_POST_PUBLISHER_SOURCE_USED_SHA256="$EXPECTED_POST_PUBLISHER_SOURCE_USED_SHA256" \
+  EXPECTED_POST_PUBLISHER_PUBLISHER_INTENT_SHA256="$EXPECTED_POST_PUBLISHER_PUBLISHER_INTENT_SHA256" \
+  EXPECTED_POST_PUBLISHER_PUBLISHER_USED_SHA256="$EXPECTED_POST_PUBLISHER_PUBLISHER_USED_SHA256" \
+  /usr/bin/bash --noprofile --norc <<'TRATTO_POST_PUBLISHER'
+set -Eeuo pipefail
+for value in \
+  EXPECTED_HELPER_SHA256 \
+  EXPECTED_ATTESTATION_SHA256 \
+  EXPECTED_POST_PUBLISHER_PREDECESSOR_KIT_ID \
+  EXPECTED_POST_PUBLISHER_SOURCE_INTENT_SHA256 \
+  EXPECTED_POST_PUBLISHER_SOURCE_USED_SHA256 \
+  EXPECTED_POST_PUBLISHER_PUBLISHER_INTENT_SHA256 \
+  EXPECTED_POST_PUBLISHER_PUBLISHER_USED_SHA256
+do
+  [[ "${!value}" =~ ^[0-9a-f]{64}$ ]]
+done
+for value in \
+  EXPECTED_CARRIER_SHA \
+  EXPECTED_CONTROLLER_SHA \
+  EXPECTED_POST_PUBLISHER_PREDECESSOR_CONTROLLER_SHA
+do
+  [[ "${!value}" =~ ^[0-9a-f]{40}$ ]]
+done
+
+incoming=/var/lib/tratto-control/incoming
+helper="$incoming/install-bootstrap-source-kit.py"
+helper_bundle="$incoming/bootstrap-source-kit.sigstore.json"
+/usr/bin/test ! -L "$helper"
+exec {helper_fd}<"$helper"
+/usr/bin/test ! -L "$helper"
+helper_fd_path="/proc/self/fd/$helper_fd"
+/usr/bin/test "$(
+  /usr/bin/stat -Lc '%F:%a:%u:%g:%h' "$helper_fd_path"
+)" = "regular file:400:0:0:1"
+/usr/bin/test "$(
+  /usr/bin/stat -Lc '%d:%i:%f:%h:%u:%g:%s' "$helper_fd_path"
+)" = "$(
+  /usr/bin/stat -Lc '%d:%i:%f:%h:%u:%g:%s' "$helper"
+)"
+/usr/bin/test "$(
+  /usr/bin/sha256sum "$helper_fd_path" | /usr/bin/awk '{print $1}'
+)" = "$EXPECTED_HELPER_SHA256"
+
+/usr/local/bin/cosign verify-blob \
+  --bundle "$helper_bundle" \
+  --certificate-identity \
+    "https://github.com/PluckXD/tratto-control-release-carrier/.github/workflows/control-bootstrap-v1.yml@refs/heads/main" \
+  --certificate-oidc-issuer \
+    https://token.actions.githubusercontent.com \
+  --certificate-github-workflow-sha "$EXPECTED_CARRIER_SHA" \
+  --certificate-github-workflow-ref refs/heads/main \
+  --certificate-github-workflow-repository \
+    PluckXD/tratto-control-release-carrier \
+  --certificate-github-workflow-trigger workflow_dispatch \
+  "$helper_fd_path"
+
+/usr/bin/python3.12 -I -B "$helper_fd_path" \
+  --helper-fd "$helper_fd" \
+  --expected-helper-sha256 "$EXPECTED_HELPER_SHA256" \
+  --expected-attestation-sha256 "$EXPECTED_ATTESTATION_SHA256" \
+  --expected-carrier-sha "$EXPECTED_CARRIER_SHA" \
+  --expected-controller-sha "$EXPECTED_CONTROLLER_SHA" \
+  --expected-post-publisher-predecessor-kit-id \
+    "$EXPECTED_POST_PUBLISHER_PREDECESSOR_KIT_ID" \
+  --expected-post-publisher-predecessor-controller-sha \
+    "$EXPECTED_POST_PUBLISHER_PREDECESSOR_CONTROLLER_SHA" \
+  --expected-post-publisher-source-intent-sha256 \
+    "$EXPECTED_POST_PUBLISHER_SOURCE_INTENT_SHA256" \
+  --expected-post-publisher-source-used-sha256 \
+    "$EXPECTED_POST_PUBLISHER_SOURCE_USED_SHA256" \
+  --expected-post-publisher-publisher-intent-sha256 \
+    "$EXPECTED_POST_PUBLISHER_PUBLISHER_INTENT_SHA256" \
+  --expected-post-publisher-publisher-used-sha256 \
+    "$EXPECTED_POST_PUBLISHER_PUBLISHER_USED_SHA256"
+exec {helper_fd}<&-
+TRATTO_POST_PUBLISHER
+```
+
+Before its first rename, the helper writes a canonical append-only
+post-publisher authorization binding that exact predecessor to that exact
+successor. It archives predecessor source `used`, publisher `used`, publisher
+`intent`, and publisher rollback by no-overwrite renames. The existing
+source-supersede transaction archives the remaining source records and
+performs the source exchange. The publisher receives no pre-exchange
+override: it starts a new ordinary upgrade only after the terminal
+predecessor evidence is outside its reserved namespace.
+
+Every archive boundary is retryable with the same ten values and signed
+inputs. Archived and active predecessor copies may never coexist. A partial
+record must be an exact prefix of its expected canonical bytes. A different
+successor, mixed `used` evidence, unknown journal, occupied deploy lock,
+failed or inconclusive quiescence proof, staged bundle, marker, or replay
+after stage is rejected without a cleanup bypass. Never delete, edit, or
+manually move these journals.
+
 ## Stable controller v2 / envelope v6
 
 The v2/v6 candidate separates stable release authority from product source and

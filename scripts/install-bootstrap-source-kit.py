@@ -45,6 +45,9 @@ EXCHANGED_NAME = "bootstrap-source-kit.exchanged.json"
 RETAINED_NAME = "bootstrap-source-kit.retained.json"
 USED_NAME = "bootstrap-source-kit.used.json"
 SUPERSEDE_NAME = "bootstrap-source-kit.supersede.json"
+POST_PUBLISHER_SUPERSEDE_NAME = (
+    "bootstrap-source-kit.post-publisher-supersede.json"
+)
 SUPERSEDED_RECORD_PREFIX = "bootstrap-source-kit."
 HELPER_NAME = "install-bootstrap-source-kit.py"
 HELPER_BUNDLE_NAME = "bootstrap-source-kit.sigstore.json"
@@ -54,6 +57,7 @@ OPS_BUNDLE_NAME = "ops.sigstore.json"
 COSIGN = Path("/usr/local/bin/cosign")
 COSIGN_CACHE = Path("/var/cache/tratto-control/cosign")
 PYTHON = Path("/usr/bin/python3.12")
+SYSTEMCTL = Path("/usr/bin/systemctl")
 LOCK_DIRECTORY = Path("/run/tratto-control")
 LOCK_NAME = "deploy.lock"
 LOCK_FD_ENV = "TRATTO_CONTROL_LOCK_FD"
@@ -69,6 +73,20 @@ PUBLISHER_SUPERSEDE_FD_ENV = "TRATTO_CONTROL_BOOTSTRAP_SUPERSEDE_FD"
 PUBLISHER_SUPERSEDE_CONTRACT = (
     "tratto-control-bootstrap-publisher-supersede-v1"
 )
+POST_PUBLISHER_SUPERSEDE_CONTRACT = (
+    "tratto-control-bootstrap-post-publisher-supersede-v1"
+)
+POST_PUBLISHER_ARCHIVE_PREFIX = ".bootstrap-post-publisher."
+BOOTSTRAP_RELEASE_MARKER = Path(
+    "/etc/tratto-control/bootstrap-release.env"
+)
+RELEASE_STATE_MARKER = Path("/etc/tratto-control/release-state.env")
+ACTIVATION_JOURNAL = Path("/etc/tratto-control/activation.env")
+ACTIVATION_EPOCH_MARKER = Path(
+    "/etc/tratto-control/activation-epoch.env"
+)
+BOOTSTRAP_CONSUMED_NAME = "bootstrap-consumed"
+BUNDLES_NAME = "bundles"
 
 CARRIER_REPOSITORY = "PluckXD/tratto-control-release-carrier"
 CARRIER_WORKFLOW = ".github/workflows/control-bootstrap-v1.yml"
@@ -82,17 +100,22 @@ GITHUB_ISSUER = "https://token.actions.githubusercontent.com"
 
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+SYSTEMD_UNIT_RE = re.compile(
+    r"^tratto-control[A-Za-z0-9_.:@-]*"
+    r"\.(?:service|timer|slice|socket|path|target)$"
+)
 ARCHIVE_NAME_RE = re.compile(
     r"^tratto-control-ops-([0-9a-f]{40})\.tar\.gz$"
 )
 STATE_TEMP_RE = re.compile(
     r"^bootstrap-source-kit\."
-    r"(intent|prepared|exchanged|retained|used|supersede)"
+    r"(intent|prepared|exchanged|retained|used|supersede"
+    r"|post-publisher-supersede)"
     r"\.([0-9a-f]{64})\.installing$"
 )
 SUPERSEDED_RECORD_RE = re.compile(
     r"^bootstrap-source-kit\."
-    r"(intent|prepared|exchanged|retained)"
+    r"(intent|prepared|exchanged|retained|used)"
     r"\.superseded\.([0-9a-f]{64})\.json$"
 )
 
@@ -106,6 +129,12 @@ MAX_MEMBERS = 2048
 MAX_PATH_BYTES = 240
 MAX_TREE_ENTRIES = 2048
 MAX_TREE_BYTES = 64 * 1024 * 1024
+MAX_PACKAGED_UNITS_BYTES = 64 * 1024
+MAX_PACKAGED_UNIT_BYTES = 1024 * 1024
+MAX_GUARDIAN_REPORT_BYTES = 4096
+QUIESCENCE_SUCCESS = (
+    b"stack Control totalmente parada e sem concorr\xc3\xaancia systemd\n"
+)
 
 REQUIRED_FILES = {
     "RELEASE_SHA": 0o444,
@@ -466,6 +495,12 @@ class BootstrapExpectations:
     predecessor_kit_id: str | None = None
     predecessor_controller_sha: str | None = None
     predecessor_publisher_intent_sha256: str | None = None
+    post_publisher_predecessor_kit_id: str | None = None
+    post_publisher_predecessor_controller_sha: str | None = None
+    post_publisher_source_intent_sha256: str | None = None
+    post_publisher_source_used_sha256: str | None = None
+    post_publisher_publisher_intent_sha256: str | None = None
+    post_publisher_publisher_used_sha256: str | None = None
 
 
 def validate_expectations(
@@ -506,6 +541,47 @@ def validate_expectations(
         require_hash(
             expectations.predecessor_publisher_intent_sha256,
             "publisher intent predecessor esperado",
+        )
+    post_publisher_values = (
+        expectations.post_publisher_predecessor_kit_id,
+        expectations.post_publisher_predecessor_controller_sha,
+        expectations.post_publisher_source_intent_sha256,
+        expectations.post_publisher_source_used_sha256,
+        expectations.post_publisher_publisher_intent_sha256,
+        expectations.post_publisher_publisher_used_sha256,
+    )
+    if any(item is not None for item in post_publisher_values):
+        if not all(item is not None for item in post_publisher_values):
+            reject(
+                "bindings post-publisher precisam ser informados juntos"
+            )
+        if any(item is not None for item in predecessor_values):
+            reject(
+                "recuperações pre-publisher e post-publisher são exclusivas"
+            )
+        require_hash(
+            expectations.post_publisher_predecessor_kit_id,
+            "kit ID post-publisher esperado",
+        )
+        require_sha(
+            expectations.post_publisher_predecessor_controller_sha,
+            "controller post-publisher esperado",
+        )
+        require_hash(
+            expectations.post_publisher_source_intent_sha256,
+            "source intent post-publisher esperado",
+        )
+        require_hash(
+            expectations.post_publisher_source_used_sha256,
+            "source used post-publisher esperado",
+        )
+        require_hash(
+            expectations.post_publisher_publisher_intent_sha256,
+            "publisher intent post-publisher esperado",
+        )
+        require_hash(
+            expectations.post_publisher_publisher_used_sha256,
+            "publisher used post-publisher esperado",
         )
 
 
@@ -1702,6 +1778,10 @@ SOURCE_PHASE_NAMES = {
     "exchanged": EXCHANGED_NAME,
     "retained": RETAINED_NAME,
 }
+POST_PUBLISHER_SOURCE_PHASE_NAMES = {
+    **SOURCE_PHASE_NAMES,
+    "used": USED_NAME,
+}
 
 
 @dataclass(frozen=True)
@@ -1713,9 +1793,10 @@ class SupersededSourceTransaction:
     new_digest: str
     intent_raw: bytes
     publisher_intent_sha256: str
+    publisher_authorization_required: bool = True
 
     def archived_name(self, phase: str) -> str:
-        if phase not in SOURCE_PHASE_NAMES:
+        if phase not in POST_PUBLISHER_SOURCE_PHASE_NAMES:
             reject("fase inválida no histórico do source kit")
         return (
             f"{SUPERSEDED_RECORD_PREFIX}{phase}.superseded."
@@ -2147,6 +2228,9 @@ def reject_foreign_state(
             predecessor.archived_name(phase)
             for phase in SOURCE_PHASE_NAMES
         )
+        if not predecessor.publisher_authorization_required:
+            allowed.add(POST_PUBLISHER_SUPERSEDE_NAME)
+            allowed.add(predecessor.archived_name("used"))
     for name in os.listdir(state_descriptor):
         match = STATE_TEMP_RE.fullmatch(name)
         if match:
@@ -2376,6 +2460,603 @@ def validate_fixed_predecessor_publisher_state(
         os.close(control)
 
 
+@dataclass(frozen=True)
+class PublisherUpgradeTransaction:
+    old_digest: str
+    new_digest: str
+    previous_name: str
+    intent_raw: bytes
+    used_raw: bytes
+
+
+@dataclass(frozen=True)
+class PostPublisherRecovery:
+    predecessor: SupersededSourceTransaction
+    source_intent_sha256: str
+    source_used_sha256: str
+    publisher_intent_sha256: str
+    publisher_used_sha256: str
+    publisher_old_digest: str
+    publisher_new_digest: str
+    publisher_previous_name: str
+    successor_kit_id: str
+    successor_new_digest: str
+
+
+def post_publisher_archive_name(kind: str, kit_id: str) -> str:
+    require_hash(kit_id, "kit ID do arquivo post-publisher")
+    if kind not in {"intent", "used", "previous"}:
+        reject("tipo de arquivo post-publisher inválido")
+    suffix = ".json" if kind in {"intent", "used"} else ""
+    return f"{POST_PUBLISHER_ARCHIVE_PREFIX}{kind}.{kit_id}{suffix}"
+
+
+def read_publisher_record_if_present(
+    parent: int,
+    name: str,
+    *,
+    uid: int,
+    gid: int,
+) -> bytes | None:
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=parent,
+        )
+    except FileNotFoundError:
+        return None
+    try:
+        info = os.fstat(descriptor)
+        validate_regular(
+            info,
+            name,
+            uid=uid,
+            gid=gid,
+            modes={0o400},
+            maximum=1024,
+        )
+        return read_all(
+            descriptor,
+            info,
+            maximum=1024,
+            label=name,
+        )
+    finally:
+        os.close(descriptor)
+
+
+def validate_publisher_upgrade_record(
+    raw: bytes,
+    *,
+    phase: str,
+    label: str,
+) -> dict[str, Any]:
+    value = parse_canonical_json(raw, label)
+    exact_object(
+        value,
+        {
+            "new_tree_sha256",
+            "old_tree_sha256",
+            "phase",
+            "previous_name",
+            "schema_version",
+        },
+        label,
+    )
+    old_digest = require_hash(
+        value["old_tree_sha256"],
+        f"{label} old tree",
+    )
+    new_digest = require_hash(
+        value["new_tree_sha256"],
+        f"{label} new tree",
+    )
+    if (
+        value["phase"] != phase
+        or value["schema_version"] != 1
+        or old_digest == new_digest
+        or value["previous_name"]
+        != PUBLISHER_PREVIOUS_PREFIX + old_digest[:32]
+    ):
+        reject(f"{label} diverge do contrato")
+    return value
+
+
+def validate_publisher_upgrade_transaction(
+    intent_raw: bytes,
+    used_raw: bytes,
+) -> PublisherUpgradeTransaction:
+    intent = validate_publisher_upgrade_record(
+        intent_raw,
+        phase="intent",
+        label="publisher intent post-publisher",
+    )
+    used = validate_publisher_upgrade_record(
+        used_raw,
+        phase="used",
+        label="publisher used post-publisher",
+    )
+    expected_used = dict(intent)
+    expected_used["phase"] = "used"
+    if used != expected_used:
+        reject("publisher used diverge do intent post-publisher")
+    return PublisherUpgradeTransaction(
+        old_digest=str(intent["old_tree_sha256"]),
+        new_digest=str(intent["new_tree_sha256"]),
+        previous_name=str(intent["previous_name"]),
+        intent_raw=intent_raw,
+        used_raw=used_raw,
+    )
+
+
+def post_publisher_supersede_payload(
+    recovery: PostPublisherRecovery,
+) -> bytes:
+    predecessor = recovery.predecessor
+    return canonical_bytes(
+        {
+            "contract": POST_PUBLISHER_SUPERSEDE_CONTRACT,
+            "phase": "post-publisher-supersede",
+            "predecessor_api_sha": predecessor.api_sha,
+            "predecessor_controller_sha": predecessor.controller_sha,
+            "predecessor_intent_sha256": (
+                recovery.source_intent_sha256
+            ),
+            "predecessor_kit_id": predecessor.kit_id,
+            "predecessor_new_source_tree_sha256": (
+                predecessor.new_digest
+            ),
+            "predecessor_old_source_tree_sha256": (
+                predecessor.old_digest
+            ),
+            "predecessor_publisher_intent_sha256": (
+                recovery.publisher_intent_sha256
+            ),
+            "predecessor_publisher_new_tree_sha256": (
+                recovery.publisher_new_digest
+            ),
+            "predecessor_publisher_old_tree_sha256": (
+                recovery.publisher_old_digest
+            ),
+            "predecessor_publisher_previous_name": (
+                recovery.publisher_previous_name
+            ),
+            "predecessor_publisher_used_sha256": (
+                recovery.publisher_used_sha256
+            ),
+            "predecessor_source_used_sha256": (
+                recovery.source_used_sha256
+            ),
+            "schema_version": 1,
+            "successor_kit_id": recovery.successor_kit_id,
+            "successor_new_source_tree_sha256": (
+                recovery.successor_new_digest
+            ),
+        }
+    )
+
+
+def validate_post_publisher_supersede(
+    raw: bytes,
+    *,
+    successor_kit_id: str,
+    successor_new_digest: str,
+) -> PostPublisherRecovery:
+    value = parse_canonical_json(
+        raw,
+        "bootstrap source post-publisher supersede",
+    )
+    exact_object(
+        value,
+        {
+            "contract",
+            "phase",
+            "predecessor_api_sha",
+            "predecessor_controller_sha",
+            "predecessor_intent_sha256",
+            "predecessor_kit_id",
+            "predecessor_new_source_tree_sha256",
+            "predecessor_old_source_tree_sha256",
+            "predecessor_publisher_intent_sha256",
+            "predecessor_publisher_new_tree_sha256",
+            "predecessor_publisher_old_tree_sha256",
+            "predecessor_publisher_previous_name",
+            "predecessor_publisher_used_sha256",
+            "predecessor_source_used_sha256",
+            "schema_version",
+            "successor_kit_id",
+            "successor_new_source_tree_sha256",
+        },
+        "bootstrap source post-publisher supersede",
+    )
+    if (
+        value["contract"] != POST_PUBLISHER_SUPERSEDE_CONTRACT
+        or value["phase"] != "post-publisher-supersede"
+        or value["schema_version"] != 1
+        or value["successor_kit_id"] != successor_kit_id
+        or value["successor_new_source_tree_sha256"]
+        != successor_new_digest
+    ):
+        reject("post-publisher supersede não autoriza este sucessor")
+    predecessor = SupersededSourceTransaction(
+        kit_id=require_hash(
+            value["predecessor_kit_id"],
+            "kit ID predecessor post-publisher",
+        ),
+        api_sha=require_sha(
+            value["predecessor_api_sha"],
+            "API predecessor post-publisher",
+        ),
+        controller_sha=require_sha(
+            value["predecessor_controller_sha"],
+            "controller predecessor post-publisher",
+        ),
+        old_digest=require_hash(
+            value["predecessor_old_source_tree_sha256"],
+            "source antigo predecessor post-publisher",
+        ),
+        new_digest=require_hash(
+            value["predecessor_new_source_tree_sha256"],
+            "source novo predecessor post-publisher",
+        ),
+        intent_raw=b"",
+        publisher_intent_sha256=require_hash(
+            value["predecessor_publisher_intent_sha256"],
+            "publisher intent predecessor post-publisher",
+        ),
+        publisher_authorization_required=False,
+    )
+    source_intent_sha256 = require_hash(
+        value["predecessor_intent_sha256"],
+        "source intent predecessor post-publisher",
+    )
+    source_used_sha256 = require_hash(
+        value["predecessor_source_used_sha256"],
+        "source used predecessor post-publisher",
+    )
+    publisher_used_sha256 = require_hash(
+        value["predecessor_publisher_used_sha256"],
+        "publisher used predecessor post-publisher",
+    )
+    publisher_old_digest = require_hash(
+        value["predecessor_publisher_old_tree_sha256"],
+        "publisher old tree predecessor post-publisher",
+    )
+    publisher_new_digest = require_hash(
+        value["predecessor_publisher_new_tree_sha256"],
+        "publisher new tree predecessor post-publisher",
+    )
+    publisher_previous_name = value[
+        "predecessor_publisher_previous_name"
+    ]
+    if (
+        type(publisher_previous_name) is not str
+        or publisher_previous_name
+        != PUBLISHER_PREVIOUS_PREFIX + publisher_old_digest[:32]
+        or publisher_old_digest == publisher_new_digest
+        or predecessor.old_digest == predecessor.new_digest
+        or predecessor.kit_id == successor_kit_id
+        or predecessor.new_digest == successor_new_digest
+    ):
+        reject("post-publisher supersede não descreve sucessão distinta")
+    return PostPublisherRecovery(
+        predecessor=predecessor,
+        source_intent_sha256=source_intent_sha256,
+        source_used_sha256=source_used_sha256,
+        publisher_intent_sha256=predecessor.publisher_intent_sha256,
+        publisher_used_sha256=publisher_used_sha256,
+        publisher_old_digest=publisher_old_digest,
+        publisher_new_digest=publisher_new_digest,
+        publisher_previous_name=publisher_previous_name,
+        successor_kit_id=successor_kit_id,
+        successor_new_digest=successor_new_digest,
+    )
+
+
+def require_absent_path(path: Path, label: str) -> None:
+    try:
+        os.stat(path, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    reject(f"{label} precisa estar ausente no estado pré-stage")
+
+
+def validate_post_publisher_pre_stage(
+    state_descriptor: int,
+    *,
+    uid: int,
+    gid: int,
+) -> None:
+    control = open_path_chain(
+        CONTROL_ROOT,
+        uid=uid,
+        gid=gid,
+        final_modes={0o711},
+    )
+    try:
+        try:
+            os.stat(
+                "current",
+                dir_fd=control,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            reject("runtime current já existe no recovery post-publisher")
+        bundles = _open_named_directory(
+            control,
+            BUNDLES_NAME,
+            uid=uid,
+            gid=gid,
+            modes={0o711},
+        )
+        if bundles is None:
+            reject("diretório de bundles pré-stage está ausente")
+        try:
+            if os.listdir(bundles):
+                reject("recovery post-publisher encontrou bundle staged")
+        finally:
+            os.close(bundles)
+    finally:
+        os.close(control)
+    for path, label in (
+        (BOOTSTRAP_RELEASE_MARKER, "bootstrap release marker"),
+        (RELEASE_STATE_MARKER, "release-state"),
+        (ACTIVATION_JOURNAL, "activation journal"),
+        (ACTIVATION_EPOCH_MARKER, "activation epoch"),
+    ):
+        require_absent_path(path, label)
+    try:
+        os.stat(
+            BOOTSTRAP_CONSUMED_NAME,
+            dir_fd=state_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        pass
+    else:
+        reject("bootstrap consumption marker já existe")
+
+
+def validate_fixed_post_publisher_state(
+    *,
+    expected_intent_sha256: str,
+    expected_used_sha256: str,
+    uid: int,
+    gid: int,
+) -> PublisherUpgradeTransaction:
+    require_hash(
+        expected_intent_sha256,
+        "publisher intent post-publisher esperado",
+    )
+    require_hash(
+        expected_used_sha256,
+        "publisher used post-publisher esperado",
+    )
+    control = open_path_chain(
+        CONTROL_ROOT,
+        uid=uid,
+        gid=gid,
+        final_modes={0o711},
+    )
+    staging: int | None = None
+    try:
+        staging = _open_named_directory(
+            control,
+            ".staging",
+            uid=uid,
+            gid=gid,
+            modes={0o700},
+        )
+        if staging is None:
+            reject("staging do publisher post-publisher está ausente")
+        intent_raw = read_publisher_record_if_present(
+            staging,
+            PUBLISHER_INTENT_NAME,
+            uid=uid,
+            gid=gid,
+        )
+        used_raw = read_publisher_record_if_present(
+            staging,
+            PUBLISHER_USED_NAME,
+            uid=uid,
+            gid=gid,
+        )
+        if intent_raw is None or used_raw is None:
+            reject("publisher post-publisher não está terminal")
+        transaction = validate_publisher_upgrade_transaction(
+            intent_raw,
+            used_raw,
+        )
+        if (
+            hashlib.sha256(intent_raw).hexdigest()
+            != expected_intent_sha256
+            or hashlib.sha256(used_raw).hexdigest()
+            != expected_used_sha256
+        ):
+            reject("publisher terminal diverge dos bindings externos")
+        allowed = {
+            PUBLISHER_INTENT_NAME,
+            PUBLISHER_USED_NAME,
+            transaction.previous_name,
+        }
+        if set(os.listdir(staging)) != allowed:
+            reject("namespace terminal do publisher não é exato")
+        previous = _open_named_directory(
+            staging,
+            transaction.previous_name,
+            uid=uid,
+            gid=gid,
+            modes={0o555},
+        )
+        if previous is None:
+            reject("rollback terminal do publisher está ausente")
+        try:
+            if (
+                protected_bootstrap_tree_digest(
+                    previous,
+                    uid=uid,
+                    gid=gid,
+                )
+                != transaction.old_digest
+            ):
+                reject("rollback terminal do publisher diverge")
+        finally:
+            os.close(previous)
+        final = _open_named_directory(
+            control,
+            "bootstrap",
+            uid=uid,
+            gid=gid,
+            modes={0o555},
+        )
+        if final is None:
+            reject("bootstrap terminal do publisher está ausente")
+        try:
+            if (
+                protected_bootstrap_tree_digest(
+                    final,
+                    uid=uid,
+                    gid=gid,
+                )
+                != transaction.new_digest
+            ):
+                reject("bootstrap terminal diverge do publisher used")
+        finally:
+            os.close(final)
+        return transaction
+    finally:
+        if staging is not None:
+            os.close(staging)
+        os.close(control)
+
+
+def build_initial_post_publisher_recovery(
+    state_descriptor: int,
+    *,
+    observed_source_digest: str,
+    binding: AttestationBinding,
+    successor_kit_id: str,
+    successor_new_digest: str,
+    expectations: BootstrapExpectations,
+    uid: int,
+    gid: int,
+) -> PostPublisherRecovery:
+    intent_raw = read_record_if_present(
+        state_descriptor,
+        INTENT_NAME,
+        uid=uid,
+        gid=gid,
+    )
+    used_raw = read_record_if_present(
+        state_descriptor,
+        USED_NAME,
+        uid=uid,
+        gid=gid,
+    )
+    if intent_raw is None or used_raw is None:
+        reject("source predecessor post-publisher não está terminal")
+    predecessor = validate_source_intent(intent_raw)
+    if (
+        predecessor.kit_id
+        != expectations.post_publisher_predecessor_kit_id
+        or predecessor.controller_sha
+        != expectations.post_publisher_predecessor_controller_sha
+        or hashlib.sha256(intent_raw).hexdigest()
+        != expectations.post_publisher_source_intent_sha256
+        or hashlib.sha256(used_raw).hexdigest()
+        != expectations.post_publisher_source_used_sha256
+        or predecessor.api_sha not in binding.api_required_ancestors
+        or predecessor.api_sha not in binding.ops_required_ancestors
+        or predecessor.kit_id == successor_kit_id
+        or predecessor.new_digest == successor_new_digest
+        or observed_source_digest != predecessor.new_digest
+    ):
+        reject("bindings externos não autorizam o source terminal")
+    for phase in ("prepared", "exchanged", "retained", "used"):
+        observed = read_record_if_present(
+            state_descriptor,
+            POST_PUBLISHER_SOURCE_PHASE_NAMES[phase],
+            uid=uid,
+            gid=gid,
+        )
+        if observed != _expected_source_phase(predecessor, phase):
+            reject(f"fase source terminal ausente ou divergente: {phase}")
+    _validate_predecessor_rollback(
+        state_descriptor,
+        predecessor,
+        uid=uid,
+        gid=gid,
+    )
+    allowed = {
+        INTENT_NAME,
+        PREPARED_NAME,
+        EXCHANGED_NAME,
+        RETAINED_NAME,
+        USED_NAME,
+        f"{PREVIOUS_PREFIX}{predecessor.kit_id}",
+        (
+            "bootstrap-source-kit.post-publisher-supersede."
+            f"{successor_kit_id}.installing"
+        ),
+    }
+    for name in os.listdir(state_descriptor):
+        if not (
+            name.startswith("bootstrap-source-kit.")
+            or name.startswith(CANDIDATE_PREFIX)
+            or name.startswith(PREVIOUS_PREFIX)
+        ):
+            continue
+        if name not in allowed:
+            reject("namespace source terminal contém journal estrangeiro")
+    publisher = validate_fixed_post_publisher_state(
+        expected_intent_sha256=(
+            expectations.post_publisher_publisher_intent_sha256
+        ),
+        expected_used_sha256=(
+            expectations.post_publisher_publisher_used_sha256
+        ),
+        uid=uid,
+        gid=gid,
+    )
+    predecessor = SupersededSourceTransaction(
+        kit_id=predecessor.kit_id,
+        api_sha=predecessor.api_sha,
+        controller_sha=predecessor.controller_sha,
+        old_digest=predecessor.old_digest,
+        new_digest=predecessor.new_digest,
+        intent_raw=intent_raw,
+        publisher_intent_sha256=hashlib.sha256(
+            publisher.intent_raw
+        ).hexdigest(),
+        publisher_authorization_required=False,
+    )
+    recovery = PostPublisherRecovery(
+        predecessor=predecessor,
+        source_intent_sha256=hashlib.sha256(intent_raw).hexdigest(),
+        source_used_sha256=hashlib.sha256(used_raw).hexdigest(),
+        publisher_intent_sha256=hashlib.sha256(
+            publisher.intent_raw
+        ).hexdigest(),
+        publisher_used_sha256=hashlib.sha256(
+            publisher.used_raw
+        ).hexdigest(),
+        publisher_old_digest=publisher.old_digest,
+        publisher_new_digest=publisher.new_digest,
+        publisher_previous_name=publisher.previous_name,
+        successor_kit_id=successor_kit_id,
+        successor_new_digest=successor_new_digest,
+    )
+    validate_post_publisher_pre_stage(
+        state_descriptor,
+        uid=uid,
+        gid=gid,
+    )
+    return recovery
+
+
 def _expected_source_phase(
     predecessor: SupersededSourceTransaction,
     phase: str,
@@ -2399,7 +3080,7 @@ def _archive_source_record(
     gid: int,
     runtime: Runtime,
 ) -> None:
-    source_name = SOURCE_PHASE_NAMES[phase]
+    source_name = POST_PUBLISHER_SOURCE_PHASE_NAMES[phase]
     archived_name = predecessor.archived_name(phase)
     expected = _expected_source_phase(predecessor, phase)
     source_raw = read_record_if_present(
@@ -2482,6 +3163,494 @@ def _validate_predecessor_rollback(
         reject("rollback predecessor retido diverge do intent")
 
 
+def _post_publisher_recovery_from_record(
+    state_descriptor: int,
+    raw: bytes,
+    *,
+    binding: AttestationBinding,
+    successor_kit_id: str,
+    successor_new_digest: str,
+    expectations: BootstrapExpectations,
+    uid: int,
+    gid: int,
+) -> PostPublisherRecovery:
+    recovery = validate_post_publisher_supersede(
+        raw,
+        successor_kit_id=successor_kit_id,
+        successor_new_digest=successor_new_digest,
+    )
+    predecessor = recovery.predecessor
+    if (
+        predecessor.kit_id
+        != expectations.post_publisher_predecessor_kit_id
+        or predecessor.controller_sha
+        != expectations.post_publisher_predecessor_controller_sha
+        or recovery.source_intent_sha256
+        != expectations.post_publisher_source_intent_sha256
+        or recovery.source_used_sha256
+        != expectations.post_publisher_source_used_sha256
+        or recovery.publisher_intent_sha256
+        != expectations.post_publisher_publisher_intent_sha256
+        or recovery.publisher_used_sha256
+        != expectations.post_publisher_publisher_used_sha256
+        or predecessor.api_sha not in binding.api_required_ancestors
+        or predecessor.api_sha not in binding.ops_required_ancestors
+    ):
+        reject("bindings externos divergem do recovery post-publisher")
+    intent_raw = read_record_if_present(
+        state_descriptor,
+        predecessor.archived_name("intent"),
+        uid=uid,
+        gid=gid,
+    )
+    if intent_raw is None:
+        intent_raw = read_record_if_present(
+            state_descriptor,
+            INTENT_NAME,
+            uid=uid,
+            gid=gid,
+        )
+    if (
+        intent_raw is None
+        or hashlib.sha256(intent_raw).hexdigest()
+        != recovery.source_intent_sha256
+    ):
+        reject("source intent post-publisher não está recuperável")
+    parsed = validate_source_intent(intent_raw)
+    if (
+        parsed.kit_id != predecessor.kit_id
+        or parsed.api_sha != predecessor.api_sha
+        or parsed.controller_sha != predecessor.controller_sha
+        or parsed.old_digest != predecessor.old_digest
+        or parsed.new_digest != predecessor.new_digest
+    ):
+        reject("source intent diverge do journal post-publisher")
+    predecessor = SupersededSourceTransaction(
+        kit_id=parsed.kit_id,
+        api_sha=parsed.api_sha,
+        controller_sha=parsed.controller_sha,
+        old_digest=parsed.old_digest,
+        new_digest=parsed.new_digest,
+        intent_raw=intent_raw,
+        publisher_intent_sha256=recovery.publisher_intent_sha256,
+        publisher_authorization_required=False,
+    )
+    return PostPublisherRecovery(
+        predecessor=predecessor,
+        source_intent_sha256=recovery.source_intent_sha256,
+        source_used_sha256=recovery.source_used_sha256,
+        publisher_intent_sha256=recovery.publisher_intent_sha256,
+        publisher_used_sha256=recovery.publisher_used_sha256,
+        publisher_old_digest=recovery.publisher_old_digest,
+        publisher_new_digest=recovery.publisher_new_digest,
+        publisher_previous_name=recovery.publisher_previous_name,
+        successor_kit_id=recovery.successor_kit_id,
+        successor_new_digest=recovery.successor_new_digest,
+    )
+
+
+def _validate_post_source_used_evidence(
+    state_descriptor: int,
+    recovery: PostPublisherRecovery,
+    *,
+    uid: int,
+    gid: int,
+) -> bool:
+    expected = _expected_source_phase(recovery.predecessor, "used")
+    active = read_record_if_present(
+        state_descriptor,
+        USED_NAME,
+        uid=uid,
+        gid=gid,
+    )
+    archived = read_record_if_present(
+        state_descriptor,
+        recovery.predecessor.archived_name("used"),
+        uid=uid,
+        gid=gid,
+    )
+    if archived is None:
+        if active is None:
+            reject("source used predecessor não está recuperável")
+        if (
+            active != expected
+            or hashlib.sha256(active).hexdigest()
+            != recovery.source_used_sha256
+        ):
+            reject("source used predecessor diverge")
+        return False
+    if (
+        archived != expected
+        or hashlib.sha256(archived).hexdigest()
+        != recovery.source_used_sha256
+    ):
+        reject("source used predecessor arquivado diverge")
+    if active == expected:
+        reject("source used predecessor coexiste com seu arquivo")
+    return True
+
+
+def _publisher_archive_status(
+    staging: int,
+    recovery: PostPublisherRecovery,
+    *,
+    uid: int,
+    gid: int,
+) -> tuple[bool, bool, bool]:
+    expected_intent = canonical_bytes(
+        {
+            "new_tree_sha256": recovery.publisher_new_digest,
+            "old_tree_sha256": recovery.publisher_old_digest,
+            "phase": "intent",
+            "previous_name": recovery.publisher_previous_name,
+            "schema_version": 1,
+        }
+    )
+    expected_used_value = parse_canonical_json(
+        expected_intent,
+        "publisher intent predecessor esperado",
+    )
+    expected_used_value["phase"] = "used"
+    expected_used = canonical_bytes(expected_used_value)
+    statuses: list[bool] = []
+    for active_name, archived_name, expected, expected_hash in (
+        (
+            PUBLISHER_USED_NAME,
+            post_publisher_archive_name(
+                "used",
+                recovery.predecessor.kit_id,
+            ),
+            expected_used,
+            recovery.publisher_used_sha256,
+        ),
+        (
+            PUBLISHER_INTENT_NAME,
+            post_publisher_archive_name(
+                "intent",
+                recovery.predecessor.kit_id,
+            ),
+            expected_intent,
+            recovery.publisher_intent_sha256,
+        ),
+    ):
+        active = read_publisher_record_if_present(
+            staging,
+            active_name,
+            uid=uid,
+            gid=gid,
+        )
+        archived = read_publisher_record_if_present(
+            staging,
+            archived_name,
+            uid=uid,
+            gid=gid,
+        )
+        observed = archived if archived is not None else active
+        if (
+            observed != expected
+            or hashlib.sha256(observed).hexdigest() != expected_hash
+        ):
+            reject(f"{active_name} predecessor não está recuperável")
+        if archived is not None and active == expected:
+            reject(f"{active_name} predecessor coexiste com seu arquivo")
+        statuses.append(archived is not None)
+    active_previous = _open_named_directory(
+        staging,
+        recovery.publisher_previous_name,
+        uid=uid,
+        gid=gid,
+        modes={0o555},
+    )
+    archived_previous_name = post_publisher_archive_name(
+        "previous",
+        recovery.predecessor.kit_id,
+    )
+    archived_previous = _open_named_directory(
+        staging,
+        archived_previous_name,
+        uid=uid,
+        gid=gid,
+        modes={0o555},
+    )
+    if active_previous is not None and archived_previous is not None:
+        os.close(active_previous)
+        os.close(archived_previous)
+        reject("rollback publisher coexiste com seu arquivo")
+    previous = (
+        archived_previous
+        if archived_previous is not None
+        else active_previous
+    )
+    if previous is None:
+        reject("rollback publisher predecessor não está recuperável")
+    try:
+        if (
+            protected_bootstrap_tree_digest(
+                previous,
+                uid=uid,
+                gid=gid,
+            )
+            != recovery.publisher_old_digest
+        ):
+            reject("rollback publisher predecessor diverge")
+    finally:
+        os.close(previous)
+    statuses.append(archived_previous is not None)
+    expected_prefix = (True,) * sum(statuses) + (False,) * (
+        len(statuses) - sum(statuses)
+    )
+    if tuple(statuses) != expected_prefix:
+        reject("arquivos publisher post-publisher estão fora de ordem")
+    return tuple(statuses)  # type: ignore[return-value]
+
+
+def validate_partial_publisher_record(
+    staging: int,
+    name: str,
+    expected: bytes,
+    *,
+    uid: int,
+    gid: int,
+) -> bool:
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=staging,
+        )
+    except FileNotFoundError:
+        return False
+    try:
+        info = os.fstat(descriptor)
+        validate_regular(
+            info,
+            name,
+            uid=uid,
+            gid=gid,
+            modes={0o400, 0o600},
+            maximum=len(expected),
+            allow_empty=True,
+        )
+        observed = (
+            read_all(
+                descriptor,
+                info,
+                maximum=len(expected),
+                label=name,
+            )
+            if info.st_size
+            else b""
+        )
+    finally:
+        os.close(descriptor)
+    if not expected.startswith(observed):
+        reject(f"{name} não é prefixo do publisher sucessor")
+    if stat.S_IMODE(info.st_mode) == 0o400 and observed != expected:
+        reject(f"{name} imutável está incompleto")
+    return True
+
+
+def _validate_successor_publisher_state(
+    control: int,
+    staging: int,
+    recovery: PostPublisherRecovery,
+    *,
+    allow_successor: bool,
+    uid: int,
+    gid: int,
+) -> tuple[set[str], str]:
+    final = _open_named_directory(
+        control,
+        "bootstrap",
+        uid=uid,
+        gid=gid,
+        modes={0o555},
+    )
+    if final is None:
+        reject("bootstrap publicado sumiu no recovery post-publisher")
+    try:
+        final_digest = protected_bootstrap_tree_digest(
+            final,
+            uid=uid,
+            gid=gid,
+        )
+    finally:
+        os.close(final)
+    intent_raw = read_publisher_record_if_present(
+        staging,
+        PUBLISHER_INTENT_NAME,
+        uid=uid,
+        gid=gid,
+    )
+    used_raw = read_publisher_record_if_present(
+        staging,
+        PUBLISHER_USED_NAME,
+        uid=uid,
+        gid=gid,
+    )
+    candidate = _open_named_directory(
+        staging,
+        PUBLISHER_CANDIDATE_NAME,
+        uid=uid,
+        gid=gid,
+        modes={0o555, 0o700},
+    )
+    candidate_digest: str | None = None
+    candidate_mode: int | None = None
+    if candidate is not None:
+        try:
+            candidate_mode = stat.S_IMODE(os.fstat(candidate).st_mode)
+            candidate_entries = scan_tree(
+                candidate,
+                uid=uid,
+                gid=gid,
+                root_modes={0o555, 0o700},
+                directory_modes={0o555, 0o700},
+                file_modes={0o444, 0o555, 0o600},
+            )
+            if candidate_mode == 0o555:
+                candidate_digest = protected_bootstrap_tree_digest(
+                    candidate,
+                    uid=uid,
+                    gid=gid,
+                )
+        finally:
+            os.close(candidate)
+    allowed: set[str] = set()
+    if intent_raw is None:
+        if used_raw is not None:
+            reject("publisher sucessor possui used sem intent")
+        if not allow_successor and candidate is not None:
+            reject("publisher sucessor começou antes do source retido")
+        if final_digest != recovery.publisher_new_digest:
+            reject("bootstrap mudou sem intent publisher sucessor")
+        if candidate is not None:
+            allowed.add(PUBLISHER_CANDIDATE_NAME)
+        if candidate_mode == 0o555 and candidate_digest is not None:
+            successor_intent = canonical_bytes(
+                {
+                    "new_tree_sha256": candidate_digest,
+                    "old_tree_sha256": recovery.publisher_new_digest,
+                    "phase": "intent",
+                    "previous_name": (
+                        PUBLISHER_PREVIOUS_PREFIX
+                        + recovery.publisher_new_digest[:32]
+                    ),
+                    "schema_version": 1,
+                }
+            )
+            if validate_partial_publisher_record(
+                staging,
+                f"{PUBLISHER_INTENT_NAME}.installing",
+                successor_intent,
+                uid=uid,
+                gid=gid,
+            ):
+                if not allow_successor:
+                    reject("publisher intent parcial começou cedo")
+                allowed.add(f"{PUBLISHER_INTENT_NAME}.installing")
+        elif (
+            f"{PUBLISHER_INTENT_NAME}.installing"
+            in os.listdir(staging)
+        ):
+            reject("publisher intent parcial não possui candidate completo")
+        if f"{PUBLISHER_USED_NAME}.installing" in os.listdir(staging):
+            reject("publisher used parcial existe antes do intent")
+        return allowed, final_digest
+    if not allow_successor:
+        reject("publisher sucessor começou antes do source retido")
+    intent = validate_publisher_upgrade_record(
+        intent_raw,
+        phase="intent",
+        label="publisher intent sucessor",
+    )
+    if intent["old_tree_sha256"] != recovery.publisher_new_digest:
+        reject("publisher sucessor não parte do bootstrap predecessor")
+    successor_new = str(intent["new_tree_sha256"])
+    successor_previous = str(intent["previous_name"])
+    allowed.add(PUBLISHER_INTENT_NAME)
+    previous = _open_named_directory(
+        staging,
+        successor_previous,
+        uid=uid,
+        gid=gid,
+        modes={0o555},
+    )
+    previous_valid = False
+    if previous is not None:
+        try:
+            previous_valid = (
+                protected_bootstrap_tree_digest(
+                    previous,
+                    uid=uid,
+                    gid=gid,
+                )
+                == recovery.publisher_new_digest
+            )
+        finally:
+            os.close(previous)
+        if not previous_valid:
+            reject("rollback publisher sucessor diverge")
+        allowed.add(successor_previous)
+    if final_digest == recovery.publisher_new_digest:
+        if (
+            candidate_mode != 0o555
+            or candidate_digest != successor_new
+            or previous is not None
+            or used_raw is not None
+        ):
+            reject("publisher sucessor pré-exchange está inconsistente")
+        allowed.add(PUBLISHER_CANDIDATE_NAME)
+    elif final_digest == successor_new:
+        candidate_is_old = (
+            candidate_mode == 0o555
+            and candidate_digest == recovery.publisher_new_digest
+        )
+        if not candidate_is_old and not previous_valid:
+            reject("publisher sucessor perdeu o lado anterior")
+        if candidate_is_old:
+            if previous is not None:
+                reject("candidate e rollback publisher coexistem")
+            allowed.add(PUBLISHER_CANDIDATE_NAME)
+    else:
+        reject("bootstrap não pertence ao publisher sucessor")
+    expected_used_value = dict(intent)
+    expected_used_value["phase"] = "used"
+    expected_used = canonical_bytes(expected_used_value)
+    if validate_partial_publisher_record(
+        staging,
+        f"{PUBLISHER_USED_NAME}.installing",
+        expected_used,
+        uid=uid,
+        gid=gid,
+    ):
+        if (
+            final_digest != successor_new
+            or not previous_valid
+            or candidate is not None
+            or used_raw is not None
+        ):
+            reject("publisher used parcial está fora de estágio")
+        allowed.add(f"{PUBLISHER_USED_NAME}.installing")
+    if used_raw is not None:
+        used = validate_publisher_upgrade_record(
+            used_raw,
+            phase="used",
+            label="publisher used sucessor",
+        )
+        if (
+            used != expected_used_value
+            or final_digest != successor_new
+            or not previous_valid
+            or candidate is not None
+        ):
+            reject("publisher used sucessor não está íntegro")
+        allowed.add(PUBLISHER_USED_NAME)
+    if f"{PUBLISHER_INTENT_NAME}.installing" in os.listdir(staging):
+        reject("publisher intent parcial coexiste com intent final")
+    return allowed, final_digest
+
+
 def validate_partial_source_record(
     state_descriptor: int,
     name: str,
@@ -2526,6 +3695,538 @@ def validate_partial_source_record(
         reject(f"{name} imutável está incompleto")
 
 
+def _validate_post_recovery_source_before_supersede(
+    state_descriptor: int,
+    recovery: PostPublisherRecovery,
+    *,
+    observed_source_digest: str,
+    uid: int,
+    gid: int,
+) -> None:
+    predecessor = recovery.predecessor
+    if observed_source_digest != predecessor.new_digest:
+        reject("source mudou antes do supersede post-publisher")
+    _validate_predecessor_rollback(
+        state_descriptor,
+        predecessor,
+        uid=uid,
+        gid=gid,
+    )
+    for phase in SOURCE_PHASE_NAMES:
+        active = read_record_if_present(
+            state_descriptor,
+            SOURCE_PHASE_NAMES[phase],
+            uid=uid,
+            gid=gid,
+        )
+        archived = read_record_if_present(
+            state_descriptor,
+            predecessor.archived_name(phase),
+            uid=uid,
+            gid=gid,
+        )
+        if active != _expected_source_phase(predecessor, phase):
+            reject(f"source predecessor perdeu a fase {phase}")
+        if archived is not None:
+            reject(f"source predecessor arquivou {phase} cedo demais")
+
+
+def _open_post_publisher_staging(
+    *,
+    uid: int,
+    gid: int,
+) -> tuple[int, int]:
+    control = open_path_chain(
+        CONTROL_ROOT,
+        uid=uid,
+        gid=gid,
+        final_modes={0o711},
+    )
+    staging = _open_named_directory(
+        control,
+        ".staging",
+        uid=uid,
+        gid=gid,
+        modes={0o700},
+    )
+    if staging is None:
+        os.close(control)
+        reject("staging publisher sumiu no recovery post-publisher")
+    return control, staging
+
+
+def validate_existing_post_publisher_recovery(
+    state_descriptor: int,
+    recovery: PostPublisherRecovery,
+    *,
+    observed_source_digest: str,
+    uid: int,
+    gid: int,
+) -> str:
+    validate_post_publisher_pre_stage(
+        state_descriptor,
+        uid=uid,
+        gid=gid,
+    )
+    source_used_archived = _validate_post_source_used_evidence(
+        state_descriptor,
+        recovery,
+        uid=uid,
+        gid=gid,
+    )
+    control, staging = _open_post_publisher_staging(
+        uid=uid,
+        gid=gid,
+    )
+    try:
+        publisher_archived = _publisher_archive_status(
+            staging,
+            recovery,
+            uid=uid,
+            gid=gid,
+        )
+        archive_steps = (
+            source_used_archived,
+            *publisher_archived,
+        )
+        archive_count = sum(archive_steps)
+        if archive_steps != (True,) * archive_count + (False,) * (
+            len(archive_steps) - archive_count
+        ):
+            reject("recovery post-publisher não forma prefixo transacional")
+        all_archived = all(archive_steps)
+
+        standard_raw = read_record_if_present(
+            state_descriptor,
+            SUPERSEDE_NAME,
+            uid=uid,
+            gid=gid,
+        )
+        expected_standard = source_supersede_payload(
+            recovery.predecessor,
+            successor_kit_id=recovery.successor_kit_id,
+            successor_new_digest=recovery.successor_new_digest,
+        )
+        standard_partial_name = (
+            f"bootstrap-source-kit.supersede."
+            f"{recovery.successor_kit_id}.installing"
+        )
+        standard_partial = False
+        if standard_raw is not None:
+            if standard_raw != expected_standard:
+                reject("source supersede padrão diverge do recovery")
+        else:
+            try:
+                os.stat(
+                    standard_partial_name,
+                    dir_fd=state_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                pass
+            else:
+                validate_partial_source_record(
+                    state_descriptor,
+                    standard_partial_name,
+                    expected_standard,
+                    uid=uid,
+                    gid=gid,
+                )
+                standard_partial = True
+        if (standard_raw is not None or standard_partial) and not all_archived:
+            reject("source supersede começou antes dos arquivos predecessor")
+        if standard_raw is None:
+            _validate_post_recovery_source_before_supersede(
+                state_descriptor,
+                recovery,
+                observed_source_digest=observed_source_digest,
+                uid=uid,
+                gid=gid,
+            )
+
+        successor_retained = marker_payload(
+            kit_id=recovery.successor_kit_id,
+            phase="retained",
+            old_digest=recovery.predecessor.new_digest,
+            new_digest=recovery.successor_new_digest,
+        )
+        successor_used = marker_payload(
+            kit_id=recovery.successor_kit_id,
+            phase="used",
+            old_digest=recovery.predecessor.new_digest,
+            new_digest=recovery.successor_new_digest,
+        )
+        allow_successor_publisher = (
+            standard_raw is not None
+            and (
+                read_record_if_present(
+                    state_descriptor,
+                    RETAINED_NAME,
+                    uid=uid,
+                    gid=gid,
+                )
+                == successor_retained
+                or read_record_if_present(
+                    state_descriptor,
+                    USED_NAME,
+                    uid=uid,
+                    gid=gid,
+                )
+                == successor_used
+            )
+        )
+        allowed_staging = {
+            post_publisher_archive_name(
+                kind,
+                recovery.predecessor.kit_id,
+            )
+            for kind, archived in zip(
+                ("used", "intent", "previous"),
+                publisher_archived,
+                strict=True,
+            )
+            if archived
+        }
+        for kind, active_name, archived in (
+            ("used", PUBLISHER_USED_NAME, publisher_archived[0]),
+            ("intent", PUBLISHER_INTENT_NAME, publisher_archived[1]),
+            (
+                "previous",
+                recovery.publisher_previous_name,
+                publisher_archived[2],
+            ),
+        ):
+            if not archived:
+                allowed_staging.add(active_name)
+        if all(publisher_archived):
+            successor_staging, current_bootstrap_digest = (
+                _validate_successor_publisher_state(
+                    control,
+                    staging,
+                    recovery,
+                    allow_successor=allow_successor_publisher,
+                    uid=uid,
+                    gid=gid,
+                )
+            )
+            allowed_staging.update(successor_staging)
+        else:
+            final = _open_named_directory(
+                control,
+                "bootstrap",
+                uid=uid,
+                gid=gid,
+                modes={0o555},
+            )
+            if final is None:
+                reject("bootstrap predecessor sumiu durante os arquivos")
+            try:
+                current_bootstrap_digest = (
+                    protected_bootstrap_tree_digest(
+                        final,
+                        uid=uid,
+                        gid=gid,
+                    )
+                )
+                if current_bootstrap_digest != recovery.publisher_new_digest:
+                    reject("bootstrap mudou durante os arquivos predecessor")
+            finally:
+                os.close(final)
+        if set(os.listdir(staging)) != allowed_staging:
+            reject("namespace publisher post-publisher contém estado estranho")
+        return current_bootstrap_digest
+    finally:
+        os.close(staging)
+        os.close(control)
+
+
+def prepare_post_publisher_recovery(
+    state_descriptor: int,
+    *,
+    observed_source_digest: str,
+    binding: AttestationBinding,
+    successor_kit_id: str,
+    successor_new_digest: str,
+    expectations: BootstrapExpectations,
+    uid: int,
+    gid: int,
+) -> tuple[PostPublisherRecovery, str]:
+    raw = read_record_if_present(
+        state_descriptor,
+        POST_PUBLISHER_SUPERSEDE_NAME,
+        uid=uid,
+        gid=gid,
+    )
+    if raw is None:
+        recovery = build_initial_post_publisher_recovery(
+            state_descriptor,
+            observed_source_digest=observed_source_digest,
+            binding=binding,
+            successor_kit_id=successor_kit_id,
+            successor_new_digest=successor_new_digest,
+            expectations=expectations,
+            uid=uid,
+            gid=gid,
+        )
+        partial_name = (
+            "bootstrap-source-kit.post-publisher-supersede."
+            f"{successor_kit_id}.installing"
+        )
+        try:
+            os.stat(
+                partial_name,
+                dir_fd=state_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            validate_partial_source_record(
+                state_descriptor,
+                partial_name,
+                post_publisher_supersede_payload(recovery),
+                uid=uid,
+                gid=gid,
+            )
+        return recovery, recovery.publisher_new_digest
+    recovery = _post_publisher_recovery_from_record(
+        state_descriptor,
+        raw,
+        binding=binding,
+        successor_kit_id=successor_kit_id,
+        successor_new_digest=successor_new_digest,
+        expectations=expectations,
+        uid=uid,
+        gid=gid,
+    )
+    current_bootstrap_digest = validate_existing_post_publisher_recovery(
+        state_descriptor,
+        recovery,
+        observed_source_digest=observed_source_digest,
+        uid=uid,
+        gid=gid,
+    )
+    return recovery, current_bootstrap_digest
+
+
+def _archive_publisher_record(
+    staging: int,
+    *,
+    source_name: str,
+    archived_name: str,
+    expected: bytes,
+    uid: int,
+    gid: int,
+    runtime: Runtime,
+) -> None:
+    active = read_publisher_record_if_present(
+        staging,
+        source_name,
+        uid=uid,
+        gid=gid,
+    )
+    archived = read_publisher_record_if_present(
+        staging,
+        archived_name,
+        uid=uid,
+        gid=gid,
+    )
+    if archived is not None:
+        if archived != expected or active == expected:
+            reject(f"arquivo publisher diverge: {archived_name}")
+        return
+    if active != expected:
+        reject(f"publisher predecessor não recuperável: {source_name}")
+    runtime.noreplace(
+        staging,
+        source_name,
+        staging,
+        archived_name,
+    )
+    os.fsync(staging)
+    if (
+        read_publisher_record_if_present(
+            staging,
+            archived_name,
+            uid=uid,
+            gid=gid,
+        )
+        != expected
+    ):
+        reject(f"publisher predecessor não foi arquivado: {source_name}")
+
+
+def _archive_publisher_previous(
+    staging: int,
+    recovery: PostPublisherRecovery,
+    *,
+    uid: int,
+    gid: int,
+    runtime: Runtime,
+) -> None:
+    source_name = recovery.publisher_previous_name
+    archived_name = post_publisher_archive_name(
+        "previous",
+        recovery.predecessor.kit_id,
+    )
+    active = _open_named_directory(
+        staging,
+        source_name,
+        uid=uid,
+        gid=gid,
+        modes={0o555},
+    )
+    archived = _open_named_directory(
+        staging,
+        archived_name,
+        uid=uid,
+        gid=gid,
+        modes={0o555},
+    )
+    if archived is not None:
+        try:
+            if (
+                protected_bootstrap_tree_digest(
+                    archived,
+                    uid=uid,
+                    gid=gid,
+                )
+                != recovery.publisher_old_digest
+                or active is not None
+            ):
+                reject("rollback publisher arquivado diverge")
+        finally:
+            os.close(archived)
+            if active is not None:
+                os.close(active)
+        return
+    if active is None:
+        reject("rollback publisher predecessor está ausente")
+    try:
+        if (
+            protected_bootstrap_tree_digest(
+                active,
+                uid=uid,
+                gid=gid,
+            )
+            != recovery.publisher_old_digest
+        ):
+            reject("rollback publisher predecessor diverge")
+    finally:
+        os.close(active)
+    runtime.noreplace(
+        staging,
+        source_name,
+        staging,
+        archived_name,
+    )
+    os.fsync(staging)
+
+
+def reconcile_post_publisher_prelude(
+    state_descriptor: int,
+    recovery: PostPublisherRecovery,
+    *,
+    observed_source_digest: str,
+    uid: int,
+    gid: int,
+    runtime: Runtime,
+    fault: Callable[[str], None],
+) -> SupersededSourceTransaction:
+    publish_record(
+        state_descriptor,
+        POST_PUBLISHER_SUPERSEDE_NAME,
+        post_publisher_supersede_payload(recovery),
+        kit_id=recovery.successor_kit_id,
+        uid=uid,
+        gid=gid,
+        runtime=runtime,
+    )
+    fault("after_post_publisher_supersede")
+    validate_existing_post_publisher_recovery(
+        state_descriptor,
+        recovery,
+        observed_source_digest=observed_source_digest,
+        uid=uid,
+        gid=gid,
+    )
+    _archive_source_record(
+        state_descriptor,
+        recovery.predecessor,
+        "used",
+        uid=uid,
+        gid=gid,
+        runtime=runtime,
+    )
+    fault("after_post_publisher_source_used_archive")
+    control, staging = _open_post_publisher_staging(
+        uid=uid,
+        gid=gid,
+    )
+    try:
+        intent_value = {
+            "new_tree_sha256": recovery.publisher_new_digest,
+            "old_tree_sha256": recovery.publisher_old_digest,
+            "phase": "intent",
+            "previous_name": recovery.publisher_previous_name,
+            "schema_version": 1,
+        }
+        used_value = dict(intent_value)
+        used_value["phase"] = "used"
+        _archive_publisher_record(
+            staging,
+            source_name=PUBLISHER_USED_NAME,
+            archived_name=post_publisher_archive_name(
+                "used",
+                recovery.predecessor.kit_id,
+            ),
+            expected=canonical_bytes(used_value),
+            uid=uid,
+            gid=gid,
+            runtime=runtime,
+        )
+        fault("after_post_publisher_used_archive")
+        _archive_publisher_record(
+            staging,
+            source_name=PUBLISHER_INTENT_NAME,
+            archived_name=post_publisher_archive_name(
+                "intent",
+                recovery.predecessor.kit_id,
+            ),
+            expected=canonical_bytes(intent_value),
+            uid=uid,
+            gid=gid,
+            runtime=runtime,
+        )
+        fault("after_post_publisher_intent_archive")
+        _archive_publisher_previous(
+            staging,
+            recovery,
+            uid=uid,
+            gid=gid,
+            runtime=runtime,
+        )
+        fault("after_post_publisher_previous_archive")
+    finally:
+        os.close(staging)
+        os.close(control)
+    publish_record(
+        state_descriptor,
+        SUPERSEDE_NAME,
+        source_supersede_payload(
+            recovery.predecessor,
+            successor_kit_id=recovery.successor_kit_id,
+            successor_new_digest=recovery.successor_new_digest,
+        ),
+        kit_id=recovery.successor_kit_id,
+        uid=uid,
+        gid=gid,
+        runtime=runtime,
+    )
+    fault("after_post_publisher_standard_supersede")
+    return recovery.predecessor
+
+
 def validate_reserved_source_namespace(
     state_descriptor: int,
     *,
@@ -2535,6 +4236,7 @@ def validate_reserved_source_namespace(
     successor_new_digest: str,
     observed_source_digest: str,
     predecessor_expected: bool,
+    post_recovery: PostPublisherRecovery | None = None,
     uid: int,
     gid: int,
 ) -> None:
@@ -2546,6 +4248,11 @@ def validate_reserved_source_namespace(
         USED_NAME,
         SUPERSEDE_NAME,
     }
+    if post_recovery is not None:
+        allowed.add(POST_PUBLISHER_SUPERSEDE_NAME)
+        allowed.add(
+            post_recovery.predecessor.archived_name("used")
+        )
     supersede_raw = read_record_if_present(
         state_descriptor,
         SUPERSEDE_NAME,
@@ -2637,7 +4344,17 @@ def validate_reserved_source_namespace(
             publisher_intent_sha256=(
                 predecessor.publisher_intent_sha256
             ),
+            publisher_authorization_required=(
+                post_recovery is None
+            ),
         )
+        if post_recovery is not None and (
+            predecessor.kit_id
+            != post_recovery.predecessor.kit_id
+            or predecessor.publisher_intent_sha256
+            != post_recovery.publisher_intent_sha256
+        ):
+            reject("source supersede diverge do recovery post-publisher")
         for phase in SOURCE_PHASE_NAMES:
             archived = archived_records[phase]
             if (
@@ -2772,7 +4489,10 @@ def validate_reserved_source_namespace(
         if (
             temporary is None
             or temporary.group(2) != successor_kit_id
-            or temporary.group(1) == "supersede"
+            or temporary.group(1) in {
+                "supersede",
+                "post-publisher-supersede",
+            }
         ):
             continue
         phase = temporary.group(1)
@@ -3034,6 +4754,7 @@ def reconcile_superseded_source_transaction(
     inventory: ArchiveInventory,
     successor_kit_id: str,
     expectations: BootstrapExpectations,
+    post_recovery: PostPublisherRecovery | None = None,
     uid: int,
     gid: int,
     runtime: Runtime,
@@ -3142,11 +4863,26 @@ def reconcile_superseded_source_transaction(
             successor_kit_id=successor_kit_id,
             successor_new_digest=inventory.tree_sha256,
         )
+        expected_predecessor_kit_id = (
+            post_recovery.predecessor.kit_id
+            if post_recovery is not None
+            else expectations.predecessor_kit_id
+        )
+        expected_predecessor_controller_sha = (
+            post_recovery.predecessor.controller_sha
+            if post_recovery is not None
+            else expectations.predecessor_controller_sha
+        )
+        expected_publisher_intent_sha256 = (
+            post_recovery.publisher_intent_sha256
+            if post_recovery is not None
+            else expectations.predecessor_publisher_intent_sha256
+        )
         if (
-            expectations.predecessor_kit_id != predecessor.kit_id
-            or expectations.predecessor_controller_sha
+            expected_predecessor_kit_id != predecessor.kit_id
+            or expected_predecessor_controller_sha
             != predecessor.controller_sha
-            or expectations.predecessor_publisher_intent_sha256
+            or expected_publisher_intent_sha256
             != predecessor.publisher_intent_sha256
             or predecessor.api_sha not in binding.api_required_ancestors
             or predecessor.api_sha not in binding.ops_required_ancestors
@@ -3191,8 +4927,14 @@ def reconcile_superseded_source_transaction(
             publisher_intent_sha256=(
                 predecessor.publisher_intent_sha256
             ),
+            publisher_authorization_required=(
+                post_recovery is None
+            ),
         )
-        if observed_source_digest == predecessor.new_digest:
+        if (
+            post_recovery is None
+            and observed_source_digest == predecessor.new_digest
+        ):
             revalidated_publisher_intent_sha256 = (
                 validate_fixed_predecessor_publisher_state(
                     uid=uid,
@@ -3206,6 +4948,15 @@ def reconcile_superseded_source_transaction(
                 reject(
                     "publisher predecessor mudou durante source supersede"
                 )
+        elif post_recovery is not None and (
+            predecessor.kit_id
+            != post_recovery.predecessor.kit_id
+            or predecessor.new_digest
+            != post_recovery.predecessor.new_digest
+            or predecessor.old_digest
+            != post_recovery.predecessor.old_digest
+        ):
+            reject("predecessor padrão diverge do recovery post-publisher")
 
     assert predecessor is not None
     _validate_predecessor_rollback(
@@ -3582,6 +5333,557 @@ def verify_inherited_lock(
         os.close(check)
 
 
+def acquire_fixed_deploy_lock(
+    *,
+    uid: int,
+    gid: int,
+    lock_directory: Path = LOCK_DIRECTORY,
+) -> int:
+    directory = open_path_chain(
+        lock_directory,
+        uid=uid,
+        gid=gid,
+        final_modes={0o700},
+    )
+    try:
+        descriptor = os.open(
+            LOCK_NAME,
+            os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=directory,
+        )
+    finally:
+        os.close(directory)
+    try:
+        info = os.fstat(descriptor)
+        validate_regular(
+            info,
+            "deploy.lock post-publisher",
+            uid=uid,
+            gid=gid,
+            modes={0o600},
+            maximum=1024,
+            allow_empty=True,
+        )
+        try:
+            fcntl.flock(
+                descriptor,
+                fcntl.LOCK_EX | fcntl.LOCK_NB,
+            )
+        except BlockingIOError:
+            reject("deploy.lock post-publisher já está ocupado")
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def open_sealed_archive_member(
+    archive_descriptor: int,
+    archive_info: os.stat_result,
+    inventory: ArchiveInventory,
+    relative: str,
+    *,
+    expected_archive_sha256: str,
+) -> int:
+    require_hash(expected_archive_sha256, "hash do archive Ops")
+    entry = inventory.entries.get(relative)
+    if (
+        entry is None
+        or entry.kind != "file"
+        or entry.mode != 0o555
+        or not 0 < entry.size <= MAX_MEMBER_BYTES
+    ):
+        reject("verificador de quiescência não pertence ao inventário")
+    if not hasattr(os, "memfd_create") or not all(
+        hasattr(fcntl, name)
+        for name in (
+            "F_ADD_SEALS",
+            "F_GET_SEALS",
+            "F_SEAL_GROW",
+            "F_SEAL_SEAL",
+            "F_SEAL_SHRINK",
+            "F_SEAL_WRITE",
+        )
+    ):
+        reject("recovery post-publisher exige memfd selável no Linux")
+    handle, archive = _tar_from_fd(archive_descriptor)
+    try:
+        try:
+            member = archive.getmember(relative)
+        except KeyError:
+            reject("verificador de quiescência sumiu do archive")
+        source = archive.extractfile(member)
+        if source is None:
+            reject("payload do verificador de quiescência está ausente")
+        payload = source.read(entry.size + 1)
+        if (
+            len(payload) != entry.size
+            or source.read(1)
+            or hashlib.sha256(payload).hexdigest() != entry.sha256
+        ):
+            reject("bytes do verificador divergem do inventário assinado")
+    finally:
+        archive.close()
+        handle.close()
+    if (
+        digest_fd(
+            archive_descriptor,
+            archive_info,
+            "archive Ops após extrair quiescência",
+        )
+        != expected_archive_sha256
+    ):
+        reject("archive Ops mudou ao extrair quiescência")
+    return open_sealed_memfd(
+        payload,
+        label="verificador de quiescência",
+        mode=0o555,
+        expected_sha256=entry.sha256,
+    )
+
+
+def open_sealed_memfd(
+    payload: bytes,
+    *,
+    label: str,
+    mode: int,
+    expected_sha256: str,
+) -> int:
+    require_hash(expected_sha256, f"hash de {label}")
+    if (
+        not payload
+        or len(payload) > MAX_MEMBER_BYTES
+        or hashlib.sha256(payload).hexdigest() != expected_sha256
+        or mode not in {0o400, 0o555}
+    ):
+        reject(f"payload do memfd de {label} é inválido")
+    if not hasattr(os, "memfd_create") or not all(
+        hasattr(fcntl, name)
+        for name in (
+            "F_ADD_SEALS",
+            "F_GET_SEALS",
+            "F_SEAL_GROW",
+            "F_SEAL_SEAL",
+            "F_SEAL_SHRINK",
+            "F_SEAL_WRITE",
+        )
+    ):
+        reject("recovery post-publisher exige memfd selável no Linux")
+    flags = int(getattr(os, "MFD_CLOEXEC", 0x0001)) | int(
+        getattr(os, "MFD_ALLOW_SEALING", 0x0002)
+    )
+    writer = os.memfd_create(
+        "tratto-control-" + label.replace(" ", "-")[:64],
+        flags,
+    )
+    reader = -1
+    try:
+        write_all(writer, payload)
+        os.fchmod(writer, mode)
+        os.fsync(writer)
+        seals = (
+            fcntl.F_SEAL_GROW
+            | fcntl.F_SEAL_SEAL
+            | fcntl.F_SEAL_SHRINK
+            | fcntl.F_SEAL_WRITE
+        )
+        fcntl.fcntl(writer, fcntl.F_ADD_SEALS, seals)
+        if fcntl.fcntl(writer, fcntl.F_GET_SEALS) != seals:
+            reject(f"memfd de {label} não ficou integralmente selado")
+        reader = os.open(
+            f"/proc/self/fd/{writer}",
+            os.O_RDONLY | os.O_CLOEXEC,
+        )
+        writer_info = os.fstat(writer)
+        info = os.fstat(reader)
+        reader_flags = fcntl.fcntl(reader, fcntl.F_GETFL)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 0
+            or info.st_uid != EXPECTED_UID
+            or info.st_gid != EXPECTED_GID
+            or stat.S_IMODE(info.st_mode) != mode
+            or info.st_size != len(payload)
+            or (reader_flags & os.O_ACCMODE) != os.O_RDONLY
+            or (info.st_dev, info.st_ino)
+            != (writer_info.st_dev, writer_info.st_ino)
+            or fcntl.fcntl(reader, fcntl.F_GET_SEALS) != seals
+            or digest_fd(
+                reader,
+                info,
+                f"memfd de {label}",
+            )
+            != expected_sha256
+        ):
+            reject(f"memfd de {label} diverge do payload")
+        os.close(writer)
+        writer = -1
+        return reader
+    except Exception:
+        if reader >= 0:
+            os.close(reader)
+        if writer >= 0:
+            os.close(writer)
+        raise
+
+
+def packaged_unit_names(inventory: ArchiveInventory) -> tuple[str, ...]:
+    units: list[str] = []
+    for path, entry in inventory.entries.items():
+        pure = PurePosixPath(path)
+        if len(pure.parts) != 2 or pure.parts[0] != "systemd":
+            continue
+        name = pure.parts[1]
+        if not name.startswith("tratto-control"):
+            continue
+        if (
+            entry.kind != "file"
+            or entry.mode != 0o444
+            or entry.size <= 0
+            or entry.size > MAX_PACKAGED_UNIT_BYTES
+            or SYSTEMD_UNIT_RE.fullmatch(name) is None
+        ):
+            reject("unit Control assinada possui tipo, modo ou nome inválido")
+        units.append(name)
+    ordered = sorted(units, key=lambda name: name.encode("ascii"))
+    if (
+        not ordered
+        or len(set(ordered)) != len(ordered)
+        or "tratto-control.slice" not in ordered
+        or "tratto-control-recovery.service" not in ordered
+    ):
+        reject("catálogo assinado de units Control está incompleto")
+    if (
+        sum(len(name.encode("ascii")) + 66 for name in ordered)
+        > MAX_PACKAGED_UNITS_BYTES
+    ):
+        reject("catálogo assinado de units Control excede o limite")
+    return tuple(ordered)
+
+
+def packaged_units_catalog(
+    inventory: ArchiveInventory,
+    current_authenticated_bootstrap_digest: str,
+    *,
+    uid: int,
+    gid: int,
+    control_root: Path | None = None,
+) -> bytes:
+    require_hash(
+        current_authenticated_bootstrap_digest,
+        "digest autenticado do bootstrap publicado",
+    )
+    expected_names = packaged_unit_names(inventory)
+    root = open_path_chain(
+        CONTROL_ROOT if control_root is None else control_root,
+        uid=uid,
+        gid=gid,
+        final_modes={0o711},
+    )
+    bootstrap = -1
+    systemd = -1
+    try:
+        bootstrap = _open_named_directory(
+            root,
+            "bootstrap",
+            uid=uid,
+            gid=gid,
+            modes={0o555},
+        )
+        if bootstrap is None:
+            reject("bootstrap publicado está ausente")
+        before = protected_bootstrap_tree_digest(
+            bootstrap,
+            uid=uid,
+            gid=gid,
+        )
+        if before != current_authenticated_bootstrap_digest:
+            reject("bootstrap publicado diverge do journal autenticado")
+        systemd = _open_named_directory(
+            bootstrap,
+            "systemd",
+            uid=uid,
+            gid=gid,
+            modes={0o555},
+        )
+        if systemd is None:
+            reject("diretório systemd do bootstrap está ausente")
+        observed: list[str] = []
+        for name in os.listdir(systemd):
+            if not name.startswith("tratto-control"):
+                continue
+            try:
+                name.encode("ascii")
+            except UnicodeEncodeError:
+                reject("nome de unit Control publicado não é ASCII")
+            if SYSTEMD_UNIT_RE.fullmatch(name) is None:
+                reject("nome de unit Control publicado é inválido")
+            observed.append(name)
+        observed_names = tuple(
+            sorted(observed, key=lambda name: name.encode("ascii"))
+        )
+        if observed_names != expected_names:
+            reject(
+                "units Control publicadas divergem do sucessor assinado"
+            )
+        records: list[bytes] = []
+        for name in expected_names:
+            if SYSTEMD_UNIT_RE.fullmatch(name) is None:
+                reject("nome de unit Control publicado é inválido")
+            descriptor = os.open(
+                name,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=systemd,
+            )
+            try:
+                info = os.fstat(descriptor)
+                validate_regular(
+                    info,
+                    f"unit Control publicada {name}",
+                    uid=uid,
+                    gid=gid,
+                    modes={0o444},
+                    maximum=MAX_PACKAGED_UNIT_BYTES,
+                )
+                digest = digest_fd(
+                    descriptor,
+                    info,
+                    f"unit Control publicada {name}",
+                )
+            finally:
+                os.close(descriptor)
+            records.append(
+                name.encode("ascii")
+                + b" "
+                + digest.encode("ascii")
+                + b"\n"
+            )
+        after = protected_bootstrap_tree_digest(
+            bootstrap,
+            uid=uid,
+            gid=gid,
+        )
+        if after != before:
+            reject("bootstrap publicado mudou durante o catálogo")
+    finally:
+        if systemd >= 0:
+            os.close(systemd)
+        if bootstrap >= 0:
+            os.close(bootstrap)
+        os.close(root)
+    payload = b"".join(records)
+    if len(payload) > MAX_PACKAGED_UNITS_BYTES:
+        reject("catálogo assinado de units Control excede o limite")
+    return payload
+
+
+def sanitized_diagnostic(raw: bytes) -> str:
+    diagnostic = raw[:2048].decode("utf-8", errors="replace")
+    return " ".join(
+        item
+        for item in diagnostic.replace("\x00", "").split()
+        if item.isprintable()
+    )[:512]
+
+
+def validate_quiescence_result(
+    result: subprocess.CompletedProcess[bytes],
+    *,
+    phase: str,
+) -> None:
+    if result.returncode != 0:
+        diagnostic = sanitized_diagnostic(result.stderr)
+        suffix = f": {diagnostic}" if diagnostic else ""
+        reject(
+            f"quiescência post-publisher {phase} não foi provada"
+            + suffix
+        )
+    if result.stdout != QUIESCENCE_SUCCESS:
+        reject(
+            f"verificador de quiescência {phase} retornou contrato inesperado"
+        )
+
+
+def run_quiescence_protocol(
+    verifier: int,
+    catalog: int,
+    lock_descriptor: int,
+) -> None:
+    inherited = tuple(sorted({verifier, catalog, lock_descriptor}))
+    environment = {
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+        "SYSTEMD_COLORS": "0",
+        "SYSTEMD_PAGER": "",
+        LOCK_FD_ENV: str(lock_descriptor),
+        LOCK_HELD_ENV: "1",
+    }
+    for option, phase in (
+        (
+            "--sealed-packaged-unit-catalog-pre-reload-fd",
+            "pré-reload",
+        ),
+        ("--sealed-packaged-unit-catalog-fd", "final"),
+    ):
+        if phase == "final":
+            reload_result = subprocess.run(
+                [
+                    str(SYSTEMCTL),
+                    "--no-ask-password",
+                    "daemon-reload",
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=environment,
+                pass_fds=(lock_descriptor,),
+                check=False,
+                timeout=300,
+            )
+            if reload_result.returncode != 0:
+                diagnostic = sanitized_diagnostic(reload_result.stderr)
+                suffix = f": {diagnostic}" if diagnostic else ""
+                reject("systemd daemon-reload falhou" + suffix)
+        result = subprocess.run(
+            [
+                str(PYTHON),
+                "-I",
+                "-B",
+                f"/proc/self/fd/{verifier}",
+                option,
+                str(catalog),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=environment,
+            pass_fds=inherited,
+            check=False,
+            timeout=300,
+        )
+        validate_quiescence_result(result, phase=phase)
+
+
+def run_fork_guardian(
+    lock_descriptor: int,
+    action: Callable[[], None],
+) -> None:
+    if not hasattr(os, "fork"):
+        reject("guardião de quiescência exige fork")
+    try:
+        os.fstat(lock_descriptor)
+    except OSError:
+        reject("guardião recebeu deploy.lock fechado")
+    if hasattr(os, "pipe2"):
+        reader, writer = os.pipe2(os.O_CLOEXEC)
+    else:
+        reader, writer = os.pipe()
+    try:
+        child = os.fork()
+    except BaseException:
+        os.close(writer)
+        os.close(reader)
+        raise
+    if child == 0:
+        os.close(reader)
+        outcome = b"ok\n"
+        status = 0
+        try:
+            action()
+        except BaseException as error:
+            detail = sanitized_diagnostic(
+                f"{type(error).__name__}: {error}".encode(
+                    "utf-8",
+                    errors="replace",
+                )
+            )
+            outcome = ("error:" + detail + "\n").encode("utf-8")
+            status = 78
+        try:
+            if len(outcome) > MAX_GUARDIAN_REPORT_BYTES:
+                outcome = b"error:relatorio do guardiao excedeu limite\n"
+                status = 78
+            write_all(writer, outcome)
+        except BaseException:
+            pass
+        finally:
+            os.close(writer)
+        os._exit(status)
+    os.close(writer)
+    report = bytearray()
+    oversized = False
+    try:
+        while True:
+            chunk = os.read(reader, 1024)
+            if not chunk:
+                break
+            if len(report) <= MAX_GUARDIAN_REPORT_BYTES:
+                report.extend(chunk)
+                if len(report) > MAX_GUARDIAN_REPORT_BYTES:
+                    oversized = True
+    finally:
+        os.close(reader)
+    while True:
+        try:
+            waited, status = os.waitpid(child, 0)
+            break
+        except InterruptedError:
+            continue
+    if oversized:
+        reject("relatório do guardião excedeu o limite")
+    if (
+        waited != child
+        or not os.WIFEXITED(status)
+        or os.WEXITSTATUS(status) != 0
+        or bytes(report) != b"ok\n"
+    ):
+        detail = sanitized_diagnostic(bytes(report))
+        suffix = f": {detail}" if detail else ""
+        reject("guardião de quiescência recusou a operação" + suffix)
+
+
+def run_quiescence_verifier(
+    archive_descriptor: int,
+    archive_info: os.stat_result,
+    inventory: ArchiveInventory,
+    expected_archive_sha256: str,
+    lock_descriptor: int,
+    current_authenticated_bootstrap_digest: str,
+) -> None:
+    verifier = open_sealed_archive_member(
+        archive_descriptor,
+        archive_info,
+        inventory,
+        "scripts/verify-control-stack-quiescent.py",
+        expected_archive_sha256=expected_archive_sha256,
+    )
+    catalog_payload = packaged_units_catalog(
+        inventory,
+        current_authenticated_bootstrap_digest,
+        uid=EXPECTED_UID,
+        gid=EXPECTED_GID,
+    )
+    catalog = open_sealed_memfd(
+        catalog_payload,
+        label="catálogo de units",
+        mode=0o400,
+        expected_sha256=hashlib.sha256(catalog_payload).hexdigest(),
+    )
+    try:
+        run_fork_guardian(
+            lock_descriptor,
+            lambda: run_quiescence_protocol(
+                verifier,
+                catalog,
+                lock_descriptor,
+            ),
+        )
+    finally:
+        os.close(catalog)
+        os.close(verifier)
+
+
 def publisher_supersede_authorization(
     predecessor: SupersededSourceTransaction,
     *,
@@ -3745,6 +6047,20 @@ def install_source(
     ),
     publisher: Callable[[int, int, bytes | None], str],
     lock_descriptor: int,
+    quiescence: (
+        Callable[
+            [
+                int,
+                os.stat_result,
+                ArchiveInventory,
+                str,
+                int,
+                str,
+            ],
+            None,
+        ]
+        | None
+    ) = None,
     fault: Callable[[str], None] = lambda _event: None,
 ) -> str:
     inputs = open_and_validate_inputs(
@@ -3783,6 +6099,83 @@ def install_source(
                 observed_digest = tree_digest(old_entries)
             finally:
                 os.close(source)
+            post_recovery: PostPublisherRecovery | None = None
+            post_publisher_mode = (
+                expectations.post_publisher_predecessor_kit_id
+                is not None
+            )
+            if post_publisher_mode:
+                (
+                    post_recovery,
+                    current_bootstrap_digest,
+                ) = prepare_post_publisher_recovery(
+                    state,
+                    observed_source_digest=observed_digest,
+                    binding=inputs.binding,
+                    successor_kit_id=kit_id,
+                    successor_new_digest=inventory.tree_sha256,
+                    expectations=expectations,
+                    uid=uid,
+                    gid=gid,
+                )
+                if quiescence is None:
+                    reject(
+                        "recovery post-publisher exige prova de quiescência"
+                    )
+                quiescence(
+                    inputs.archive_descriptor,
+                    inputs.archive_info,
+                    inventory,
+                    inputs.binding.ops_sha256,
+                    lock_descriptor,
+                    current_bootstrap_digest,
+                )
+                source_after = _open_named_directory(
+                    state,
+                    SOURCE_NAME,
+                    uid=uid,
+                    gid=gid,
+                    modes={0o555},
+                )
+                if source_after is None:
+                    reject("source sumiu após a prova de quiescência")
+                try:
+                    digest_after = tree_digest(
+                        scan_tree(source_after, uid=uid, gid=gid)
+                    )
+                finally:
+                    os.close(source_after)
+                if digest_after != observed_digest:
+                    reject("source mudou durante a prova de quiescência")
+                (
+                    post_recovery,
+                    _current_bootstrap_digest_after,
+                ) = prepare_post_publisher_recovery(
+                    state,
+                    observed_source_digest=observed_digest,
+                    binding=inputs.binding,
+                    successor_kit_id=kit_id,
+                    successor_new_digest=inventory.tree_sha256,
+                    expectations=expectations,
+                    uid=uid,
+                    gid=gid,
+                )
+                if (
+                    _current_bootstrap_digest_after
+                    != current_bootstrap_digest
+                ):
+                    reject(
+                        "bootstrap mudou durante a prova de quiescência"
+                    )
+                reconcile_post_publisher_prelude(
+                    state,
+                    post_recovery,
+                    observed_source_digest=observed_digest,
+                    uid=uid,
+                    gid=gid,
+                    runtime=runtime,
+                    fault=fault,
+                )
             validate_reserved_source_namespace(
                 state,
                 binding=inputs.binding,
@@ -3792,7 +6185,9 @@ def install_source(
                 observed_source_digest=observed_digest,
                 predecessor_expected=(
                     expectations.predecessor_kit_id is not None
+                    or post_publisher_mode
                 ),
+                post_recovery=post_recovery,
                 uid=uid,
                 gid=gid,
             )
@@ -3803,6 +6198,7 @@ def install_source(
                 inventory=inventory,
                 successor_kit_id=kit_id,
                 expectations=expectations,
+                post_recovery=post_recovery,
                 uid=uid,
                 gid=gid,
                 runtime=runtime,
@@ -4170,7 +6566,10 @@ def install_source(
                         successor_kit_id=kit_id,
                         successor_source_digest=inventory.tree_sha256,
                     )
-                    if predecessor is not None
+                    if (
+                        predecessor is not None
+                        and predecessor.publisher_authorization_required
+                    )
                     else None
                 )
                 publisher_result = publisher(
@@ -4222,6 +6621,14 @@ def parse_cli(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--expected-predecessor-kit-id")
     parser.add_argument("--expected-predecessor-controller-sha")
     parser.add_argument("--expected-predecessor-publisher-intent-sha256")
+    parser.add_argument("--expected-post-publisher-predecessor-kit-id")
+    parser.add_argument(
+        "--expected-post-publisher-predecessor-controller-sha"
+    )
+    parser.add_argument("--expected-post-publisher-source-intent-sha256")
+    parser.add_argument("--expected-post-publisher-source-used-sha256")
+    parser.add_argument("--expected-post-publisher-publisher-intent-sha256")
+    parser.add_argument("--expected-post-publisher-publisher-used-sha256")
     required_options = (
         "--helper-fd",
         "--expected-helper-sha256",
@@ -4234,12 +6641,28 @@ def parse_cli(argv: list[str]) -> argparse.Namespace:
         "--expected-predecessor-controller-sha",
         "--expected-predecessor-publisher-intent-sha256",
     )
+    post_publisher_options = (
+        "--expected-post-publisher-predecessor-kit-id",
+        "--expected-post-publisher-predecessor-controller-sha",
+        "--expected-post-publisher-source-intent-sha256",
+        "--expected-post-publisher-source-used-sha256",
+        "--expected-post-publisher-publisher-intent-sha256",
+        "--expected-post-publisher-publisher-used-sha256",
+    )
     predecessor_present = [
         option for option in predecessor_options if option in argv
+    ]
+    post_publisher_present = [
+        option for option in post_publisher_options if option in argv
     ]
     expected_length = 2 * (
         len(required_options)
         + (len(predecessor_options) if predecessor_present else 0)
+        + (
+            len(post_publisher_options)
+            if post_publisher_present
+            else 0
+        )
     )
     if (
         len(argv) != expected_length
@@ -4250,6 +6673,14 @@ def parse_cli(argv: list[str]) -> argparse.Namespace:
             predecessor_present
             and any(argv.count(option) != 1 for option in predecessor_options)
         )
+        or (
+            post_publisher_present
+            and any(
+                argv.count(option) != 1
+                for option in post_publisher_options
+            )
+        )
+        or (predecessor_present and post_publisher_present)
     ):
         reject("CLI do helper exige cada binding exatamente uma vez")
     args = parser.parse_args(argv)
@@ -4306,14 +6737,48 @@ def main() -> int:
         predecessor_publisher_intent_sha256=(
             args.expected_predecessor_publisher_intent_sha256
         ),
+        post_publisher_predecessor_kit_id=(
+            args.expected_post_publisher_predecessor_kit_id
+        ),
+        post_publisher_predecessor_controller_sha=(
+            args.expected_post_publisher_predecessor_controller_sha
+        ),
+        post_publisher_source_intent_sha256=(
+            args.expected_post_publisher_source_intent_sha256
+        ),
+        post_publisher_source_used_sha256=(
+            args.expected_post_publisher_source_used_sha256
+        ),
+        post_publisher_publisher_intent_sha256=(
+            args.expected_post_publisher_publisher_intent_sha256
+        ),
+        post_publisher_publisher_used_sha256=(
+            args.expected_post_publisher_publisher_used_sha256
+        ),
     )
     validate_expectations(expectations)
     previous_umask = os.umask(0o077)
+    acquired_lock = False
+    lock_descriptor = -1
     try:
-        lock_descriptor = verify_inherited_lock(
-            uid=EXPECTED_UID,
-            gid=EXPECTED_GID,
-        )
+        if expectations.post_publisher_predecessor_kit_id is not None:
+            if (
+                LOCK_FD_ENV in os.environ
+                or LOCK_HELD_ENV in os.environ
+            ):
+                reject(
+                    "ponte post-publisher recusa lock herdado ambíguo"
+                )
+            lock_descriptor = acquire_fixed_deploy_lock(
+                uid=EXPECTED_UID,
+                gid=EXPECTED_GID,
+            )
+            acquired_lock = True
+        else:
+            lock_descriptor = verify_inherited_lock(
+                uid=EXPECTED_UID,
+                gid=EXPECTED_GID,
+            )
         result = install_source(
             incoming=INCOMING,
             state_root=STATE_ROOT,
@@ -4325,10 +6790,13 @@ def main() -> int:
             signature_verifier=None,
             publisher=run_publisher,
             lock_descriptor=lock_descriptor,
+            quiescence=run_quiescence_verifier,
         )
         print(result)
         return 0
     finally:
+        if acquired_lock and lock_descriptor >= 0:
+            os.close(lock_descriptor)
         os.umask(previous_umask)
 
 
