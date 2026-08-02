@@ -2,14 +2,24 @@ from __future__ import annotations
 
 import hashlib
 import datetime as dt
+import importlib.util
 import json
 import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "build-bootstrap-envelope.py"
+SPEC = importlib.util.spec_from_file_location(
+    "bootstrap_envelope_builder_under_test",
+    SCRIPT,
+)
+assert SPEC is not None and SPEC.loader is not None
+MODULE = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(MODULE)
 
 
 def canonical(value: dict) -> bytes:
@@ -100,6 +110,8 @@ def run_builder(
     *,
     ids: dict[str, int] | None = None,
     expired: bool = False,
+    helper_receipt: dict | None = None,
+    helper_receipt_raw: bytes | None = None,
 ) -> subprocess.CompletedProcess[str]:
     artifact_ids = ids or {"api": 11, "ops": 12, "web": 13}
     approval_path = tmp_path / "approval.json"
@@ -115,6 +127,21 @@ def run_builder(
         summary_paths[label] = path
     behavior_path = tmp_path / "behavior.json"
     put(behavior_path, behavior(artifact_ids))
+    receipt_path = tmp_path / "bootstrap-source-helper.json"
+    put(
+        receipt_path,
+        helper_receipt
+        if helper_receipt is not None
+        else {
+            "controller_sha": "3" * 40,
+            "name": "install-bootstrap-source-kit.py",
+            "sha256": "c" * 64,
+            "size_bytes": 456,
+        },
+    )
+    if helper_receipt_raw is not None:
+        receipt_path.write_bytes(helper_receipt_raw)
+        receipt_path.chmod(0o644)
     return subprocess.run(
         [
             sys.executable,
@@ -129,6 +156,8 @@ def run_builder(
             str(summary_paths["web"]),
             "--behavior",
             str(behavior_path),
+            "--bootstrap-source-helper",
+            str(receipt_path),
             "--api-artifact-id",
             str(artifact_ids["api"]),
             "--ops-artifact-id",
@@ -164,7 +193,13 @@ def test_builds_canonical_single_operator_envelope(
     raw = attestation_path.read_bytes()
     value = json.loads(raw)
     assert raw == canonical(value)
-    assert value["schema_version"] == 5
+    assert value["schema_version"] == 6
+    assert value["bootstrap_source_helper"] == {
+        "controller_sha": "3" * 40,
+        "name": "install-bootstrap-source-kit.py",
+        "sha256": "c" * 64,
+        "size_bytes": 456,
+    }
     assert value["approval"]["mode"] == "single-operator-bootstrap"
     assert value["controller"]["repository"].endswith(
         "tratto-control-release-carrier"
@@ -195,3 +230,100 @@ def test_rejects_expired_bootstrap_approval(tmp_path: Path) -> None:
     assert result.returncode == 78
     assert "expired" in result.stderr
     assert not (tmp_path / "attestation.json").exists()
+
+
+def test_rejects_helper_receipt_not_bound_to_controller(
+    tmp_path: Path,
+) -> None:
+    result = run_builder(
+        tmp_path,
+        helper_receipt={
+            "controller_sha": "d" * 40,
+            "name": "install-bootstrap-source-kit.py",
+            "sha256": "c" * 64,
+            "size_bytes": 456,
+        },
+    )
+
+    assert result.returncode == 78
+    assert "helper receipt is invalid" in result.stderr
+    assert not (tmp_path / "attestation.json").exists()
+
+
+def test_rejects_non_exact_helper_receipt(tmp_path: Path) -> None:
+    result = run_builder(
+        tmp_path,
+        helper_receipt={
+            "controller_sha": "3" * 40,
+            "name": "install-bootstrap-source-kit.py",
+            "sha256": "c" * 64,
+            "size_bytes": 456,
+            "schema_version": 1,
+        },
+    )
+
+    assert result.returncode == 78
+    assert "helper receipt is invalid" in result.stderr
+    assert not (tmp_path / "attestation.json").exists()
+
+
+def test_rejects_non_string_helper_digest(tmp_path: Path) -> None:
+    result = run_builder(
+        tmp_path,
+        helper_receipt={
+            "controller_sha": "3" * 40,
+            "name": "install-bootstrap-source-kit.py",
+            "sha256": int("1" * 64),
+            "size_bytes": 456,
+        },
+    )
+
+    assert result.returncode == 78
+    assert "helper receipt is invalid" in result.stderr
+    assert not (tmp_path / "attestation.json").exists()
+
+
+def test_rejects_noncanonical_helper_receipt(tmp_path: Path) -> None:
+    result = run_builder(
+        tmp_path,
+        helper_receipt_raw=json.dumps(
+            {
+                "controller_sha": "3" * 40,
+                "name": "install-bootstrap-source-kit.py",
+                "sha256": "c" * 64,
+                "size_bytes": 456,
+            },
+            indent=2,
+        ).encode(),
+    )
+
+    assert result.returncode == 78
+    assert "canonical" in result.stderr
+    assert not (tmp_path / "attestation.json").exists()
+
+
+def test_read_json_uses_one_stable_nofollow_fd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "input.json"
+    put(source, {"value": 1})
+
+    def forbid_path_reopen(_path: Path) -> bytes:
+        raise AssertionError("Path.read_bytes must not be used")
+
+    monkeypatch.setattr(Path, "read_bytes", forbid_path_reopen)
+    raw, value = MODULE.read_json(source, "test input")
+
+    assert raw == canonical({"value": 1})
+    assert value == {"value": 1}
+
+
+def test_read_json_rejects_symlink(tmp_path: Path) -> None:
+    source = tmp_path / "input.json"
+    put(source, {"value": 1})
+    link = tmp_path / "link.json"
+    link.symlink_to(source)
+
+    with pytest.raises(MODULE.BootstrapEnvelopeError):
+        MODULE.read_json(link, "test input")

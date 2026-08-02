@@ -29,12 +29,15 @@ Control Plane generation may instead use the narrowly scoped
 `single-operator-bootstrap` path exactly once:
 
 - the private carrier workflow must be
-  `.github/workflows/control-bootstrap-v1.yml` on its exact `main` commit;
+  `.github/workflows/control-bootstrap-v1.yml` on its exact `main` commit,
+  with its complete LF/UTF-8 bytes matching the controller's compile-time
+  SHA-256;
 - a canonical approval pins the final API/Ops, Web, and reviewed public
   controller commits, runtime policy, migrations, and fleet preflight;
 - isolated jobs build and test API, Ops, and Web, while a checkout-free job
-  signs the canonical schema-v5 envelope, the exact Ops archive, and the
-  reviewed bootstrap-source helper separately with GitHub OIDC and Cosign;
+  signs the canonical bootstrap schema-v6 envelope, the exact Ops archive,
+  and the reviewed bootstrap-source helper separately with GitHub OIDC and
+  Cosign;
 - the host independently verifies the signature identity, envelope, approval,
   behavioral report, helper origin, artifact IDs and bytes before staging;
 - the helper runs only from the root-owned incoming directory under the
@@ -58,20 +61,101 @@ The signed carrier output adds
 `install-bootstrap-source-kit.py`,
 `bootstrap-source-kit.sigstore.json`, and the canonical helper-origin
 receipt to the existing attestation, Ops archive, and their separate bundles.
-Only the helper and the five signature inputs it consumes are transferred as
-`root:root 0400` into `/var/lib/tratto-control/incoming`. Invoke it through
-the pre-existing immutable lock wrapper:
+The receipt is canonical JSON with exactly `controller_sha`, `name`, `sha256`,
+and `size_bytes`; the identical object is embedded as the signed
+`bootstrap_source_helper` envelope block. Transfer those seven files as
+`root:root 0400` into the root-only
+`/var/lib/tratto-control/incoming`.
 
-```text
+Directly invoking the helper pathname is forbidden. Before this ceremony,
+populate the four `EXPECTED_*` values from authenticated evidence outside the
+incoming directory; in particular, do not derive them from the files about to
+be consumed. The ceremony opens the fixed helper once, binds that descriptor
+back to the root-owned pathname, verifies the expected digest and the Cosign
+identity against that same descriptor, and only then gives a duplicate of the
+descriptor to the pre-existing immutable lock wrapper as standard input:
+
+```bash
+/usr/bin/env -i \
+  HOME=/nonexistent \
+  LANG=C \
+  LC_ALL=C \
+  NO_COLOR=1 \
+  PATH=/usr/bin:/bin \
+  XDG_CACHE_HOME=/var/cache/tratto-control/cosign \
+  EXPECTED_HELPER_SHA256="$EXPECTED_HELPER_SHA256" \
+  EXPECTED_ATTESTATION_SHA256="$EXPECTED_ATTESTATION_SHA256" \
+  EXPECTED_CARRIER_SHA="$EXPECTED_CARRIER_SHA" \
+  EXPECTED_CONTROLLER_SHA="$EXPECTED_CONTROLLER_SHA" \
+  /usr/bin/bash --noprofile --norc <<'TRATTO_BOOTSTRAP'
+set -Eeuo pipefail
+: "${EXPECTED_HELPER_SHA256:?authenticated helper SHA-256 required}"
+: "${EXPECTED_ATTESTATION_SHA256:?authenticated attestation SHA-256 required}"
+: "${EXPECTED_CARRIER_SHA:?authenticated carrier commit required}"
+: "${EXPECTED_CONTROLLER_SHA:?reviewed controller commit required}"
+[[ "$EXPECTED_HELPER_SHA256" =~ ^[0-9a-f]{64}$ ]]
+[[ "$EXPECTED_ATTESTATION_SHA256" =~ ^[0-9a-f]{64}$ ]]
+[[ "$EXPECTED_CARRIER_SHA" =~ ^[0-9a-f]{40}$ ]]
+[[ "$EXPECTED_CONTROLLER_SHA" =~ ^[0-9a-f]{40}$ ]]
+
+incoming=/var/lib/tratto-control/incoming
+helper="$incoming/install-bootstrap-source-kit.py"
+helper_bundle="$incoming/bootstrap-source-kit.sigstore.json"
+/usr/bin/test ! -L "$helper"
+exec {helper_fd}<"$helper"
+/usr/bin/test ! -L "$helper"
+helper_fd_path="/proc/self/fd/$helper_fd"
+/usr/bin/test "$(
+  /usr/bin/stat -Lc '%F:%a:%u:%g:%h' "$helper_fd_path"
+)" = \
+  "regular file:400:0:0:1"
+helper_size="$(/usr/bin/stat -Lc '%s' "$helper_fd_path")"
+/usr/bin/test "$helper_size" -gt 0
+/usr/bin/test "$helper_size" -le 2097152
+/usr/bin/test "$(
+  /usr/bin/stat -Lc \
+    '%d:%i:%f:%h:%u:%g:%s' "$helper_fd_path"
+)" = "$(
+  /usr/bin/stat -Lc '%d:%i:%f:%h:%u:%g:%s' "$helper"
+)"
+/usr/bin/test "$(
+  /usr/bin/sha256sum "$helper_fd_path" \
+    | /usr/bin/awk '{print $1}'
+)" = \
+  "$EXPECTED_HELPER_SHA256"
+
+/usr/local/bin/cosign verify-blob \
+  --bundle "$helper_bundle" \
+  --certificate-identity \
+    "https://github.com/PluckXD/tratto-control-release-carrier/.github/workflows/control-bootstrap-v1.yml@refs/heads/main" \
+  --certificate-oidc-issuer \
+    https://token.actions.githubusercontent.com \
+  --certificate-github-workflow-sha "$EXPECTED_CARRIER_SHA" \
+  --certificate-github-workflow-ref refs/heads/main \
+  --certificate-github-workflow-repository \
+    PluckXD/tratto-control-release-carrier \
+  --certificate-github-workflow-trigger workflow_dispatch \
+  "$helper_fd_path"
+
 /usr/bin/python3.12 -I -B \
   /opt/tratto-control/bootstrap/scripts/with-deploy-lock.py -- \
-  /usr/bin/python3.12 -I -B \
-  /var/lib/tratto-control/incoming/install-bootstrap-source-kit.py
+  /usr/bin/python3.12 -I -B /proc/self/fd/0 \
+    --helper-fd 0 \
+    --expected-helper-sha256 "$EXPECTED_HELPER_SHA256" \
+    --expected-attestation-sha256 "$EXPECTED_ATTESTATION_SHA256" \
+    --expected-carrier-sha "$EXPECTED_CARRIER_SHA" \
+    --expected-controller-sha "$EXPECTED_CONTROLLER_SHA" \
+  <&"$helper_fd"
+exec {helper_fd}<&-
+TRATTO_BOOTSTRAP
 ```
 
-The helper-origin receipt is retained as release evidence; it is not a host
-trust input. The host instead requires all three blob signatures to carry the
-same exact carrier workflow SHA, ref, repository, and dispatch trigger.
+The helper reopens the fixed pathname with no-follow semantics, requires it to
+be the same inode and metadata as descriptor 0, rechecks all four external
+bindings, validates the signed helper block and every archive byte, and
+verifies all three separate blob signatures before it writes state or executes
+installed Operations. The helper-origin receipt is retained as release
+evidence; it is not an independent host trust root.
 
 ## Stable controller v2 / envelope v6
 

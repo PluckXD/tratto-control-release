@@ -3,8 +3,9 @@
 
 This is intentionally narrower than the permanent release controller.  It
 only combines already-built component summaries, a canonical approval, and an
-independent behavioral report.  Signing is performed later by a checkout-free
-OIDC job in the private bootstrap carrier.
+independent behavioral report.  Schema 6 also embeds the exact canonical
+bootstrap-helper receipt.  Signing is performed later by a checkout-free OIDC
+job in the private bootstrap carrier.
 """
 
 from __future__ import annotations
@@ -36,6 +37,13 @@ APPROVAL_SPEC.loader.exec_module(APPROVAL)
 
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+HELPER_NAME = "install-bootstrap-source-kit.py"
+HELPER_RECEIPT_KEYS = {
+    "controller_sha",
+    "name",
+    "sha256",
+    "size_bytes",
+}
 REPOSITORIES = {
     "api": "PluckXD/tratto-api",
     "ops": "PluckXD/tratto-api",
@@ -104,8 +112,52 @@ def canonical_bytes(value: dict[str, Any]) -> bytes:
 
 def read_json(path: Path, label: str) -> tuple[bytes, dict[str, Any]]:
     try:
-        info = path.lstat()
-        raw = path.read_bytes()
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+    except OSError:
+        reject(f"{label} is invalid")
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode) & 0o022
+            or not 0 < before.st_size <= 1024 * 1024
+        ):
+            reject(f"{label} must be canonical and non-writable")
+        chunks: list[bytes] = []
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                reject(f"{label} ended before its declared size")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            reject(f"{label} grew while being read")
+        after = os.fstat(descriptor)
+        stable = (
+            "st_dev",
+            "st_ino",
+            "st_mode",
+            "st_nlink",
+            "st_uid",
+            "st_gid",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+        if any(
+            getattr(before, field) != getattr(after, field)
+            for field in stable
+        ):
+            reject(f"{label} changed while being read")
+        raw = b"".join(chunks)
+    finally:
+        os.close(descriptor)
+    try:
         value = json.loads(
             raw.decode("utf-8"),
             object_pairs_hook=unique_object,
@@ -113,15 +165,10 @@ def read_json(path: Path, label: str) -> tuple[bytes, dict[str, Any]]:
                 f"{label} contains non-finite number: {item}"
             ),
         )
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+    except (UnicodeDecodeError, json.JSONDecodeError):
         reject(f"{label} is invalid")
     if (
-        not stat.S_ISREG(info.st_mode)
-        or stat.S_ISLNK(info.st_mode)
-        or info.st_nlink != 1
-        or stat.S_IMODE(info.st_mode) & 0o022
-        or not 0 < len(raw) <= 1024 * 1024
-        or not isinstance(value, dict)
+        not isinstance(value, dict)
         or raw != canonical_bytes(value)
     ):
         reject(f"{label} must be canonical and non-writable")
@@ -165,6 +212,24 @@ def validate_summary(
     ):
         if HASH_RE.fullmatch(str(value[key])) is None:
             reject(f"{label} summary digest is invalid: {key}")
+
+
+def validate_helper_receipt(
+    value: dict[str, Any],
+    *,
+    controller_sha: str,
+) -> dict[str, Any]:
+    if (
+        set(value) != HELPER_RECEIPT_KEYS
+        or value["name"] != HELPER_NAME
+        or value["controller_sha"] != controller_sha
+        or type(value["sha256"]) is not str
+        or HASH_RE.fullmatch(value["sha256"]) is None
+        or type(value["size_bytes"]) is not int
+        or not 0 < value["size_bytes"] <= 2 * 1024 * 1024
+    ):
+        reject("bootstrap source helper receipt is invalid")
+    return value
 
 
 def artifact_binding(
@@ -269,6 +334,11 @@ def main() -> int:
     parser.add_argument("--ops-summary", required=True, type=Path)
     parser.add_argument("--web-summary", required=True, type=Path)
     parser.add_argument("--behavior", required=True, type=Path)
+    parser.add_argument(
+        "--bootstrap-source-helper",
+        required=True,
+        type=Path,
+    )
     parser.add_argument("--api-artifact-id", required=True, type=int)
     parser.add_argument("--ops-artifact-id", required=True, type=int)
     parser.add_argument("--web-artifact-id", required=True, type=int)
@@ -301,6 +371,14 @@ def main() -> int:
             reject("bootstrap artifacts require distinct positive IDs")
 
         approval_raw, approval = read_approval(args.approval)
+        _, helper_receipt = read_json(
+            args.bootstrap_source_helper,
+            "bootstrap source helper receipt",
+        )
+        validate_helper_receipt(
+            helper_receipt,
+            controller_sha=args.controller_sha,
+        )
         api_sha = approval["api"]["commit_sha"]
         web_sha = approval["web"]["commit_sha"]
         if approval["ops"]["commit_sha"] != api_sha:
@@ -363,6 +441,7 @@ def main() -> int:
             },
             "artifacts": artifacts,
             "behavioral_verification": behavior,
+            "bootstrap_source_helper": helper_receipt,
             "carrier": {
                 "authorizes_release": False,
                 "repository": (
@@ -393,7 +472,7 @@ def main() -> int:
                 ),
             },
             "migration": approval["migration"],
-            "schema_version": 5,
+            "schema_version": 6,
             "supplemental_inventory": {
                 "supplemental_only": True,
             },

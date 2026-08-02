@@ -3,8 +3,9 @@
 
 This program is deliberately self-contained.  It is transported as data,
 signed independently, placed with the other release inputs, and invoked by
-the already-installed ``with-deploy-lock.py``.  No checkout, network
-download, shell, or mutable Python import participates in the host update.
+the already-installed ``with-deploy-lock.py`` through the same read-only file
+descriptor verified before execution.  No checkout, network download, shell,
+or mutable Python import participates in the host update.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ import sys
 
 sys.dont_write_bytecode = True
 
+import argparse
 import ctypes
 import errno
 import fcntl
@@ -424,6 +426,35 @@ def open_input(
 
 
 @dataclass(frozen=True)
+class BootstrapExpectations:
+    helper_sha256: str
+    attestation_sha256: str
+    carrier_sha: str
+    controller_sha: str
+
+
+def validate_expectations(
+    expectations: BootstrapExpectations,
+) -> None:
+    require_hash(
+        expectations.helper_sha256,
+        "helper hash esperado",
+    )
+    require_hash(
+        expectations.attestation_sha256,
+        "attestation hash esperado",
+    )
+    require_sha(
+        expectations.carrier_sha,
+        "carrier SHA esperado",
+    )
+    require_sha(
+        expectations.controller_sha,
+        "controller SHA esperado",
+    )
+
+
+@dataclass(frozen=True)
 class AttestationBinding:
     raw_sha256: str
     carrier_sha: str
@@ -441,8 +472,17 @@ def validate_attestation(
     raw: bytes,
     *,
     helper_sha256: str,
+    helper_size_bytes: int,
+    expected_carrier_sha: str,
+    expected_controller_sha: str,
 ) -> AttestationBinding:
     require_hash(helper_sha256, "helper hash")
+    if type(helper_size_bytes) is not int or not (
+        0 < helper_size_bytes <= MAX_HELPER_BYTES
+    ):
+        reject("tamanho do helper é inválido")
+    require_sha(expected_carrier_sha, "carrier SHA esperado")
+    require_sha(expected_controller_sha, "controller SHA esperado")
     value = parse_canonical_json(raw, "release attestation")
     exact_object(
         value,
@@ -450,6 +490,7 @@ def validate_attestation(
             "approval",
             "artifacts",
             "behavioral_verification",
+            "bootstrap_source_helper",
             "carrier",
             "controller",
             "migration",
@@ -458,8 +499,25 @@ def validate_attestation(
         },
         "release attestation",
     )
-    if value["schema_version"] != 5:
-        reject("release attestation não usa schema 5")
+    if (
+        type(value["schema_version"]) is not int
+        or value["schema_version"] != 6
+    ):
+        reject("release attestation não usa schema 6")
+    helper = exact_object(
+        value["bootstrap_source_helper"],
+        {"controller_sha", "name", "sha256", "size_bytes"},
+        "bootstrap source helper binding",
+    )
+    if (
+        helper["name"] != HELPER_NAME
+        or helper["sha256"] != helper_sha256
+        or type(helper["size_bytes"]) is not int
+        or helper["size_bytes"] != helper_size_bytes
+    ):
+        reject("bootstrap source helper binding diverge")
+    if helper["controller_sha"] != expected_controller_sha:
+        reject("controller SHA esperado diverge do helper assinado")
     carrier = exact_object(
         value["carrier"],
         {"authorizes_release", "repository", "trust"},
@@ -500,7 +558,8 @@ def validate_attestation(
         "carrier commit",
     )
     if (
-        controller["event_name"] != CARRIER_TRIGGER
+        carrier_sha != expected_carrier_sha
+        or controller["event_name"] != CARRIER_TRIGGER
         or controller["repository"] != CARRIER_REPOSITORY
         or controller["source_ref"] != CARRIER_REF
         or controller["workflow"] != CARRIER_WORKFLOW
@@ -544,6 +603,11 @@ def validate_attestation(
         controller_approval.get("base_sha"),
         "controller SHA aprovado",
     )
+    if (
+        controller_sha != expected_controller_sha
+        or controller_sha != helper["controller_sha"]
+    ):
+        reject("controller SHA diverge do helper assinado")
     api_sha = require_sha(
         api_approval.get("commit_sha"),
         "API SHA aprovado",
@@ -1827,10 +1891,31 @@ def open_and_validate_inputs(
     *,
     uid: int,
     gid: int,
+    execution_descriptor: int,
+    expectations: BootstrapExpectations,
     signature_verifier: (
         Callable[[int, int, int, str], None] | None
     ) = None,
 ) -> InstallInputs:
+    validate_expectations(expectations)
+    try:
+        execution_info = os.fstat(execution_descriptor)
+        execution_flags = fcntl.fcntl(
+            execution_descriptor,
+            fcntl.F_GETFL,
+        )
+    except OSError:
+        reject("FD de execução do helper está fechado")
+    if (execution_flags & os.O_ACCMODE) != os.O_RDONLY:
+        reject("FD de execução do helper precisa ser somente leitura")
+    validate_regular(
+        execution_info,
+        "FD de execução do helper",
+        uid=uid,
+        gid=gid,
+        modes={0o400},
+        maximum=MAX_HELPER_BYTES,
+    )
     incoming_descriptor = open_path_chain(
         incoming,
         uid=uid,
@@ -1847,6 +1932,40 @@ def open_and_validate_inputs(
             maximum=MAX_HELPER_BYTES,
         )
         opened.append(helper)
+        stable_identity = (
+            "st_dev",
+            "st_ino",
+            "st_mode",
+            "st_nlink",
+            "st_uid",
+            "st_gid",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+        if any(
+            getattr(execution_info, field)
+            != getattr(helper_info, field)
+            for field in stable_identity
+        ):
+            reject(
+                "FD de execução não aponta para o helper fixo protegido"
+            )
+        execution_hash = digest_fd(
+            execution_descriptor,
+            execution_info,
+            "FD de execução do helper",
+        )
+        helper_hash = digest_fd(
+            helper,
+            helper_info,
+            "bootstrap source helper",
+        )
+        if (
+            execution_hash != expectations.helper_sha256
+            or helper_hash != expectations.helper_sha256
+        ):
+            reject("hash esperado do helper diverge")
         helper_bundle, _ = open_input(
             incoming_descriptor,
             HELPER_BUNDLE_NAME,
@@ -1877,14 +1996,17 @@ def open_and_validate_inputs(
             maximum=MAX_JSON_BYTES,
             label="release attestation",
         )
-        helper_hash = digest_fd(
-            helper,
-            helper_info,
-            "bootstrap source helper",
-        )
+        if (
+            hashlib.sha256(attestation_raw).hexdigest()
+            != expectations.attestation_sha256
+        ):
+            reject("hash esperado da release attestation diverge")
         binding = validate_attestation(
             attestation_raw,
             helper_sha256=helper_hash,
+            helper_size_bytes=helper_info.st_size,
+            expected_carrier_sha=expectations.carrier_sha,
+            expected_controller_sha=expectations.controller_sha,
         )
         archive, archive_info = open_input(
             incoming_descriptor,
@@ -1918,19 +2040,19 @@ def open_and_validate_inputs(
                 cosign_descriptor,
                 helper,
                 helper_bundle,
-                binding.carrier_sha,
+                expectations.carrier_sha,
             )
             verifier(
                 cosign_descriptor,
                 attestation,
                 attestation_bundle,
-                binding.carrier_sha,
+                expectations.carrier_sha,
             )
             verifier(
                 cosign_descriptor,
                 archive,
                 archive_bundle,
-                binding.carrier_sha,
+                expectations.carrier_sha,
             )
         finally:
             if cosign_descriptor >= 0:
@@ -2152,6 +2274,8 @@ def install_source(
     state_root: Path,
     uid: int,
     gid: int,
+    execution_descriptor: int,
+    expectations: BootstrapExpectations,
     runtime: Runtime,
     signature_verifier: (
         Callable[[int, int, int, str], None] | None
@@ -2164,6 +2288,8 @@ def install_source(
         incoming,
         uid=uid,
         gid=gid,
+        execution_descriptor=execution_descriptor,
+        expectations=expectations,
         signature_verifier=signature_verifier,
     )
     try:
@@ -2576,15 +2702,81 @@ def install_source(
         inputs.close()
 
 
+class FailClosedArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        reject(f"CLI do helper é inválida: {message}")
+
+
+def parse_cli(argv: list[str]) -> argparse.Namespace:
+    parser = FailClosedArgumentParser(
+        allow_abbrev=False,
+        add_help=False,
+    )
+    parser.add_argument("--helper-fd", required=True, type=int)
+    parser.add_argument("--expected-helper-sha256", required=True)
+    parser.add_argument("--expected-attestation-sha256", required=True)
+    parser.add_argument("--expected-carrier-sha", required=True)
+    parser.add_argument("--expected-controller-sha", required=True)
+    required_options = (
+        "--helper-fd",
+        "--expected-helper-sha256",
+        "--expected-attestation-sha256",
+        "--expected-carrier-sha",
+        "--expected-controller-sha",
+    )
+    if len(argv) != 2 * len(required_options) or any(
+        argv.count(option) != 1 for option in required_options
+    ):
+        reject("CLI do helper exige cada binding exatamente uma vez")
+    args = parser.parse_args(argv)
+    if args.helper_fd < 0:
+        reject("FD de execução do helper é inválido")
+    return args
+
+
+def validate_execution_entrypoint(
+    helper_fd: int,
+    *,
+    script_path: str,
+    platform: str,
+    proc_fd_root: Path = Path("/proc/self/fd"),
+) -> None:
+    if platform != "linux":
+        reject("helper exige Linux com procfs")
+    try:
+        proc_info = proc_fd_root.stat()
+        os.fstat(helper_fd)
+    except OSError:
+        reject("helper exige /proc/self/fd e FD aberto")
+    if (
+        not stat.S_ISDIR(proc_info.st_mode)
+        or script_path != str(proc_fd_root / str(helper_fd))
+    ):
+        reject("helper exige execução por /proc/self/fd")
+
+
 def main() -> int:
-    expected = INCOMING / HELPER_NAME
+    args = parse_cli(sys.argv[1:])
+    validate_execution_entrypoint(
+        args.helper_fd,
+        script_path=__file__,
+        platform=sys.platform,
+    )
     if (
         os.geteuid() != EXPECTED_UID
         or os.getegid() != EXPECTED_GID
-        or Path(os.path.abspath(__file__)) != expected
-        or len(sys.argv) != 1
     ):
-        reject("helper exige root:root, caminho fixo e nenhuma opção")
+        reject(
+            "helper exige root:root e execução pelo FD explicitamente "
+            "validado"
+        )
+    expectations = BootstrapExpectations(
+        helper_sha256=args.expected_helper_sha256,
+        attestation_sha256=args.expected_attestation_sha256,
+        carrier_sha=args.expected_carrier_sha,
+        controller_sha=args.expected_controller_sha,
+    )
+    validate_expectations(expectations)
     previous_umask = os.umask(0o077)
     try:
         lock_descriptor = verify_inherited_lock(
@@ -2596,6 +2788,8 @@ def main() -> int:
             state_root=STATE_ROOT,
             uid=EXPECTED_UID,
             gid=EXPECTED_GID,
+            execution_descriptor=args.helper_fd,
+            expectations=expectations,
             runtime=production_runtime(),
             signature_verifier=None,
             publisher=run_publisher,
