@@ -82,6 +82,7 @@ descriptor to the pre-existing immutable lock wrapper as standard input:
   LC_ALL=C \
   NO_COLOR=1 \
   PATH=/usr/bin:/bin \
+  TUF_ROOT=/var/cache/tratto-control/cosign \
   XDG_CACHE_HOME=/var/cache/tratto-control/cosign \
   EXPECTED_HELPER_SHA256="$EXPECTED_HELPER_SHA256" \
   EXPECTED_ATTESTATION_SHA256="$EXPECTED_ATTESTATION_SHA256" \
@@ -247,6 +248,7 @@ helper FD directly with the complete post-publisher binding group:
   LC_ALL=C \
   NO_COLOR=1 \
   PATH=/usr/bin:/bin \
+  TUF_ROOT=/var/cache/tratto-control/cosign \
   XDG_CACHE_HOME=/var/cache/tratto-control/cosign \
   EXPECTED_HELPER_SHA256="$EXPECTED_HELPER_SHA256" \
   EXPECTED_ATTESTATION_SHA256="$EXPECTED_ATTESTATION_SHA256" \
@@ -355,6 +357,20 @@ The new standard source supersede cannot begin until the prelude has archived
 current source `used`, the current publisher terminal evidence, and every
 nested-history entry.
 
+When a later terminal predecessor was itself installed by that bridge, the
+fixed schema-v1/v2 journal remains immutable as the history root. The next
+bridge writes a distinct append-only
+`bootstrap-source-kit.post-publisher-supersede.<successor-kit-id>.json`
+journal. Schema v5 binds the exact SHA-256 of both the predecessor's journal
+and its standard source-supersede record; schema v6 adds the post-stage bundle
+ID and tree hash. Parent names come only from the predecessor kit identity.
+Validation follows that hash-linked chain with cycle and depth limits, proves
+every older witness and exact namespace, and rejects flattening an archived
+publisher supersede into a newer generation. The prior journals and witnesses
+are never renamed. Only the immediately preceding standard source supersede
+is archived, after the new generational journal and all current terminal
+evidence are durable.
+
 Every archive boundary is retryable with the same ten values and signed
 inputs. Replay revalidates the journal bindings, the exact namespace, and the
 completed archival prefix before continuing idempotently. Except for the
@@ -417,7 +433,8 @@ absent.
 
 The helper records the exact bundle ID and tree hash in schema 3 of the
 post-publisher journal (schema 4 when nested supersede history is also
-present), then moves the inert bundle with atomic no-replace semantics to:
+present, or schema 6 for a hash-linked prior post-publisher generation), then
+moves the inert bundle with atomic no-replace semantics to:
 
 ```text
 /opt/tratto-control/.staging/.bootstrap-post-stage.bundle.<bundle-id>

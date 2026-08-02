@@ -1006,7 +1006,10 @@ def stage_predecessor_schema6_bundle(
     return bundle_id, tree_digest
 
 
-def publish_fake_successor_bootstrap(control: Path) -> None:
+def publish_fake_successor_bootstrap(
+    control: Path,
+    version: bytes = b"successor\n",
+) -> None:
     staging = control / ".staging"
     final = control / "bootstrap"
     final_descriptor = os.open(final, os.O_RDONLY | os.O_DIRECTORY)
@@ -1019,7 +1022,7 @@ def publish_fake_successor_bootstrap(control: Path) -> None:
     finally:
         os.close(final_descriptor)
     candidate = staging / ".publisher-successor"
-    new_digest = protected_bootstrap_tree(candidate, b"successor\n")
+    new_digest = protected_bootstrap_tree(candidate, version)
     previous_name = KIT.PUBLISHER_PREVIOUS_PREFIX + old_digest[:32]
     control.chmod(0o700)
     final.chmod(0o700)
@@ -1203,6 +1206,66 @@ def prepare_nested_post_publisher_fixture(
     replace_signed_release(
         incoming,
         api_sha="e" * 40,
+        required_ancestors=(current_source.api_sha,),
+    )
+    calls.clear()
+    return (
+        incoming,
+        state,
+        calls,
+        (
+            current_source.kit_id,
+            current_source.controller_sha,
+            hashlib.sha256(current_source_intent).hexdigest(),
+            hashlib.sha256(current_source_used).hexdigest(),
+            hashlib.sha256(publisher_intent).hexdigest(),
+            hashlib.sha256(publisher_used).hexdigest(),
+        ),
+        control,
+    )
+
+
+def prepare_repeated_post_publisher_fixture(
+    root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[
+    Path,
+    Path,
+    list[str],
+    tuple[str, str, str, str, str, str],
+    Path,
+]:
+    incoming, state, calls, bindings, control = (
+        prepare_nested_post_publisher_fixture(root, monkeypatch)
+    )
+    assert (
+        install(
+            incoming,
+            state,
+            calls,
+            post_predecessor=bindings,
+            publisher_callback=lambda: publish_fake_successor_bootstrap(
+                control
+            ),
+        )
+        == "installed"
+    )
+    first_journal = json.loads(
+        (state / KIT.POST_PUBLISHER_SUPERSEDE_NAME).read_text()
+    )
+    assert first_journal["schema_version"] == 2
+    current_source_intent = (state / KIT.INTENT_NAME).read_bytes()
+    current_source_used = (state / KIT.USED_NAME).read_bytes()
+    current_source = KIT.validate_source_intent(current_source_intent)
+    publisher_intent = (
+        control / ".staging" / KIT.PUBLISHER_INTENT_NAME
+    ).read_bytes()
+    publisher_used = (
+        control / ".staging" / KIT.PUBLISHER_USED_NAME
+    ).read_bytes()
+    replace_signed_release(
+        incoming,
+        api_sha="f" * 40,
         required_ancestors=(current_source.api_sha,),
     )
     calls.clear()
@@ -3209,6 +3272,362 @@ def test_post_publisher_successor_preserves_nested_supersede_and_replays(
     assert immutable_tree_snapshot(control) == control_before
 
 
+def test_repeated_post_publisher_inspects_schema6_bundle_read_only(
+    secure_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    incoming, state, calls, bindings, control = (
+        prepare_repeated_post_publisher_fixture(
+            secure_tmp_path,
+            monkeypatch,
+        )
+    )
+    post_stage = stage_predecessor_schema6_bundle(
+        incoming,
+        state,
+        control,
+        required_ancestors=("d" * 40,),
+    )
+    state_before = immutable_tree_snapshot(state)
+    control_before = immutable_tree_snapshot(control)
+
+    observed = json.loads(
+        inspect_post_stage(
+            incoming,
+            state,
+            bindings,
+            post_stage[0],
+            calls,
+        )
+    )
+
+    assert observed["bundle_id"] == post_stage[0]
+    assert observed["bundle_tree_sha256"] == post_stage[1]
+    assert immutable_tree_snapshot(state) == state_before
+    assert immutable_tree_snapshot(control) == control_before
+
+
+def test_repeated_post_publisher_installs_schema6_generation_and_recurses(
+    secure_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    incoming, state, calls, bindings, control = (
+        prepare_repeated_post_publisher_fixture(
+            secure_tmp_path,
+            monkeypatch,
+        )
+    )
+    post_stage = stage_predecessor_schema6_bundle(
+        incoming,
+        state,
+        control,
+        required_ancestors=("d" * 40,),
+    )
+    fixed_before = (
+        state / KIT.POST_PUBLISHER_SUPERSEDE_NAME
+    ).read_bytes()
+    successor_kit_id = signed_release_kit_id(incoming)
+
+    assert (
+        install(
+            incoming,
+            state,
+            calls,
+            post_predecessor=bindings,
+            post_stage=post_stage,
+            publisher_callback=lambda: publish_fake_successor_bootstrap(
+                control,
+                b"second-successor\n",
+            ),
+        )
+        == "installed"
+    )
+
+    assert (
+        state / KIT.POST_PUBLISHER_SUPERSEDE_NAME
+    ).read_bytes() == fixed_before
+    generational = (
+        state
+        / KIT.post_publisher_history_journal_name(successor_kit_id)
+    )
+    journal = json.loads(generational.read_text())
+    assert journal["schema_version"] == 6
+    assert (
+        journal["predecessor_history_journal_sha256"]
+        == hashlib.sha256(fixed_before).hexdigest()
+    )
+    assert (
+        journal["predecessor_history_source_supersede_sha256"]
+        == hashlib.sha256(
+            (
+                state
+                / KIT.nested_source_archive_name(
+                    "supersede",
+                    bindings[0],
+                )
+            ).read_bytes()
+        ).hexdigest()
+    )
+    assert (
+        control
+        / ".staging"
+        / KIT.post_stage_bundle_archive_name(post_stage[0])
+    ).is_dir()
+
+    current_source_intent = (state / KIT.INTENT_NAME).read_bytes()
+    current_source_used = (state / KIT.USED_NAME).read_bytes()
+    current_source = KIT.validate_source_intent(current_source_intent)
+    current_publisher_intent = (
+        control / ".staging" / KIT.PUBLISHER_INTENT_NAME
+    ).read_bytes()
+    current_publisher_used = (
+        control / ".staging" / KIT.PUBLISHER_USED_NAME
+    ).read_bytes()
+    next_bindings = (
+        current_source.kit_id,
+        current_source.controller_sha,
+        hashlib.sha256(current_source_intent).hexdigest(),
+        hashlib.sha256(current_source_used).hexdigest(),
+        hashlib.sha256(current_publisher_intent).hexdigest(),
+        hashlib.sha256(current_publisher_used).hexdigest(),
+    )
+    replace_signed_release(
+        incoming,
+        api_sha="1" * 40,
+        required_ancestors=(current_source.api_sha,),
+    )
+    next_stage = stage_predecessor_schema6_bundle(
+        incoming,
+        state,
+        control,
+        required_ancestors=("e" * 40,),
+    )
+    state_before = immutable_tree_snapshot(state)
+    control_before = immutable_tree_snapshot(control)
+    observed = json.loads(
+        inspect_post_stage(
+            incoming,
+            state,
+            next_bindings,
+            next_stage[0],
+            calls,
+        )
+    )
+    assert observed["bundle_id"] == next_stage[0]
+    assert observed["bundle_tree_sha256"] == next_stage[1]
+    assert immutable_tree_snapshot(state) == state_before
+    assert immutable_tree_snapshot(control) == control_before
+
+    third_kit_id = signed_release_kit_id(incoming)
+    parent_journal_raw = generational.read_bytes()
+    assert (
+        install(
+            incoming,
+            state,
+            calls,
+            post_predecessor=next_bindings,
+            post_stage=next_stage,
+            publisher_callback=lambda: publish_fake_successor_bootstrap(
+                control,
+                b"third-successor\n",
+            ),
+        )
+        == "installed"
+    )
+    third_journal = json.loads(
+        (
+            state
+            / KIT.post_publisher_history_journal_name(third_kit_id)
+        ).read_text()
+    )
+    assert third_journal["schema_version"] == 6
+    assert (
+        third_journal["predecessor_history_journal_sha256"]
+        == hashlib.sha256(parent_journal_raw).hexdigest()
+    )
+    terminal_state = immutable_tree_snapshot(state)
+    terminal_control = immutable_tree_snapshot(control)
+    assert (
+        install(
+            incoming,
+            state,
+            calls,
+            post_predecessor=next_bindings,
+            post_stage=next_stage,
+        )
+        == "already-installed"
+    )
+    assert immutable_tree_snapshot(state) == terminal_state
+    assert immutable_tree_snapshot(control) == terminal_control
+
+
+@pytest.mark.parametrize(
+    "event",
+    (
+        "after_post_publisher_supersede",
+        "after_post_publisher_staged_bundle_archive",
+        "after_post_publisher_source_used_archive",
+        "after_post_publisher_previous_archive",
+        "after_repeated_source_supersede_archive",
+        "after_post_publisher_standard_supersede",
+        "after_publisher",
+    ),
+)
+@pytest.mark.skipif(
+    not hasattr(os, "fork"),
+    reason="fault harness exige fork",
+)
+def test_repeated_post_publisher_recovers_sigkill_boundaries(
+    secure_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    event: str,
+) -> None:
+    incoming, state, _calls, bindings, control = (
+        prepare_repeated_post_publisher_fixture(
+            secure_tmp_path,
+            monkeypatch,
+        )
+    )
+    post_stage = stage_predecessor_schema6_bundle(
+        incoming,
+        state,
+        control,
+        required_ancestors=("d" * 40,),
+    )
+
+    def publish_successor_once() -> None:
+        if not (
+            control / ".staging" / KIT.PUBLISHER_USED_NAME
+        ).exists():
+            publish_fake_successor_bootstrap(
+                control,
+                b"second-successor\n",
+            )
+
+    child = os.fork()
+    if child == 0:
+        def kill_at(observed: str) -> None:
+            if observed == event:
+                os.kill(os.getpid(), signal.SIGKILL)
+
+        try:
+            install(
+                incoming,
+                state,
+                [],
+                post_predecessor=bindings,
+                post_stage=post_stage,
+                publisher_callback=publish_successor_once,
+                fault=kill_at,
+            )
+        except BaseException:
+            os._exit(92)
+        os._exit(91)
+    _, status = os.waitpid(child, 0)
+    assert os.WIFSIGNALED(status)
+    assert os.WTERMSIG(status) == signal.SIGKILL
+
+    assert (
+        install(
+            incoming,
+            state,
+            [],
+            post_predecessor=bindings,
+            post_stage=post_stage,
+            publisher_callback=publish_successor_once,
+        )
+        == "installed"
+    )
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    (
+        "parent-journal",
+        "parent-source-supersede",
+        "generational-binding",
+        "foreign-generation",
+    ),
+)
+def test_repeated_post_publisher_rejects_history_tamper_without_mutation(
+    secure_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tamper: str,
+) -> None:
+    incoming, state, calls, bindings, control = (
+        prepare_repeated_post_publisher_fixture(
+            secure_tmp_path,
+            monkeypatch,
+        )
+    )
+    post_stage = stage_predecessor_schema6_bundle(
+        incoming,
+        state,
+        control,
+        required_ancestors=("d" * 40,),
+    )
+
+    def stop_after_journal(event: str) -> None:
+        if event == "after_post_publisher_supersede":
+            raise RuntimeError("stop after journal")
+
+    with pytest.raises(RuntimeError, match="stop after journal"):
+        install(
+            incoming,
+            state,
+            calls,
+            post_predecessor=bindings,
+            post_stage=post_stage,
+            fault=stop_after_journal,
+        )
+    generational = (
+        state
+        / KIT.post_publisher_history_journal_name(
+            signed_release_kit_id(incoming)
+        )
+    )
+
+    def rewrite(path: Path, value: dict[str, object]) -> None:
+        path.chmod(0o600)
+        path.write_bytes(canonical(value))
+        path.chmod(0o444)
+
+    if tamper == "parent-journal":
+        path = state / KIT.POST_PUBLISHER_SUPERSEDE_NAME
+        value = json.loads(path.read_text())
+        value["predecessor_source_used_sha256"] = "9" * 64
+        rewrite(path, value)
+    elif tamper == "parent-source-supersede":
+        path = state / KIT.SUPERSEDE_NAME
+        value = json.loads(path.read_text())
+        value["predecessor_publisher_intent_sha256"] = "9" * 64
+        rewrite(path, value)
+    elif tamper == "generational-binding":
+        value = json.loads(generational.read_text())
+        value["predecessor_history_journal_sha256"] = "9" * 64
+        rewrite(generational, value)
+    else:
+        foreign = (
+            state
+            / KIT.post_publisher_history_journal_name("9" * 64)
+        )
+        foreign.write_bytes(generational.read_bytes())
+        foreign.chmod(0o444)
+
+    state_before = immutable_tree_snapshot(state)
+    control_before = immutable_tree_snapshot(control)
+    with pytest.raises(KIT.BootstrapSourceError):
+        install(
+            incoming,
+            state,
+            calls,
+            post_predecessor=bindings,
+            post_stage=post_stage,
+        )
+    assert immutable_tree_snapshot(state) == state_before
+    assert immutable_tree_snapshot(control) == control_before
+
+
 def test_nested_post_publisher_resumes_valid_partial_recovery_journal(
     secure_tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -5134,6 +5553,7 @@ def test_readme_verifies_same_helper_fd_before_lock_wrapper() -> None:
     ):
         assert utility in before_signature
     assert "PATH=/usr/bin:/bin" in before_signature
+    assert "TUF_ROOT=/var/cache/tratto-control/cosign" in before_signature
     assert "BASH_ENV" not in before_signature
     assert "/usr/bin/python3.12 -I -B /proc/self/fd/0" in text
     assert '--helper-fd 0' in text
@@ -5171,6 +5591,10 @@ def test_readme_post_publisher_bridge_uses_verified_fd_without_bad_wrapper(
     )
     assert opened < signature < direct
     assert (
+        "TUF_ROOT=/var/cache/tratto-control/cosign"
+        in section[:signature]
+    )
+    assert (
         "/opt/tratto-control/bootstrap/scripts/with-deploy-lock.py"
         not in section
     )
@@ -5203,6 +5627,26 @@ def test_readme_post_publisher_bridge_uses_verified_fd_without_bad_wrapper(
         "--expected-post-publisher-publisher-used-sha256",
     ):
         assert option in section[direct:]
+
+
+def test_cosign_verification_uses_validated_cache_as_tuf_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run(arguments: list[str], **kwargs: object) -> object:
+        captured["arguments"] = arguments
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(arguments, 0)
+
+    monkeypatch.setattr(KIT.subprocess, "run", fake_run)
+    KIT.verify_cosign_blob(10, 11, 12, "a" * 40)
+
+    environment = captured["env"]
+    assert isinstance(environment, dict)
+    assert environment["HOME"] == "/nonexistent"
+    assert environment["TUF_ROOT"] == str(KIT.COSIGN_CACHE)
+    assert environment["XDG_CACHE_HOME"] == str(KIT.COSIGN_CACHE)
 
 
 def test_execution_entrypoint_fails_closed_without_linux_procfs(
