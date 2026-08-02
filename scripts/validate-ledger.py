@@ -51,7 +51,7 @@ EXPECTED_ORIGIN = (
     "https://github.com/PluckXD/tratto-control-release-ledger.git"
 )
 EXPECTED_REF = "refs/heads/main"
-PINNED_GENESIS_SHA = ""
+PINNED_GENESIS_SHA = "20ad87d361f31fd08ed2721a2d2acbb855addd6b"
 
 SHA1_RE = APPROVAL_V2.SHA1_RE
 SHA256_RE = APPROVAL_V2.SHA256_RE

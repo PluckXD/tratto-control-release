@@ -547,16 +547,20 @@ def test_loader_rejects_symlink_and_hardlink(tmp_path: Path) -> None:
             CONTROLS.load_canonical_json(path, "evidence")
 
 
-def test_cli_stays_unavailable_until_real_repository_ids_are_pinned(
+def test_cli_uses_the_audited_repository_ids(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     controller_path = tmp_path / "controller.json"
     ledger_path = tmp_path / "ledger.json"
-    write_canonical(controller_path, controller_evidence())
-    write_canonical(ledger_path, ledger_evidence())
-    assert CONTROLS.PINNED_CONTROLLER_REPOSITORY_ID == 0
-    assert CONTROLS.PINNED_LEDGER_REPOSITORY_ID == 0
+    controller = controller_evidence()
+    ledger = ledger_evidence()
+    controller["repository"]["id"] = (
+        CONTROLS.PINNED_CONTROLLER_REPOSITORY_ID
+    )
+    ledger["repository"]["id"] = CONTROLS.PINNED_LEDGER_REPOSITORY_ID
+    write_canonical(controller_path, controller)
+    write_canonical(ledger_path, ledger)
     assert (
         CONTROLS.main(
             [
@@ -566,9 +570,11 @@ def test_cli_stays_unavailable_until_real_repository_ids_are_pinned(
                 str(ledger_path),
             ]
         )
-        == 78
+        == 0
     )
-    assert "pins are not configured" in capsys.readouterr().err
+    output = json.loads(capsys.readouterr().out)
+    assert output["controller_repository_id"] == 1317521588
+    assert output["ledger_repository_id"] == 1319756090
 
 
 def test_cli_reads_canonical_evidence_when_reviewed_pins_are_injected(

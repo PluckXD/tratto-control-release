@@ -32,10 +32,11 @@ LEDGER_REPOSITORY = "PluckXD/tratto-control-release-ledger"
 MAIN_REF = "refs/heads/main"
 ENVIRONMENT = "control-release"
 
-# These IDs are intentionally unavailable until the repositories and their
-# owner-enforced controls have been provisioned and independently reviewed.
-PINNED_CONTROLLER_REPOSITORY_ID = 0
-PINNED_LEDGER_REPOSITORY_ID = 0
+# Numeric repository identities audited directly from the GitHub API after
+# both public trust repositories were provisioned. Names remain part of the
+# contract, but can never substitute for these immutable numeric identities.
+PINNED_CONTROLLER_REPOSITORY_ID = 1317521588
+PINNED_LEDGER_REPOSITORY_ID = 1319756090
 
 CHECKOUT_ACTION = (
     "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"

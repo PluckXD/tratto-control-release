@@ -220,7 +220,7 @@ def test_api_validation_is_offline(monkeypatch, tmp_path: Path) -> None:
     assert validate(root, genesis, relative)["record_count"] == 1
 
 
-def test_cli_fails_closed_until_production_genesis_is_pinned(
+def test_cli_uses_pinned_genesis_and_still_requires_trusted_github_context(
     tmp_path: Path,
 ) -> None:
     result = subprocess.run(
@@ -243,7 +243,7 @@ def test_cli_fails_closed_until_production_genesis_is_pinned(
         text=True,
     )
     assert result.returncode == 78
-    assert "production ledger genesis SHA is not pinned" in result.stderr
+    assert "trusted ledger GitHub context is invalid: GITHUB_ACTIONS" in result.stderr
     assert "Traceback" not in result.stderr
 
 
@@ -617,5 +617,8 @@ def test_source_disables_bytecode_before_local_execution() -> None:
     disable = source.index("sys.dont_write_bytecode = True")
     argparse_import = source.index("import argparse")
     assert future < disable < argparse_import
-    assert "PINNED_GENESIS_SHA = \"\"" in source
+    assert (
+        'PINNED_GENESIS_SHA = "20ad87d361f31fd08ed2721a2d2acbb855addd6b"'
+        in source
+    )
     assert 'HERE / "validate-approval-v2.py"' in source
