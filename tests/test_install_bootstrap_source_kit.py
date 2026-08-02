@@ -67,6 +67,7 @@ def build_archive(
     path: Path,
     api_sha: str,
     *,
+    required_ancestors: tuple[str, ...] = ("0" * 40,),
     extra: tuple[str, bytes, int] | None = None,
     link: bool = False,
     omit: str | None = None,
@@ -74,9 +75,15 @@ def build_archive(
     quiescence_mode: int = 0o555,
 ) -> None:
     approval = {
-        "api": {"commit_sha": api_sha},
+        "api": {
+            "commit_sha": api_sha,
+            "required_ancestors": list(required_ancestors),
+        },
         "controller": {"base_sha": "c" * 40},
-        "ops": {"commit_sha": api_sha},
+        "ops": {
+            "commit_sha": api_sha,
+            "required_ancestors": list(required_ancestors),
+        },
     }
     manifest = canonical(
         {
@@ -185,11 +192,18 @@ def attestation(
     archive_size: int,
     helper_hash: str,
     helper_size: int,
+    required_ancestors: tuple[str, ...] = ("0" * 40,),
 ) -> bytes:
     approval = {
-        "api": {"commit_sha": api_sha},
+        "api": {
+            "commit_sha": api_sha,
+            "required_ancestors": list(required_ancestors),
+        },
         "controller": {"base_sha": controller_sha},
-        "ops": {"commit_sha": api_sha},
+        "ops": {
+            "commit_sha": api_sha,
+            "required_ancestors": list(required_ancestors),
+        },
     }
     def artifact(
         *,
@@ -448,6 +462,7 @@ def install(
     calls: list[str],
     *,
     fault=lambda _event: None,
+    predecessor: tuple[str, str, str] | None = None,
 ) -> str:
     def verifier(
         _cosign: int,
@@ -458,7 +473,16 @@ def install(
         assert carrier_sha == "b" * 40
         calls.append("signature")
 
-    def publisher(_source: int, _lock: int) -> str:
+    def publisher(
+        _source: int,
+        _lock: int,
+        authorization: bytes | None,
+    ) -> str:
+        if predecessor is None:
+            assert authorization is None
+        else:
+            assert authorization is not None
+            calls.append(authorization.decode("utf-8"))
         calls.append("publisher")
         return "upgraded"
 
@@ -471,7 +495,23 @@ def install(
             uid=os.getuid(),
             gid=os.getgid(),
             execution_descriptor=execution_descriptor,
-            expectations=expectations(incoming),
+            expectations=KIT.BootstrapExpectations(
+                helper_sha256=expectations(incoming).helper_sha256,
+                attestation_sha256=(
+                    expectations(incoming).attestation_sha256
+                ),
+                carrier_sha=expectations(incoming).carrier_sha,
+                controller_sha=expectations(incoming).controller_sha,
+                predecessor_kit_id=(
+                    predecessor[0] if predecessor else None
+                ),
+                predecessor_controller_sha=(
+                    predecessor[1] if predecessor else None
+                ),
+                predecessor_publisher_intent_sha256=(
+                    predecessor[2] if predecessor else None
+                ),
+            ),
             runtime=fake_runtime(),
             signature_verifier=verifier,
             publisher=publisher,
@@ -480,6 +520,105 @@ def install(
         )
     finally:
         os.close(execution_descriptor)
+
+
+def replace_signed_release(
+    incoming: Path,
+    *,
+    api_sha: str,
+    required_ancestors: tuple[str, ...],
+) -> None:
+    helper = (incoming / KIT.HELPER_NAME).read_bytes()
+    archive = incoming / f"tratto-control-ops-{api_sha}.tar.gz"
+    build_archive(
+        archive,
+        api_sha,
+        required_ancestors=required_ancestors,
+    )
+    archive_hash = hashlib.sha256(archive.read_bytes()).hexdigest()
+    attestation_path = incoming / KIT.ATTESTATION_NAME
+    attestation_path.chmod(0o600)
+    attestation_path.write_bytes(
+        attestation(
+            api_sha=api_sha,
+            carrier_sha="b" * 40,
+            controller_sha="c" * 40,
+            archive_hash=archive_hash,
+            archive_size=archive.stat().st_size,
+            helper_hash=hashlib.sha256(helper).hexdigest(),
+            helper_size=len(helper),
+            required_ancestors=required_ancestors,
+        )
+    )
+    archive.chmod(0o400)
+    attestation_path.chmod(0o400)
+
+
+def prepare_pre_publisher_source_state(
+    incoming: Path,
+    state: Path,
+    calls: list[str],
+) -> dict:
+    def stop(event: str) -> None:
+        if event == "before_publisher":
+            raise RuntimeError("predecessor publisher failed")
+
+    with pytest.raises(RuntimeError, match="publisher failed"):
+        install(incoming, state, calls, fault=stop)
+    return json.loads((state / KIT.INTENT_NAME).read_text())
+
+
+def prepare_fixed_publisher_state(
+    root: Path,
+) -> tuple[Path, str]:
+    control = root / "tratto-control"
+    staging = control / ".staging"
+    final = control / "bootstrap"
+    candidate = staging / KIT.PUBLISHER_CANDIDATE_NAME
+    staging.mkdir(parents=True, mode=0o700)
+    final.mkdir(mode=0o700)
+    candidate.mkdir(mode=0o700)
+    (final / ".complete").write_bytes(b"BOOTSTRAP_READY=1\n")
+    (candidate / ".complete").write_bytes(b"BOOTSTRAP_READY=1\n")
+    (final / "version").write_bytes(b"old\n")
+    (candidate / "version").write_bytes(b"failed\n")
+    for directory in (final, candidate):
+        for child in directory.iterdir():
+            child.chmod(0o444)
+        directory.chmod(0o555)
+    final_fd = os.open(final, os.O_RDONLY | os.O_DIRECTORY)
+    candidate_fd = os.open(candidate, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        old_digest = KIT.protected_bootstrap_tree_digest(
+            final_fd,
+            uid=os.getuid(),
+            gid=os.getgid(),
+        )
+        new_digest = KIT.protected_bootstrap_tree_digest(
+            candidate_fd,
+            uid=os.getuid(),
+            gid=os.getgid(),
+        )
+    finally:
+        os.close(candidate_fd)
+        os.close(final_fd)
+    intent = canonical(
+        {
+            "new_tree_sha256": new_digest,
+            "old_tree_sha256": old_digest,
+            "phase": "intent",
+            "previous_name": (
+                KIT.PUBLISHER_PREVIOUS_PREFIX + old_digest[:32]
+            ),
+            "schema_version": 1,
+        }
+    )
+    intent_path = staging / KIT.PUBLISHER_INTENT_NAME
+    intent_path.write_bytes(intent)
+    intent_path.chmod(0o400)
+    staging.chmod(0o700)
+    control.chmod(0o711)
+    return control, hashlib.sha256(intent).hexdigest()
 
 
 def test_installs_signed_tree_retains_old_and_is_idempotent(
@@ -531,6 +670,427 @@ def test_recovers_each_persistent_crash_boundary(
     assert (state / "bootstrap-source" / "RELEASE_SHA").is_file()
     assert len(list(state.glob("bootstrap-source.previous.*"))) == 1
     assert calls[-1] == "publisher"
+
+
+def test_authorized_successor_supersedes_only_exact_pre_publisher_state(
+    secure_tmp_path: Path,
+    monkeypatch,
+) -> None:
+    incoming, state, calls = fixture(secure_tmp_path)
+    predecessor_intent = prepare_pre_publisher_source_state(
+        incoming,
+        state,
+        calls,
+    )
+    publisher_intent_sha256 = "7" * 64
+    monkeypatch.setattr(
+        KIT,
+        "validate_fixed_predecessor_publisher_state",
+        lambda **_kwargs: publisher_intent_sha256,
+    )
+    replace_signed_release(
+        incoming,
+        api_sha="e" * 40,
+        required_ancestors=("a" * 40,),
+    )
+    calls.clear()
+    predecessor = (
+        predecessor_intent["kit_id"],
+        predecessor_intent["controller_sha"],
+        publisher_intent_sha256,
+    )
+    assert (
+        install(
+            incoming,
+            state,
+            calls,
+            predecessor=predecessor,
+        )
+        == "installed"
+    )
+    supersede = json.loads((state / KIT.SUPERSEDE_NAME).read_text())
+    assert supersede["predecessor_kit_id"] == predecessor[0]
+    assert (
+        supersede["predecessor_publisher_intent_sha256"]
+        == publisher_intent_sha256
+    )
+    for phase in ("intent", "prepared", "exchanged", "retained"):
+        archived = state / (
+            f"bootstrap-source-kit.{phase}.superseded."
+            f"{predecessor[0]}.json"
+        )
+        assert archived.is_file()
+    authorization = json.loads(calls[-2])
+    assert authorization["predecessor_source_kit_id"] == predecessor[0]
+    assert (
+        authorization["predecessor_publisher_intent_sha256"]
+        == publisher_intent_sha256
+    )
+    assert calls[-1] == "publisher"
+    calls.clear()
+    assert (
+        install(
+            incoming,
+            state,
+            calls,
+            predecessor=predecessor,
+        )
+        == "already-installed"
+    )
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    (
+        "after_source_supersede",
+        "after_source_supersede_intent",
+        "after_source_supersede_prepared",
+        "after_source_supersede_exchanged",
+        "after_source_supersede_retained",
+    ),
+)
+def test_successor_recovers_every_supersede_crash_boundary(
+    secure_tmp_path: Path,
+    monkeypatch,
+    boundary: str,
+) -> None:
+    incoming, state, calls = fixture(secure_tmp_path)
+    predecessor_intent = prepare_pre_publisher_source_state(
+        incoming,
+        state,
+        calls,
+    )
+    publisher_intent_sha256 = "7" * 64
+    monkeypatch.setattr(
+        KIT,
+        "validate_fixed_predecessor_publisher_state",
+        lambda **_kwargs: publisher_intent_sha256,
+    )
+    replace_signed_release(
+        incoming,
+        api_sha="e" * 40,
+        required_ancestors=("a" * 40,),
+    )
+    predecessor = (
+        predecessor_intent["kit_id"],
+        predecessor_intent["controller_sha"],
+        publisher_intent_sha256,
+    )
+    fired = False
+
+    def fail_once(event: str) -> None:
+        nonlocal fired
+        if not fired and event == boundary:
+            fired = True
+            raise RuntimeError("simulated successor crash")
+
+    with pytest.raises(RuntimeError, match="simulated successor"):
+        install(
+            incoming,
+            state,
+            calls,
+            predecessor=predecessor,
+            fault=fail_once,
+        )
+    calls.clear()
+    assert (
+        install(
+            incoming,
+            state,
+            calls,
+            predecessor=predecessor,
+        )
+        == "installed"
+    )
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "fork"),
+    reason="fault harness exige fork",
+)
+@pytest.mark.parametrize(
+    "boundary",
+    (
+        "after_source_supersede",
+        "after_source_supersede_intent",
+        "after_source_supersede_retained",
+    ),
+)
+def test_successor_replays_after_real_sigkill(
+    secure_tmp_path: Path,
+    monkeypatch,
+    boundary: str,
+) -> None:
+    incoming, state, calls = fixture(secure_tmp_path)
+    predecessor_intent = prepare_pre_publisher_source_state(
+        incoming,
+        state,
+        calls,
+    )
+    publisher_intent_sha256 = "7" * 64
+    monkeypatch.setattr(
+        KIT,
+        "validate_fixed_predecessor_publisher_state",
+        lambda **_kwargs: publisher_intent_sha256,
+    )
+    replace_signed_release(
+        incoming,
+        api_sha="e" * 40,
+        required_ancestors=("a" * 40,),
+    )
+    predecessor = (
+        predecessor_intent["kit_id"],
+        predecessor_intent["controller_sha"],
+        publisher_intent_sha256,
+    )
+    child = os.fork()
+    if child == 0:
+        def kill_at(event: str) -> None:
+            if event == boundary:
+                os.kill(os.getpid(), 9)
+
+        try:
+            install(
+                incoming,
+                state,
+                [],
+                predecessor=predecessor,
+                fault=kill_at,
+            )
+        except BaseException:
+            os._exit(92)
+        os._exit(91)
+    _, status = os.waitpid(child, 0)
+    assert os.WIFSIGNALED(status)
+    assert os.WTERMSIG(status) == 9
+    assert (
+        install(
+            incoming,
+            state,
+            [],
+            predecessor=predecessor,
+        )
+        == "installed"
+    )
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    (
+        "missing-required-ancestor",
+        "wrong-controller",
+        "wrong-publisher-intent",
+        "predecessor-used",
+        "rollback",
+    ),
+)
+def test_successor_rejects_unbound_or_non_pre_publisher_predecessor(
+    secure_tmp_path: Path,
+    monkeypatch,
+    tamper: str,
+) -> None:
+    incoming, state, calls = fixture(secure_tmp_path)
+    predecessor_intent = prepare_pre_publisher_source_state(
+        incoming,
+        state,
+        calls,
+    )
+    publisher_intent_sha256 = "7" * 64
+    monkeypatch.setattr(
+        KIT,
+        "validate_fixed_predecessor_publisher_state",
+        lambda **_kwargs: publisher_intent_sha256,
+    )
+    ancestors = (
+        ("0" * 40,)
+        if tamper == "missing-required-ancestor"
+        else ("a" * 40,)
+    )
+    replace_signed_release(
+        incoming,
+        api_sha="e" * 40,
+        required_ancestors=ancestors,
+    )
+    predecessor = [
+        predecessor_intent["kit_id"],
+        predecessor_intent["controller_sha"],
+        publisher_intent_sha256,
+    ]
+    if tamper == "wrong-controller":
+        predecessor[1] = "9" * 40
+    elif tamper == "wrong-publisher-intent":
+        predecessor[2] = "9" * 64
+    elif tamper == "predecessor-used":
+        (state / KIT.USED_NAME).write_bytes(
+            KIT.marker_payload(
+                kit_id=predecessor_intent["kit_id"],
+                phase="used",
+                old_digest=predecessor_intent[
+                    "old_source_tree_sha256"
+                ],
+                new_digest=predecessor_intent[
+                    "new_source_tree_sha256"
+                ],
+            )
+        )
+        (state / KIT.USED_NAME).chmod(0o444)
+    elif tamper == "rollback":
+        previous = state / (
+            KIT.PREVIOUS_PREFIX + predecessor_intent["kit_id"]
+        )
+        previous.chmod(0o755)
+        old = previous / "old.txt"
+        old.chmod(0o644)
+        old.write_bytes(b"tampered rollback\n")
+        old.chmod(0o444)
+        previous.chmod(0o555)
+    with pytest.raises(KIT.BootstrapSourceError):
+        install(
+            incoming,
+            state,
+            calls,
+            predecessor=tuple(predecessor),
+        )
+    assert not (state / KIT.SUPERSEDE_NAME).exists()
+    assert (state / KIT.INTENT_NAME).is_file()
+
+
+@pytest.mark.parametrize(
+    "publisher_state",
+    ("used", "previous", "exchanged", "partial"),
+)
+def test_successor_prevalidates_exact_publisher_state_before_source_mutation(
+    secure_tmp_path: Path,
+    monkeypatch,
+    publisher_state: str,
+) -> None:
+    incoming, state, calls = fixture(secure_tmp_path)
+    predecessor_intent = prepare_pre_publisher_source_state(
+        incoming,
+        state,
+        calls,
+    )
+    control, publisher_intent_sha256 = prepare_fixed_publisher_state(
+        secure_tmp_path / "publisher"
+    )
+    monkeypatch.setattr(KIT, "CONTROL_ROOT", control)
+    staging = control / ".staging"
+    intent = json.loads(
+        (staging / KIT.PUBLISHER_INTENT_NAME).read_text()
+    )
+    if publisher_state == "used":
+        used = dict(intent)
+        used["phase"] = "used"
+        path = staging / KIT.PUBLISHER_USED_NAME
+        path.write_bytes(canonical(used))
+        path.chmod(0o400)
+    elif publisher_state == "previous":
+        previous = staging / intent["previous_name"]
+        previous.mkdir(mode=0o555)
+    elif publisher_state == "exchanged":
+        temporary = staging / "test.exchange"
+        final = control / "bootstrap"
+        candidate = staging / KIT.PUBLISHER_CANDIDATE_NAME
+        final.chmod(0o755)
+        candidate.chmod(0o755)
+        final.rename(temporary)
+        candidate.rename(final)
+        temporary.rename(candidate)
+        final.chmod(0o555)
+        candidate.chmod(0o555)
+    else:
+        partial = staging / f"{KIT.PUBLISHER_USED_NAME}.installing"
+        partial.write_bytes(b"partial\n")
+        partial.chmod(0o400)
+    replace_signed_release(
+        incoming,
+        api_sha="e" * 40,
+        required_ancestors=("a" * 40,),
+    )
+    predecessor = (
+        predecessor_intent["kit_id"],
+        predecessor_intent["controller_sha"],
+        publisher_intent_sha256,
+    )
+    with pytest.raises(KIT.BootstrapSourceError):
+        install(
+            incoming,
+            state,
+            calls,
+            predecessor=predecessor,
+        )
+    assert (
+        state / KIT.SOURCE_NAME / "RELEASE_SHA"
+    ).read_text() == "a" * 40 + "\n"
+    assert not (state / KIT.SUPERSEDE_NAME).exists()
+    assert (state / KIT.INTENT_NAME).is_file()
+
+
+def test_successor_revalidates_publisher_after_supersede_crash_before_archive(
+    secure_tmp_path: Path,
+    monkeypatch,
+) -> None:
+    incoming, state, calls = fixture(secure_tmp_path)
+    predecessor_intent = prepare_pre_publisher_source_state(
+        incoming,
+        state,
+        calls,
+    )
+    control, publisher_intent_sha256 = prepare_fixed_publisher_state(
+        secure_tmp_path / "publisher"
+    )
+    monkeypatch.setattr(KIT, "CONTROL_ROOT", control)
+    replace_signed_release(
+        incoming,
+        api_sha="e" * 40,
+        required_ancestors=("a" * 40,),
+    )
+    predecessor = (
+        predecessor_intent["kit_id"],
+        predecessor_intent["controller_sha"],
+        publisher_intent_sha256,
+    )
+
+    def stop_after_supersede(event: str) -> None:
+        if event == "after_source_supersede":
+            raise RuntimeError("stop after source supersede")
+
+    with pytest.raises(RuntimeError, match="stop after source"):
+        install(
+            incoming,
+            state,
+            calls,
+            predecessor=predecessor,
+            fault=stop_after_supersede,
+        )
+    publisher_intent = json.loads(
+        (
+            control / ".staging" / KIT.PUBLISHER_INTENT_NAME
+        ).read_text()
+    )
+    publisher_used = dict(publisher_intent)
+    publisher_used["phase"] = "used"
+    used_path = control / ".staging" / KIT.PUBLISHER_USED_NAME
+    used_path.write_bytes(canonical(publisher_used))
+    used_path.chmod(0o400)
+    with pytest.raises(KIT.BootstrapSourceError):
+        install(
+            incoming,
+            state,
+            calls,
+            predecessor=predecessor,
+        )
+    assert (
+        state / KIT.SOURCE_NAME / "RELEASE_SHA"
+    ).read_text() == "a" * 40 + "\n"
+    assert (state / KIT.INTENT_NAME).is_file()
+    assert not (
+        state
+        / (
+            "bootstrap-source-kit.intent.superseded."
+            f"{predecessor[0]}.json"
+        )
+    ).exists()
 
 
 @pytest.mark.parametrize("immutable_complete", [False, True])
@@ -890,6 +1450,27 @@ def test_cli_requires_fd_and_all_external_bindings() -> None:
     )
 
     assert parsed.helper_fd == 0
+    successor = KIT.parse_cli(
+        [
+            "--helper-fd",
+            "0",
+            "--expected-helper-sha256",
+            "1" * 64,
+            "--expected-attestation-sha256",
+            "2" * 64,
+            "--expected-carrier-sha",
+            "3" * 40,
+            "--expected-controller-sha",
+            "4" * 40,
+            "--expected-predecessor-kit-id",
+            "5" * 64,
+            "--expected-predecessor-controller-sha",
+            "6" * 40,
+            "--expected-predecessor-publisher-intent-sha256",
+            "7" * 64,
+        ]
+    )
+    assert successor.expected_predecessor_kit_id == "5" * 64
     with pytest.raises(KIT.BootstrapSourceError, match="CLI"):
         KIT.parse_cli(
             [
@@ -931,6 +1512,23 @@ def test_cli_requires_fd_and_all_external_bindings() -> None:
                 "3" * 40,
                 "--expected-controller-sha",
                 "4" * 40,
+            ]
+        )
+    with pytest.raises(KIT.BootstrapSourceError, match="exatamente"):
+        KIT.parse_cli(
+            [
+                "--helper-fd",
+                "0",
+                "--expected-helper-sha256",
+                "1" * 64,
+                "--expected-attestation-sha256",
+                "2" * 64,
+                "--expected-carrier-sha",
+                "3" * 40,
+                "--expected-controller-sha",
+                "4" * 40,
+                "--expected-predecessor-kit-id",
+                "5" * 64,
             ]
         )
 
@@ -979,6 +1577,12 @@ def test_readme_verifies_same_helper_fd_before_lock_wrapper() -> None:
         "--expected-controller-sha",
     ):
         assert option in text[wrapper:]
+    for option in (
+        "--expected-predecessor-kit-id",
+        "--expected-predecessor-controller-sha",
+        "--expected-predecessor-publisher-intent-sha256",
+    ):
+        assert option in text
     assert (
         "/usr/bin/python3.12 -I -B \\\n"
         "  /var/lib/tratto-control/incoming/"
