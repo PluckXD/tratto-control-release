@@ -77,6 +77,9 @@ POST_PUBLISHER_SUPERSEDE_CONTRACT = (
     "tratto-control-bootstrap-post-publisher-supersede-v1"
 )
 POST_PUBLISHER_ARCHIVE_PREFIX = ".bootstrap-post-publisher."
+NESTED_POST_PUBLISHER_ARCHIVE_PREFIX = (
+    ".bootstrap-post-publisher.nested-"
+)
 BOOTSTRAP_RELEASE_MARKER = Path(
     "/etc/tratto-control/bootstrap-release.env"
 )
@@ -2470,6 +2473,18 @@ class PublisherUpgradeTransaction:
 
 
 @dataclass(frozen=True)
+class NestedSupersedeHistory:
+    source_predecessor: SupersededSourceTransaction
+    source_supersede_raw: bytes
+    publisher_supersede_raw: bytes
+    publisher_predecessor_intent_raw: bytes
+    publisher_predecessor_new_digest: str
+    publisher_retained_intent_name: str
+    publisher_retained_candidate_name: str
+    archive_statuses: tuple[bool, ...]
+
+
+@dataclass(frozen=True)
 class PostPublisherRecovery:
     predecessor: SupersededSourceTransaction
     source_intent_sha256: str
@@ -2481,6 +2496,9 @@ class PostPublisherRecovery:
     publisher_previous_name: str
     successor_kit_id: str
     successor_new_digest: str
+    nested_source_supersede_sha256: str | None = None
+    nested_publisher_supersede_sha256: str | None = None
+    nested_history: NestedSupersedeHistory | None = None
 
 
 def post_publisher_archive_name(kind: str, kit_id: str) -> str:
@@ -2489,6 +2507,35 @@ def post_publisher_archive_name(kind: str, kit_id: str) -> str:
         reject("tipo de arquivo post-publisher inválido")
     suffix = ".json" if kind in {"intent", "used"} else ""
     return f"{POST_PUBLISHER_ARCHIVE_PREFIX}{kind}.{kit_id}{suffix}"
+
+
+def nested_source_archive_name(kind: str, kit_id: str) -> str:
+    require_hash(kit_id, "kit ID do histórico source aninhado")
+    if kind not in {
+        "supersede",
+        "intent",
+        "prepared",
+        "exchanged",
+        "retained",
+        "previous",
+    }:
+        reject("tipo de histórico source aninhado inválido")
+    suffix = "" if kind == "previous" else ".json"
+    return (
+        f"{NESTED_POST_PUBLISHER_ARCHIVE_PREFIX}"
+        f"source-{kind}.{kit_id}{suffix}"
+    )
+
+
+def nested_publisher_archive_name(kind: str, kit_id: str) -> str:
+    require_hash(kit_id, "kit ID do histórico publisher aninhado")
+    if kind not in {"supersede", "intent", "candidate"}:
+        reject("tipo de histórico publisher aninhado inválido")
+    suffix = "" if kind == "candidate" else ".json"
+    return (
+        f"{NESTED_POST_PUBLISHER_ARCHIVE_PREFIX}"
+        f"publisher-{kind}.{kit_id}{suffix}"
+    )
 
 
 def read_publisher_record_if_present(
@@ -2520,6 +2567,41 @@ def read_publisher_record_if_present(
             descriptor,
             info,
             maximum=1024,
+            label=name,
+        )
+    finally:
+        os.close(descriptor)
+
+
+def read_publisher_history_record_if_present(
+    parent: int,
+    name: str,
+    *,
+    uid: int,
+    gid: int,
+) -> bytes | None:
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=parent,
+        )
+    except FileNotFoundError:
+        return None
+    try:
+        info = os.fstat(descriptor)
+        validate_regular(
+            info,
+            name,
+            uid=uid,
+            gid=gid,
+            modes={0o400},
+            maximum=4096,
+        )
+        return read_all(
+            descriptor,
+            info,
+            maximum=4096,
             label=name,
         )
     finally:
@@ -2590,51 +2672,587 @@ def validate_publisher_upgrade_transaction(
     )
 
 
+def validate_publisher_supersede_history(
+    raw: bytes,
+) -> dict[str, Any]:
+    value = parse_canonical_json(
+        raw,
+        "publisher supersede aninhado",
+    )
+    keys = {
+        "contract",
+        "phase",
+        "predecessor_intent_sha256",
+        "predecessor_new_tree_sha256",
+        "predecessor_old_tree_sha256",
+        "predecessor_previous_name",
+        "retained_candidate_name",
+        "retained_intent_name",
+        "schema_version",
+        "source_predecessor_kit_id",
+        "source_predecessor_tree_sha256",
+        "source_successor_kit_id",
+        "source_successor_tree_sha256",
+        "successor_new_tree_sha256",
+    }
+    exact_object(value, keys, "publisher supersede aninhado")
+    if (
+        value["contract"] != PUBLISHER_SUPERSEDE_CONTRACT
+        or value["phase"] != "superseded"
+        or type(value["schema_version"]) is not int
+        or value["schema_version"] != 1
+    ):
+        reject("publisher supersede aninhado diverge do contrato")
+    digest_keys = keys - {
+        "contract",
+        "phase",
+        "predecessor_previous_name",
+        "retained_candidate_name",
+        "retained_intent_name",
+        "schema_version",
+    }
+    for key in digest_keys:
+        require_hash(value[key], key)
+    predecessor_old = str(value["predecessor_old_tree_sha256"])
+    predecessor_new = str(value["predecessor_new_tree_sha256"])
+    predecessor_intent = str(value["predecessor_intent_sha256"])
+    if (
+        value["predecessor_previous_name"]
+        != PUBLISHER_PREVIOUS_PREFIX + predecessor_old[:32]
+        or value["retained_intent_name"]
+        != (
+            "bootstrap-upgrade.intent.superseded."
+            f"{predecessor_intent}.json"
+        )
+        or value["retained_candidate_name"]
+        != (
+            "bootstrap.upgrading.superseded."
+            f"{predecessor_new}"
+        )
+        or value["source_predecessor_kit_id"]
+        == value["source_successor_kit_id"]
+        or value["source_predecessor_tree_sha256"]
+        == value["source_successor_tree_sha256"]
+        or predecessor_new == value["successor_new_tree_sha256"]
+    ):
+        reject("publisher supersede aninhado não é sucessão exata")
+    return value
+
+
+def _nested_record(
+    parent: int,
+    *,
+    active_name: str,
+    archived_name: str,
+    expected: bytes,
+    publisher: bool,
+    uid: int,
+    gid: int,
+) -> tuple[bool, set[str]]:
+    reader = (
+        read_publisher_history_record_if_present
+        if publisher
+        else read_record_if_present
+    )
+    active = reader(parent, active_name, uid=uid, gid=gid)
+    archived = reader(parent, archived_name, uid=uid, gid=gid)
+    if archived is not None:
+        if archived != expected:
+            reject(f"histórico aninhado diverge: {archived_name}")
+        if active is not None:
+            reject(f"histórico aninhado coexiste: {active_name}")
+        return True, {archived_name}
+    if active != expected:
+        reject(f"histórico aninhado está ausente: {active_name}")
+    return False, {active_name}
+
+
+def _nested_tree(
+    parent: int,
+    *,
+    active_name: str,
+    archived_name: str,
+    expected_digest: str,
+    publisher: bool,
+    uid: int,
+    gid: int,
+) -> tuple[bool, set[str]]:
+    modes = {0o555}
+    active = _open_named_directory(
+        parent,
+        active_name,
+        uid=uid,
+        gid=gid,
+        modes=modes,
+    )
+    archived = _open_named_directory(
+        parent,
+        archived_name,
+        uid=uid,
+        gid=gid,
+        modes=modes,
+    )
+
+    def observed_digest(descriptor: int) -> str:
+        if publisher:
+            return protected_bootstrap_tree_digest(
+                descriptor,
+                uid=uid,
+                gid=gid,
+            )
+        return tree_digest(scan_tree(descriptor, uid=uid, gid=gid))
+
+    try:
+        if archived is not None:
+            if observed_digest(archived) != expected_digest:
+                reject(f"histórico aninhado diverge: {archived_name}")
+            if active is not None:
+                reject(f"histórico aninhado coexiste: {active_name}")
+            return True, {archived_name}
+        if active is None or observed_digest(active) != expected_digest:
+            reject(f"histórico aninhado está ausente: {active_name}")
+        return False, {active_name}
+    finally:
+        if active is not None:
+            os.close(active)
+        if archived is not None:
+            os.close(archived)
+
+
+def validate_nested_supersede_history(
+    state_descriptor: int,
+    staging: int,
+    *,
+    current_source: SupersededSourceTransaction,
+    current_publisher: PublisherUpgradeTransaction,
+    expected_source_supersede_sha256: str | None,
+    expected_publisher_supersede_sha256: str | None,
+    uid: int,
+    gid: int,
+) -> tuple[
+    NestedSupersedeHistory | None,
+    set[str],
+    set[str],
+]:
+    if (
+        expected_source_supersede_sha256 is None
+    ) != (expected_publisher_supersede_sha256 is None):
+        reject("bindings do histórico aninhado estão incompletos")
+    source_archive = nested_source_archive_name(
+        "supersede",
+        current_source.kit_id,
+    )
+    active_source_raw = read_record_if_present(
+        state_descriptor,
+        SUPERSEDE_NAME,
+        uid=uid,
+        gid=gid,
+    )
+    archived_source_raw = read_record_if_present(
+        state_descriptor,
+        source_archive,
+        uid=uid,
+        gid=gid,
+    )
+    source_archived = False
+    if expected_source_supersede_sha256 is None:
+        if active_source_raw is None:
+            if archived_source_raw is not None:
+                reject("histórico source aninhado existe sem recovery")
+            for name in os.listdir(state_descriptor):
+                if name.startswith(NESTED_POST_PUBLISHER_ARCHIVE_PREFIX):
+                    reject("arquivo source aninhado existe sem recovery")
+            return None, set(), set()
+        if archived_source_raw is not None:
+            reject("histórico source aninhado parcial existe sem recovery")
+        source_supersede_raw = active_source_raw
+    else:
+        require_hash(
+            expected_source_supersede_sha256,
+            "hash source supersede aninhado",
+        )
+        if (
+            archived_source_raw is not None
+            and hashlib.sha256(archived_source_raw).hexdigest()
+            == expected_source_supersede_sha256
+        ):
+            source_supersede_raw = archived_source_raw
+            source_archived = True
+            if (
+                active_source_raw is not None
+                and hashlib.sha256(active_source_raw).hexdigest()
+                == expected_source_supersede_sha256
+            ):
+                reject("source supersede aninhado coexiste com arquivo")
+        elif (
+            archived_source_raw is None
+            and active_source_raw is not None
+            and hashlib.sha256(active_source_raw).hexdigest()
+            == expected_source_supersede_sha256
+        ):
+            source_supersede_raw = active_source_raw
+        else:
+            reject("source supersede aninhado não está recuperável")
+    source_predecessor = validate_source_supersede(
+        source_supersede_raw,
+        successor_kit_id=current_source.kit_id,
+        successor_new_digest=current_source.new_digest,
+    )
+    source_value = parse_canonical_json(
+        source_supersede_raw,
+        "source supersede aninhado",
+    )
+    source_allowed = {
+        source_archive if source_archived else SUPERSEDE_NAME
+    }
+    source_statuses = [source_archived]
+    source_intent_name = source_predecessor.archived_name("intent")
+    nested_intent_name = nested_source_archive_name(
+        "intent",
+        current_source.kit_id,
+    )
+    source_intent_active = read_record_if_present(
+        state_descriptor,
+        source_intent_name,
+        uid=uid,
+        gid=gid,
+    )
+    source_intent_archived = read_record_if_present(
+        state_descriptor,
+        nested_intent_name,
+        uid=uid,
+        gid=gid,
+    )
+    source_intent_raw = (
+        source_intent_archived
+        if source_intent_archived is not None
+        else source_intent_active
+    )
+    if (
+        source_intent_raw is None
+        or hashlib.sha256(source_intent_raw).hexdigest()
+        != source_value["predecessor_intent_sha256"]
+    ):
+        reject("intent source aninhado diverge do supersede")
+    parsed_source_predecessor = validate_source_intent(
+        source_intent_raw
+    )
+    if (
+        parsed_source_predecessor.kit_id
+        != source_predecessor.kit_id
+        or parsed_source_predecessor.api_sha
+        != source_predecessor.api_sha
+        or parsed_source_predecessor.controller_sha
+        != source_predecessor.controller_sha
+        or parsed_source_predecessor.old_digest
+        != source_predecessor.old_digest
+        or parsed_source_predecessor.new_digest
+        != source_predecessor.new_digest
+    ):
+        reject("intent source aninhado mudou de identidade")
+    if current_source.old_digest != source_predecessor.new_digest:
+        reject("source supersede aninhado não encadeia o sucessor")
+    source_predecessor = SupersededSourceTransaction(
+        kit_id=parsed_source_predecessor.kit_id,
+        api_sha=parsed_source_predecessor.api_sha,
+        controller_sha=parsed_source_predecessor.controller_sha,
+        old_digest=parsed_source_predecessor.old_digest,
+        new_digest=parsed_source_predecessor.new_digest,
+        intent_raw=source_intent_raw,
+        publisher_intent_sha256=(
+            source_predecessor.publisher_intent_sha256
+        ),
+    )
+    for phase in ("intent", "prepared", "exchanged", "retained"):
+        archived, allowed = _nested_record(
+            state_descriptor,
+            active_name=source_predecessor.archived_name(phase),
+            archived_name=nested_source_archive_name(
+                phase,
+                current_source.kit_id,
+            ),
+            expected=_expected_source_phase(
+                source_predecessor,
+                phase,
+            ),
+            publisher=False,
+            uid=uid,
+            gid=gid,
+        )
+        source_statuses.append(archived)
+        source_allowed.update(allowed)
+    previous_archived, previous_allowed = _nested_tree(
+        state_descriptor,
+        active_name=(
+            f"{PREVIOUS_PREFIX}{source_predecessor.kit_id}"
+        ),
+        archived_name=nested_source_archive_name(
+            "previous",
+            current_source.kit_id,
+        ),
+        expected_digest=source_predecessor.old_digest,
+        publisher=False,
+        uid=uid,
+        gid=gid,
+    )
+    source_statuses.append(previous_archived)
+    source_allowed.update(previous_allowed)
+
+    publisher_archive = nested_publisher_archive_name(
+        "supersede",
+        current_source.kit_id,
+    )
+    active_publisher_raw = read_publisher_history_record_if_present(
+        staging,
+        PUBLISHER_SUPERSEDE_NAME,
+        uid=uid,
+        gid=gid,
+    )
+    archived_publisher_raw = read_publisher_history_record_if_present(
+        staging,
+        publisher_archive,
+        uid=uid,
+        gid=gid,
+    )
+    publisher_archived = False
+    if expected_publisher_supersede_sha256 is None:
+        if (
+            active_publisher_raw is None
+            or archived_publisher_raw is not None
+        ):
+            reject("publisher supersede aninhado não está íntegro")
+        publisher_supersede_raw = active_publisher_raw
+    else:
+        require_hash(
+            expected_publisher_supersede_sha256,
+            "hash publisher supersede aninhado",
+        )
+        if (
+            archived_publisher_raw is not None
+            and hashlib.sha256(archived_publisher_raw).hexdigest()
+            == expected_publisher_supersede_sha256
+        ):
+            publisher_supersede_raw = archived_publisher_raw
+            publisher_archived = True
+            if (
+                active_publisher_raw is not None
+                and hashlib.sha256(active_publisher_raw).hexdigest()
+                == expected_publisher_supersede_sha256
+            ):
+                reject(
+                    "publisher supersede aninhado coexiste com arquivo"
+                )
+        elif (
+            archived_publisher_raw is None
+            and active_publisher_raw is not None
+            and hashlib.sha256(active_publisher_raw).hexdigest()
+            == expected_publisher_supersede_sha256
+        ):
+            publisher_supersede_raw = active_publisher_raw
+        else:
+            reject("publisher supersede aninhado não está recuperável")
+    publisher_value = validate_publisher_supersede_history(
+        publisher_supersede_raw
+    )
+    if (
+        publisher_value["predecessor_intent_sha256"]
+        != source_predecessor.publisher_intent_sha256
+        or publisher_value["source_predecessor_kit_id"]
+        != source_predecessor.kit_id
+        or publisher_value["source_predecessor_tree_sha256"]
+        != source_predecessor.new_digest
+        or publisher_value["source_successor_kit_id"]
+        != current_source.kit_id
+        or publisher_value["source_successor_tree_sha256"]
+        != current_source.new_digest
+        or publisher_value["predecessor_old_tree_sha256"]
+        != current_publisher.old_digest
+        or publisher_value["successor_new_tree_sha256"]
+        != current_publisher.new_digest
+        or publisher_value["predecessor_previous_name"]
+        != current_publisher.previous_name
+    ):
+        reject("publisher supersede aninhado diverge da cadeia source")
+    publisher_allowed = {
+        (
+            publisher_archive
+            if publisher_archived
+            else PUBLISHER_SUPERSEDE_NAME
+        )
+    }
+    publisher_statuses = [publisher_archived]
+    publisher_intent_name = str(
+        publisher_value["retained_intent_name"]
+    )
+    publisher_intent_archive = nested_publisher_archive_name(
+        "intent",
+        current_source.kit_id,
+    )
+    active_publisher_intent = read_publisher_record_if_present(
+        staging,
+        publisher_intent_name,
+        uid=uid,
+        gid=gid,
+    )
+    archived_publisher_intent = read_publisher_record_if_present(
+        staging,
+        publisher_intent_archive,
+        uid=uid,
+        gid=gid,
+    )
+    predecessor_publisher_intent_raw = (
+        archived_publisher_intent
+        if archived_publisher_intent is not None
+        else active_publisher_intent
+    )
+    if (
+        predecessor_publisher_intent_raw is None
+        or hashlib.sha256(
+            predecessor_publisher_intent_raw
+        ).hexdigest()
+        != publisher_value["predecessor_intent_sha256"]
+    ):
+        reject("intent publisher aninhado diverge do supersede")
+    parsed_publisher_intent = validate_publisher_upgrade_record(
+        predecessor_publisher_intent_raw,
+        phase="intent",
+        label="intent publisher aninhado",
+    )
+    if (
+        parsed_publisher_intent["old_tree_sha256"]
+        != publisher_value["predecessor_old_tree_sha256"]
+        or parsed_publisher_intent["new_tree_sha256"]
+        != publisher_value["predecessor_new_tree_sha256"]
+        or parsed_publisher_intent["previous_name"]
+        != publisher_value["predecessor_previous_name"]
+    ):
+        reject("intent publisher aninhado mudou de contrato")
+    intent_archived, intent_allowed = _nested_record(
+        staging,
+        active_name=publisher_intent_name,
+        archived_name=publisher_intent_archive,
+        expected=predecessor_publisher_intent_raw,
+        publisher=True,
+        uid=uid,
+        gid=gid,
+    )
+    candidate_archived, candidate_allowed = _nested_tree(
+        staging,
+        active_name=str(
+            publisher_value["retained_candidate_name"]
+        ),
+        archived_name=nested_publisher_archive_name(
+            "candidate",
+            current_source.kit_id,
+        ),
+        expected_digest=str(
+            publisher_value["predecessor_new_tree_sha256"]
+        ),
+        publisher=True,
+        uid=uid,
+        gid=gid,
+    )
+    publisher_statuses.extend(
+        (candidate_archived, intent_archived)
+    )
+    publisher_allowed.update(candidate_allowed)
+    publisher_allowed.update(intent_allowed)
+
+    statuses = tuple(source_statuses + publisher_statuses)
+    archived_count = sum(statuses)
+    if statuses != (True,) * archived_count + (False,) * (
+        len(statuses) - archived_count
+    ):
+        reject("histórico aninhado não forma prefixo transacional")
+    for parent, allowed in (
+        (state_descriptor, source_allowed),
+        (staging, publisher_allowed),
+    ):
+        for name in os.listdir(parent):
+            if (
+                name.startswith(
+                    NESTED_POST_PUBLISHER_ARCHIVE_PREFIX
+                )
+                and name not in allowed
+            ):
+                reject("namespace do histórico aninhado não é exato")
+    history = NestedSupersedeHistory(
+        source_predecessor=source_predecessor,
+        source_supersede_raw=source_supersede_raw,
+        publisher_supersede_raw=publisher_supersede_raw,
+        publisher_predecessor_intent_raw=(
+            predecessor_publisher_intent_raw
+        ),
+        publisher_predecessor_new_digest=str(
+            publisher_value["predecessor_new_tree_sha256"]
+        ),
+        publisher_retained_intent_name=publisher_intent_name,
+        publisher_retained_candidate_name=str(
+            publisher_value["retained_candidate_name"]
+        ),
+        archive_statuses=statuses,
+    )
+    return history, source_allowed, publisher_allowed
+
+
 def post_publisher_supersede_payload(
     recovery: PostPublisherRecovery,
 ) -> bytes:
     predecessor = recovery.predecessor
-    return canonical_bytes(
-        {
-            "contract": POST_PUBLISHER_SUPERSEDE_CONTRACT,
-            "phase": "post-publisher-supersede",
-            "predecessor_api_sha": predecessor.api_sha,
-            "predecessor_controller_sha": predecessor.controller_sha,
-            "predecessor_intent_sha256": (
-                recovery.source_intent_sha256
-            ),
-            "predecessor_kit_id": predecessor.kit_id,
-            "predecessor_new_source_tree_sha256": (
-                predecessor.new_digest
-            ),
-            "predecessor_old_source_tree_sha256": (
-                predecessor.old_digest
-            ),
-            "predecessor_publisher_intent_sha256": (
-                recovery.publisher_intent_sha256
-            ),
-            "predecessor_publisher_new_tree_sha256": (
-                recovery.publisher_new_digest
-            ),
-            "predecessor_publisher_old_tree_sha256": (
-                recovery.publisher_old_digest
-            ),
-            "predecessor_publisher_previous_name": (
-                recovery.publisher_previous_name
-            ),
-            "predecessor_publisher_used_sha256": (
-                recovery.publisher_used_sha256
-            ),
-            "predecessor_source_used_sha256": (
-                recovery.source_used_sha256
-            ),
-            "schema_version": 1,
-            "successor_kit_id": recovery.successor_kit_id,
-            "successor_new_source_tree_sha256": (
-                recovery.successor_new_digest
-            ),
-        }
+    value: dict[str, Any] = {
+        "contract": POST_PUBLISHER_SUPERSEDE_CONTRACT,
+        "phase": "post-publisher-supersede",
+        "predecessor_api_sha": predecessor.api_sha,
+        "predecessor_controller_sha": predecessor.controller_sha,
+        "predecessor_intent_sha256": (
+            recovery.source_intent_sha256
+        ),
+        "predecessor_kit_id": predecessor.kit_id,
+        "predecessor_new_source_tree_sha256": (
+            predecessor.new_digest
+        ),
+        "predecessor_old_source_tree_sha256": (
+            predecessor.old_digest
+        ),
+        "predecessor_publisher_intent_sha256": (
+            recovery.publisher_intent_sha256
+        ),
+        "predecessor_publisher_new_tree_sha256": (
+            recovery.publisher_new_digest
+        ),
+        "predecessor_publisher_old_tree_sha256": (
+            recovery.publisher_old_digest
+        ),
+        "predecessor_publisher_previous_name": (
+            recovery.publisher_previous_name
+        ),
+        "predecessor_publisher_used_sha256": (
+            recovery.publisher_used_sha256
+        ),
+        "predecessor_source_used_sha256": (
+            recovery.source_used_sha256
+        ),
+        "schema_version": 1,
+        "successor_kit_id": recovery.successor_kit_id,
+        "successor_new_source_tree_sha256": (
+            recovery.successor_new_digest
+        ),
+    }
+    nested_hashes = (
+        recovery.nested_source_supersede_sha256,
+        recovery.nested_publisher_supersede_sha256,
     )
+    if any(item is not None for item in nested_hashes):
+        if not all(item is not None for item in nested_hashes):
+            reject("bindings do histórico aninhado estão incompletos")
+        value["schema_version"] = 2
+        value["nested_source_supersede_sha256"] = (
+            recovery.nested_source_supersede_sha256
+        )
+        value["nested_publisher_supersede_sha256"] = (
+            recovery.nested_publisher_supersede_sha256
+        )
+    return canonical_bytes(value)
 
 
 def validate_post_publisher_supersede(
@@ -2647,33 +3265,45 @@ def validate_post_publisher_supersede(
         raw,
         "bootstrap source post-publisher supersede",
     )
+    base_keys = {
+        "contract",
+        "phase",
+        "predecessor_api_sha",
+        "predecessor_controller_sha",
+        "predecessor_intent_sha256",
+        "predecessor_kit_id",
+        "predecessor_new_source_tree_sha256",
+        "predecessor_old_source_tree_sha256",
+        "predecessor_publisher_intent_sha256",
+        "predecessor_publisher_new_tree_sha256",
+        "predecessor_publisher_old_tree_sha256",
+        "predecessor_publisher_previous_name",
+        "predecessor_publisher_used_sha256",
+        "predecessor_source_used_sha256",
+        "schema_version",
+        "successor_kit_id",
+        "successor_new_source_tree_sha256",
+    }
+    schema_version = value.get("schema_version")
+    if type(schema_version) is not int:
+        reject("post-publisher supersede possui schema inválido")
+    if schema_version == 1:
+        expected_keys = base_keys
+    elif schema_version == 2:
+        expected_keys = base_keys | {
+            "nested_source_supersede_sha256",
+            "nested_publisher_supersede_sha256",
+        }
+    else:
+        reject("post-publisher supersede possui schema inválido")
     exact_object(
         value,
-        {
-            "contract",
-            "phase",
-            "predecessor_api_sha",
-            "predecessor_controller_sha",
-            "predecessor_intent_sha256",
-            "predecessor_kit_id",
-            "predecessor_new_source_tree_sha256",
-            "predecessor_old_source_tree_sha256",
-            "predecessor_publisher_intent_sha256",
-            "predecessor_publisher_new_tree_sha256",
-            "predecessor_publisher_old_tree_sha256",
-            "predecessor_publisher_previous_name",
-            "predecessor_publisher_used_sha256",
-            "predecessor_source_used_sha256",
-            "schema_version",
-            "successor_kit_id",
-            "successor_new_source_tree_sha256",
-        },
+        expected_keys,
         "bootstrap source post-publisher supersede",
     )
     if (
         value["contract"] != POST_PUBLISHER_SUPERSEDE_CONTRACT
         or value["phase"] != "post-publisher-supersede"
-        or value["schema_version"] != 1
         or value["successor_kit_id"] != successor_kit_id
         or value["successor_new_source_tree_sha256"]
         != successor_new_digest
@@ -2740,6 +3370,22 @@ def validate_post_publisher_supersede(
         or predecessor.new_digest == successor_new_digest
     ):
         reject("post-publisher supersede não descreve sucessão distinta")
+    nested_source_supersede_sha256 = (
+        require_hash(
+            value["nested_source_supersede_sha256"],
+            "source supersede aninhado no recovery",
+        )
+        if schema_version == 2
+        else None
+    )
+    nested_publisher_supersede_sha256 = (
+        require_hash(
+            value["nested_publisher_supersede_sha256"],
+            "publisher supersede aninhado no recovery",
+        )
+        if schema_version == 2
+        else None
+    )
     return PostPublisherRecovery(
         predecessor=predecessor,
         source_intent_sha256=source_intent_sha256,
@@ -2751,6 +3397,12 @@ def validate_post_publisher_supersede(
         publisher_previous_name=publisher_previous_name,
         successor_kit_id=successor_kit_id,
         successor_new_digest=successor_new_digest,
+        nested_source_supersede_sha256=(
+            nested_source_supersede_sha256
+        ),
+        nested_publisher_supersede_sha256=(
+            nested_publisher_supersede_sha256
+        ),
     )
 
 
@@ -2821,12 +3473,19 @@ def validate_post_publisher_pre_stage(
 
 
 def validate_fixed_post_publisher_state(
+    state_descriptor: int,
     *,
+    current_source: SupersededSourceTransaction,
     expected_intent_sha256: str,
     expected_used_sha256: str,
     uid: int,
     gid: int,
-) -> PublisherUpgradeTransaction:
+) -> tuple[
+    PublisherUpgradeTransaction,
+    NestedSupersedeHistory | None,
+    set[str],
+    set[str],
+]:
     require_hash(
         expected_intent_sha256,
         "publisher intent post-publisher esperado",
@@ -2877,11 +3536,26 @@ def validate_fixed_post_publisher_state(
             != expected_used_sha256
         ):
             reject("publisher terminal diverge dos bindings externos")
+        (
+            nested_history,
+            nested_source_allowed,
+            nested_publisher_allowed,
+        ) = validate_nested_supersede_history(
+            state_descriptor,
+            staging,
+            current_source=current_source,
+            current_publisher=transaction,
+            expected_source_supersede_sha256=None,
+            expected_publisher_supersede_sha256=None,
+            uid=uid,
+            gid=gid,
+        )
         allowed = {
             PUBLISHER_INTENT_NAME,
             PUBLISHER_USED_NAME,
             transaction.previous_name,
         }
+        allowed.update(nested_publisher_allowed)
         if set(os.listdir(staging)) != allowed:
             reject("namespace terminal do publisher não é exato")
         previous = _open_named_directory(
@@ -2926,7 +3600,12 @@ def validate_fixed_post_publisher_state(
                 reject("bootstrap terminal diverge do publisher used")
         finally:
             os.close(final)
-        return transaction
+        return (
+            transaction,
+            nested_history,
+            nested_source_allowed,
+            nested_publisher_allowed,
+        )
     finally:
         if staging is not None:
             os.close(staging)
@@ -3002,16 +3681,14 @@ def build_initial_post_publisher_recovery(
             f"{successor_kit_id}.installing"
         ),
     }
-    for name in os.listdir(state_descriptor):
-        if not (
-            name.startswith("bootstrap-source-kit.")
-            or name.startswith(CANDIDATE_PREFIX)
-            or name.startswith(PREVIOUS_PREFIX)
-        ):
-            continue
-        if name not in allowed:
-            reject("namespace source terminal contém journal estrangeiro")
-    publisher = validate_fixed_post_publisher_state(
+    (
+        publisher,
+        nested_history,
+        nested_source_allowed,
+        _nested_publisher_allowed,
+    ) = validate_fixed_post_publisher_state(
+        state_descriptor,
+        current_source=predecessor,
         expected_intent_sha256=(
             expectations.post_publisher_publisher_intent_sha256
         ),
@@ -3021,6 +3698,19 @@ def build_initial_post_publisher_recovery(
         uid=uid,
         gid=gid,
     )
+    allowed.update(nested_source_allowed)
+    for name in os.listdir(state_descriptor):
+        if not (
+            name.startswith("bootstrap-source-kit.")
+            or name.startswith(CANDIDATE_PREFIX)
+            or name.startswith(PREVIOUS_PREFIX)
+            or name.startswith(
+                NESTED_POST_PUBLISHER_ARCHIVE_PREFIX
+            )
+        ):
+            continue
+        if name not in allowed:
+            reject("namespace source terminal contém journal estrangeiro")
     predecessor = SupersededSourceTransaction(
         kit_id=predecessor.kit_id,
         api_sha=predecessor.api_sha,
@@ -3048,6 +3738,21 @@ def build_initial_post_publisher_recovery(
         publisher_previous_name=publisher.previous_name,
         successor_kit_id=successor_kit_id,
         successor_new_digest=successor_new_digest,
+        nested_source_supersede_sha256=(
+            hashlib.sha256(
+                nested_history.source_supersede_raw
+            ).hexdigest()
+            if nested_history is not None
+            else None
+        ),
+        nested_publisher_supersede_sha256=(
+            hashlib.sha256(
+                nested_history.publisher_supersede_raw
+            ).hexdigest()
+            if nested_history is not None
+            else None
+        ),
+        nested_history=nested_history,
     )
     validate_post_publisher_pre_stage(
         state_descriptor,
@@ -3235,6 +3940,50 @@ def _post_publisher_recovery_from_record(
         publisher_intent_sha256=recovery.publisher_intent_sha256,
         publisher_authorization_required=False,
     )
+    nested_history: NestedSupersedeHistory | None = None
+    if recovery.nested_source_supersede_sha256 is not None:
+        publisher_intent_value = {
+            "new_tree_sha256": recovery.publisher_new_digest,
+            "old_tree_sha256": recovery.publisher_old_digest,
+            "phase": "intent",
+            "previous_name": recovery.publisher_previous_name,
+            "schema_version": 1,
+        }
+        publisher_used_value = dict(publisher_intent_value)
+        publisher_used_value["phase"] = "used"
+        current_publisher = PublisherUpgradeTransaction(
+            old_digest=recovery.publisher_old_digest,
+            new_digest=recovery.publisher_new_digest,
+            previous_name=recovery.publisher_previous_name,
+            intent_raw=canonical_bytes(publisher_intent_value),
+            used_raw=canonical_bytes(publisher_used_value),
+        )
+        control, staging = _open_post_publisher_staging(
+            uid=uid,
+            gid=gid,
+        )
+        try:
+            nested_history, _source_allowed, _publisher_allowed = (
+                validate_nested_supersede_history(
+                    state_descriptor,
+                    staging,
+                    current_source=predecessor,
+                    current_publisher=current_publisher,
+                    expected_source_supersede_sha256=(
+                        recovery.nested_source_supersede_sha256
+                    ),
+                    expected_publisher_supersede_sha256=(
+                        recovery.nested_publisher_supersede_sha256
+                    ),
+                    uid=uid,
+                    gid=gid,
+                )
+            )
+        finally:
+            os.close(staging)
+            os.close(control)
+        if nested_history is None:
+            reject("recovery exige histórico aninhado ausente")
     return PostPublisherRecovery(
         predecessor=predecessor,
         source_intent_sha256=recovery.source_intent_sha256,
@@ -3246,6 +3995,13 @@ def _post_publisher_recovery_from_record(
         publisher_previous_name=recovery.publisher_previous_name,
         successor_kit_id=recovery.successor_kit_id,
         successor_new_digest=recovery.successor_new_digest,
+        nested_source_supersede_sha256=(
+            recovery.nested_source_supersede_sha256
+        ),
+        nested_publisher_supersede_sha256=(
+            recovery.nested_publisher_supersede_sha256
+        ),
+        nested_history=nested_history,
     )
 
 
@@ -3779,6 +4535,55 @@ def validate_existing_post_publisher_recovery(
         gid=gid,
     )
     try:
+        nested_publisher_allowed: set[str] = set()
+        nested_history: NestedSupersedeHistory | None = None
+        if recovery.nested_source_supersede_sha256 is not None:
+            publisher_intent_value = {
+                "new_tree_sha256": recovery.publisher_new_digest,
+                "old_tree_sha256": recovery.publisher_old_digest,
+                "phase": "intent",
+                "previous_name": recovery.publisher_previous_name,
+                "schema_version": 1,
+            }
+            publisher_used_value = dict(publisher_intent_value)
+            publisher_used_value["phase"] = "used"
+            (
+                nested_history,
+                _nested_source_allowed,
+                nested_publisher_allowed,
+            ) = validate_nested_supersede_history(
+                state_descriptor,
+                staging,
+                current_source=recovery.predecessor,
+                current_publisher=PublisherUpgradeTransaction(
+                    old_digest=recovery.publisher_old_digest,
+                    new_digest=recovery.publisher_new_digest,
+                    previous_name=recovery.publisher_previous_name,
+                    intent_raw=canonical_bytes(
+                        publisher_intent_value
+                    ),
+                    used_raw=canonical_bytes(publisher_used_value),
+                ),
+                expected_source_supersede_sha256=(
+                    recovery.nested_source_supersede_sha256
+                ),
+                expected_publisher_supersede_sha256=(
+                    recovery.nested_publisher_supersede_sha256
+                ),
+                uid=uid,
+                gid=gid,
+            )
+            if nested_history is None:
+                reject("histórico aninhado sumiu durante recovery")
+        else:
+            for parent in (state_descriptor, staging):
+                if any(
+                    name.startswith(
+                        NESTED_POST_PUBLISHER_ARCHIVE_PREFIX
+                    )
+                    for name in os.listdir(parent)
+                ):
+                    reject("recovery sem binding contém histórico aninhado")
         publisher_archived = _publisher_archive_status(
             staging,
             recovery,
@@ -3795,6 +4600,18 @@ def validate_existing_post_publisher_recovery(
         ):
             reject("recovery post-publisher não forma prefixo transacional")
         all_archived = all(archive_steps)
+        nested_archive_started = (
+            nested_history is not None
+            and any(nested_history.archive_statuses)
+        )
+        nested_all_archived = (
+            nested_history is None
+            or all(nested_history.archive_statuses)
+        )
+        if nested_archive_started and not all_archived:
+            reject(
+                "histórico aninhado começou antes dos arquivos atuais"
+            )
 
         standard_raw = read_record_if_present(
             state_descriptor,
@@ -3802,6 +4619,14 @@ def validate_existing_post_publisher_recovery(
             uid=uid,
             gid=gid,
         )
+        nested_standard_occupies_name = (
+            standard_raw is not None
+            and recovery.nested_source_supersede_sha256 is not None
+            and hashlib.sha256(standard_raw).hexdigest()
+            == recovery.nested_source_supersede_sha256
+        )
+        if nested_standard_occupies_name:
+            standard_raw = None
         expected_standard = source_supersede_payload(
             recovery.predecessor,
             successor_kit_id=recovery.successor_kit_id,
@@ -3835,6 +4660,12 @@ def validate_existing_post_publisher_recovery(
                 standard_partial = True
         if (standard_raw is not None or standard_partial) and not all_archived:
             reject("source supersede começou antes dos arquivos predecessor")
+        if (
+            standard_raw is not None or standard_partial
+        ) and not nested_all_archived:
+            reject(
+                "source supersede começou antes do histórico aninhado"
+            )
         if standard_raw is None:
             _validate_post_recovery_source_before_supersede(
                 state_descriptor,
@@ -3887,6 +4718,7 @@ def validate_existing_post_publisher_recovery(
             )
             if archived
         }
+        allowed_staging.update(nested_publisher_allowed)
         for kind, active_name, archived in (
             ("used", PUBLISHER_USED_NAME, publisher_archived[0]),
             ("intent", PUBLISHER_INTENT_NAME, publisher_archived[1]),
@@ -4123,6 +4955,247 @@ def _archive_publisher_previous(
     os.fsync(staging)
 
 
+def _archive_nested_record(
+    parent: int,
+    *,
+    active_name: str,
+    archived_name: str,
+    expected: bytes,
+    publisher: bool,
+    uid: int,
+    gid: int,
+    runtime: Runtime,
+) -> None:
+    archived, _allowed = _nested_record(
+        parent,
+        active_name=active_name,
+        archived_name=archived_name,
+        expected=expected,
+        publisher=publisher,
+        uid=uid,
+        gid=gid,
+    )
+    if archived:
+        return
+    runtime.noreplace(
+        parent,
+        active_name,
+        parent,
+        archived_name,
+    )
+    os.fsync(parent)
+    archived, _allowed = _nested_record(
+        parent,
+        active_name=active_name,
+        archived_name=archived_name,
+        expected=expected,
+        publisher=publisher,
+        uid=uid,
+        gid=gid,
+    )
+    if not archived:
+        reject(f"histórico aninhado não foi arquivado: {active_name}")
+
+
+def _archive_nested_source_supersede(
+    state_descriptor: int,
+    *,
+    archived_name: str,
+    expected: bytes,
+    uid: int,
+    gid: int,
+    runtime: Runtime,
+) -> None:
+    active = read_record_if_present(
+        state_descriptor,
+        SUPERSEDE_NAME,
+        uid=uid,
+        gid=gid,
+    )
+    archived = read_record_if_present(
+        state_descriptor,
+        archived_name,
+        uid=uid,
+        gid=gid,
+    )
+    if archived is not None:
+        if archived != expected or active == expected:
+            reject("source supersede aninhado arquivado diverge")
+        return
+    if active != expected:
+        reject("source supersede aninhado não está recuperável")
+    runtime.noreplace(
+        state_descriptor,
+        SUPERSEDE_NAME,
+        state_descriptor,
+        archived_name,
+    )
+    os.fsync(state_descriptor)
+    if (
+        read_record_if_present(
+            state_descriptor,
+            archived_name,
+            uid=uid,
+            gid=gid,
+        )
+        != expected
+    ):
+        reject("source supersede aninhado não foi arquivado")
+
+
+def _archive_nested_tree(
+    parent: int,
+    *,
+    active_name: str,
+    archived_name: str,
+    expected_digest: str,
+    publisher: bool,
+    uid: int,
+    gid: int,
+    runtime: Runtime,
+) -> None:
+    archived, _allowed = _nested_tree(
+        parent,
+        active_name=active_name,
+        archived_name=archived_name,
+        expected_digest=expected_digest,
+        publisher=publisher,
+        uid=uid,
+        gid=gid,
+    )
+    if archived:
+        return
+    runtime.noreplace(
+        parent,
+        active_name,
+        parent,
+        archived_name,
+    )
+    os.fsync(parent)
+    archived, _allowed = _nested_tree(
+        parent,
+        active_name=active_name,
+        archived_name=archived_name,
+        expected_digest=expected_digest,
+        publisher=publisher,
+        uid=uid,
+        gid=gid,
+    )
+    if not archived:
+        reject(f"histórico aninhado não foi arquivado: {active_name}")
+
+
+def archive_nested_supersede_history(
+    state_descriptor: int,
+    recovery: PostPublisherRecovery,
+    *,
+    uid: int,
+    gid: int,
+    runtime: Runtime,
+    fault: Callable[[str], None],
+) -> None:
+    history = recovery.nested_history
+    if history is None:
+        return
+    current_kit_id = recovery.predecessor.kit_id
+    source_predecessor = history.source_predecessor
+    _archive_nested_source_supersede(
+        state_descriptor,
+        archived_name=nested_source_archive_name(
+            "supersede",
+            current_kit_id,
+        ),
+        expected=history.source_supersede_raw,
+        uid=uid,
+        gid=gid,
+        runtime=runtime,
+    )
+    fault("after_nested_source_supersede_archive")
+    for phase in ("intent", "prepared", "exchanged", "retained"):
+        _archive_nested_record(
+            state_descriptor,
+            active_name=source_predecessor.archived_name(phase),
+            archived_name=nested_source_archive_name(
+                phase,
+                current_kit_id,
+            ),
+            expected=_expected_source_phase(
+                source_predecessor,
+                phase,
+            ),
+            publisher=False,
+            uid=uid,
+            gid=gid,
+            runtime=runtime,
+        )
+        fault(f"after_nested_source_{phase}_archive")
+    _archive_nested_tree(
+        state_descriptor,
+        active_name=f"{PREVIOUS_PREFIX}{source_predecessor.kit_id}",
+        archived_name=nested_source_archive_name(
+            "previous",
+            current_kit_id,
+        ),
+        expected_digest=source_predecessor.old_digest,
+        publisher=False,
+        uid=uid,
+        gid=gid,
+        runtime=runtime,
+    )
+    fault("after_nested_source_previous_archive")
+
+    control, staging = _open_post_publisher_staging(
+        uid=uid,
+        gid=gid,
+    )
+    try:
+        _archive_nested_record(
+            staging,
+            active_name=PUBLISHER_SUPERSEDE_NAME,
+            archived_name=nested_publisher_archive_name(
+                "supersede",
+                current_kit_id,
+            ),
+            expected=history.publisher_supersede_raw,
+            publisher=True,
+            uid=uid,
+            gid=gid,
+            runtime=runtime,
+        )
+        fault("after_nested_publisher_supersede_archive")
+        _archive_nested_tree(
+            staging,
+            active_name=history.publisher_retained_candidate_name,
+            archived_name=nested_publisher_archive_name(
+                "candidate",
+                current_kit_id,
+            ),
+            expected_digest=history.publisher_predecessor_new_digest,
+            publisher=True,
+            uid=uid,
+            gid=gid,
+            runtime=runtime,
+        )
+        fault("after_nested_publisher_candidate_archive")
+        _archive_nested_record(
+            staging,
+            active_name=history.publisher_retained_intent_name,
+            archived_name=nested_publisher_archive_name(
+                "intent",
+                current_kit_id,
+            ),
+            expected=history.publisher_predecessor_intent_raw,
+            publisher=True,
+            uid=uid,
+            gid=gid,
+            runtime=runtime,
+        )
+        fault("after_nested_publisher_intent_archive")
+    finally:
+        os.close(staging)
+        os.close(control)
+
+
 def reconcile_post_publisher_prelude(
     state_descriptor: int,
     recovery: PostPublisherRecovery,
@@ -4210,6 +5283,14 @@ def reconcile_post_publisher_prelude(
     finally:
         os.close(staging)
         os.close(control)
+    archive_nested_supersede_history(
+        state_descriptor,
+        recovery,
+        uid=uid,
+        gid=gid,
+        runtime=runtime,
+        fault=fault,
+    )
     publish_record(
         state_descriptor,
         SUPERSEDE_NAME,
