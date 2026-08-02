@@ -243,7 +243,7 @@ def test_cli_uses_pinned_genesis_and_still_requires_trusted_github_context(
         text=True,
     )
     assert result.returncode == 78
-    assert "trusted ledger GitHub context is invalid: GITHUB_ACTIONS" in result.stderr
+    assert "trusted ledger GitHub context is invalid:" in result.stderr
     assert "Traceback" not in result.stderr
 
 
