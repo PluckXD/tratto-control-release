@@ -13,6 +13,8 @@ from pathlib import Path
 import pytest
 
 
+sys.dont_write_bytecode = True
+
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "validate-approval.py"
 SPEC = importlib.util.spec_from_file_location("validate_approval", SCRIPT)
@@ -30,6 +32,9 @@ SOURCE_SPEC.loader.exec_module(SOURCE_MODULE)
 NOW = dt.datetime(2026, 7, 30, 12, 0, tzinfo=dt.timezone.utc)
 WORKFLOW = b"name: control-release\n"
 POLICY = (ROOT / "policies" / "control-production-v1.json").read_bytes()
+RUNTIME_POLICY = (
+    ROOT / "policies" / "control-runtime-v1.json"
+).read_bytes()
 
 
 def git(root: Path, *arguments: str) -> str:
@@ -61,6 +66,9 @@ def init_repository(tmp_path: Path) -> tuple[Path, str]:
     )
     (root / "policies").mkdir()
     (root / "policies" / "control-production-v1.json").write_bytes(POLICY)
+    (root / "policies" / "control-runtime-v1.json").write_bytes(
+        RUNTIME_POLICY
+    )
     git(root, "add", ".")
     git(root, "commit", "-m", "bootstrap controller")
     head = git(root, "rev-parse", "HEAD")
@@ -93,10 +101,14 @@ def approval(base_sha: str, *, suffix: str = "tests") -> dict:
         "expires_at": "2026-07-30T13:00:00Z",
         "issued_at": "2026-07-30T12:00:00Z",
         "migration": {
-            "base_revision": "f25p2tauth",
-            "database_scope": "control",
-            "head_revision": "f28controlrpc",
+            "base_revision": "j1transpcod",
+            "database_scope": "control-and-tenant-fleet",
+            "fleet_preflight_sha256": "9" * 64,
+            "head_revision": "f29controlexec",
             "mode": "expand-only",
+            "tenant_catalog_count": 1,
+            "tenant_catalog_sha256": "a" * 64,
+            "tenant_fleet_base_revision": "j1transpcod",
         },
         "nonce": "AAAAAAAAAAAAAAAAAAAAAA",
         "ops": {
@@ -375,6 +387,21 @@ def test_rejects_policy_numeric_boolean_alias(tmp_path: Path) -> None:
         validate(root, relative)
 
 
+def test_rejects_runtime_policy_blob_drift(tmp_path: Path) -> None:
+    root, _ = init_repository(tmp_path)
+    runtime_path = root / "policies" / "control-runtime-v1.json"
+    runtime_value = json.loads(runtime_path.read_text(encoding="utf-8"))
+    runtime_value["node"]["version"] = "v20.20.2"
+    runtime_path.write_bytes(MODULE.canonical_bytes(runtime_value))
+    git(root, "add", str(runtime_path.relative_to(root)))
+    git(root, "commit", "-m", "drift runtime policy")
+    base = git(root, "rev-parse", "HEAD")
+    value = approval(base)
+    relative = commit_approval(root, value)
+    with pytest.raises(MODULE.ApprovalError, match="runtime policy"):
+        validate(root, relative)
+
+
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [
@@ -403,9 +430,9 @@ def test_rejects_policy_numeric_boolean_alias(tmp_path: Path) -> None:
         ),
         (
             lambda value: value["migration"].update(
-                {"head_revision": "f25p2tauth"}
+                {"head_revision": "j1transpcod"}
             ),
-            "base and head",
+            "revision chain",
         ),
         (
             lambda value: value["policy"].update({"digest_sha256": "6" * 64}),

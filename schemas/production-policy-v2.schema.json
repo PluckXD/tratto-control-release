@@ -1,0 +1,322 @@
+{
+  "$id": "https://github.com/PluckXD/tratto-control-release/schemas/production-policy-v2.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/unconfiguredBindings"
+        },
+        {
+          "$ref": "#/$defs/configuredBindings"
+        }
+      ]
+    }
+  ],
+  "properties": {
+    "approval_max_seconds": {
+      "const": 86400,
+      "type": "integer"
+    },
+    "approval_path_prefix": {
+      "const": "approvals/"
+    },
+    "approval_schema_version": {
+      "const": 2,
+      "type": "integer"
+    },
+    "artifact_transport": {
+      "const": "private-untrusted-carrier"
+    },
+    "carrier_authorizes_release": {
+      "const": false
+    },
+    "carrier_repository": {
+      "const": "PluckXD/tratto-control-release-carrier"
+    },
+    "carrier_trust": {
+      "const": "transport-only"
+    },
+    "controller": {
+      "$ref": "#/$defs/controller"
+    },
+    "controller_repository": {
+      "const": "PluckXD/tratto-control-release"
+    },
+    "ledger": {
+      "$ref": "#/$defs/ledger"
+    },
+    "migration_database_scope": {
+      "const": "control-and-tenant-fleet"
+    },
+    "product_repositories": {
+      "const": [
+        "PluckXD/tratto-api",
+        "PluckXD/tratto-web"
+      ]
+    },
+    "required_ref": {
+      "const": "refs/heads/main"
+    },
+    "runtime_policy": {
+      "additionalProperties": false,
+      "properties": {
+        "digest_sha256": {
+          "const": "c34e2b5655ed2df968b4f976db223bb9653a58e4aacce65f28300cb06b5dc5ae"
+        },
+        "name": {
+          "const": "control-runtime-v1"
+        },
+        "path": {
+          "const": "policies/control-runtime-v1.json"
+        }
+      },
+      "required": [
+        "digest_sha256",
+        "name",
+        "path"
+      ],
+      "type": "object"
+    },
+    "schema_version": {
+      "const": 2,
+      "type": "integer"
+    },
+    "signer_allows_product_credentials": {
+      "const": false
+    },
+    "signer_allows_source_checkout": {
+      "const": false
+    }
+  },
+  "required": [
+    "approval_max_seconds",
+    "approval_path_prefix",
+    "approval_schema_version",
+    "artifact_transport",
+    "carrier_authorizes_release",
+    "carrier_repository",
+    "carrier_trust",
+    "controller",
+    "controller_repository",
+    "ledger",
+    "migration_database_scope",
+    "product_repositories",
+    "required_ref",
+    "runtime_policy",
+    "schema_version",
+    "signer_allows_product_credentials",
+    "signer_allows_source_checkout"
+  ],
+  "title": "Tratto Control production policy v2",
+  "type": "object",
+  "$defs": {
+    "configuredBindings": {
+      "properties": {
+        "controller": {
+          "properties": {
+            "repository_id": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "tag_signature_trust_root_sha256": {
+              "$ref": "#/$defs/sha256"
+            },
+            "tag_signature_verifier_sha256": {
+              "$ref": "#/$defs/sha256"
+            },
+            "workflow_sha256": {
+              "$ref": "#/$defs/sha256"
+            }
+          },
+          "required": [
+            "repository_id",
+            "tag_signature_trust_root_sha256",
+            "tag_signature_verifier_sha256",
+            "workflow_sha256"
+          ]
+        },
+        "ledger": {
+          "properties": {
+            "genesis_sha": {
+              "$ref": "#/$defs/sha1"
+            },
+            "repository_id": {
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "genesis_sha",
+            "repository_id"
+          ]
+        }
+      },
+      "required": [
+        "controller",
+        "ledger"
+      ]
+    },
+    "controller": {
+      "additionalProperties": false,
+      "properties": {
+        "immutable_release_required": {
+          "const": true
+        },
+        "repository": {
+          "const": "PluckXD/tratto-control-release"
+        },
+        "repository_id": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "require_owner_enforcement": {
+          "const": true
+        },
+        "signed_annotated_tag_required": {
+          "const": true
+        },
+        "tag_ref_pattern": {
+          "const": "^refs/tags/control-controller-v6\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"
+        },
+        "tag_ref_prefix": {
+          "const": "refs/tags/control-controller-v6."
+        },
+        "tag_signature_claim_authorizes_release": {
+          "const": false
+        },
+        "tag_signature_trust_root_sha256": {
+          "type": "string"
+        },
+        "tag_signature_verification_mode": {
+          "const": "local-cryptographic-annotated-tag-object"
+        },
+        "tag_signature_verifier_sha256": {
+          "type": "string"
+        },
+        "workflow_path": {
+          "const": ".github/workflows/control-release.yml"
+        },
+        "workflow_sha256": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "immutable_release_required",
+        "repository",
+        "repository_id",
+        "require_owner_enforcement",
+        "signed_annotated_tag_required",
+        "tag_ref_pattern",
+        "tag_ref_prefix",
+        "tag_signature_claim_authorizes_release",
+        "tag_signature_trust_root_sha256",
+        "tag_signature_verification_mode",
+        "tag_signature_verifier_sha256",
+        "workflow_path",
+        "workflow_sha256"
+      ],
+      "type": "object"
+    },
+    "ledger": {
+      "additionalProperties": false,
+      "properties": {
+        "append_only": {
+          "const": true
+        },
+        "approval_schema_version": {
+          "const": 2,
+          "type": "integer"
+        },
+        "genesis_sha": {
+          "type": "string"
+        },
+        "linear_single_parent": {
+          "const": true
+        },
+        "ref": {
+          "const": "refs/heads/main"
+        },
+        "repository": {
+          "const": "PluckXD/tratto-control-release-ledger"
+        },
+        "repository_id": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "require_unchanged_head_at_signature": {
+          "const": true
+        },
+        "signer_revalidation_timing": {
+          "const": "immediately-before-signature"
+        }
+      },
+      "required": [
+        "append_only",
+        "approval_schema_version",
+        "genesis_sha",
+        "linear_single_parent",
+        "ref",
+        "repository",
+        "repository_id",
+        "require_unchanged_head_at_signature",
+        "signer_revalidation_timing"
+      ],
+      "type": "object"
+    },
+    "sha1": {
+      "pattern": "^[0-9a-f]{40}$",
+      "type": "string"
+    },
+    "sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "unconfiguredBindings": {
+      "properties": {
+        "controller": {
+          "properties": {
+            "repository_id": {
+              "const": 0
+            },
+            "tag_signature_trust_root_sha256": {
+              "const": ""
+            },
+            "tag_signature_verifier_sha256": {
+              "const": ""
+            },
+            "workflow_sha256": {
+              "const": ""
+            }
+          },
+          "required": [
+            "repository_id",
+            "tag_signature_trust_root_sha256",
+            "tag_signature_verifier_sha256",
+            "workflow_sha256"
+          ]
+        },
+        "ledger": {
+          "properties": {
+            "genesis_sha": {
+              "const": ""
+            },
+            "repository_id": {
+              "const": 0
+            }
+          },
+          "required": [
+            "genesis_sha",
+            "repository_id"
+          ]
+        }
+      },
+      "required": [
+        "controller",
+        "ledger"
+      ]
+    }
+  },
+  "$comment": "The checked-in policy is intentionally unconfigured and cannot authorize production. scripts/validate-policy-v2.py is normative, requires canonical JSON and exact keys, and only accepts a configured document when every non-circular binding matches separately audited pins. Controller commit_sha, tag_ref, tag_object_sha and immutable_release_id are deliberately forbidden here; approval/envelope bind them to independently verified GitHub evidence."
+}

@@ -1,0 +1,177 @@
+{
+  "$id": "https://github.com/PluckXD/tratto-control-release/schemas/host-runtime-attestation.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "distribution": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "const": "ubuntu"
+        },
+        "os_release_path": {
+          "const": "/usr/lib/os-release"
+        },
+        "version_id": {
+          "const": "24.04"
+        }
+      },
+      "required": [
+        "id",
+        "os_release_path",
+        "version_id"
+      ],
+      "type": "object"
+    },
+    "libc": {
+      "additionalProperties": false,
+      "properties": {
+        "family": {
+          "const": "glibc"
+        },
+        "minimum_version": {
+          "const": "2.39"
+        },
+        "observed_version": {
+          "pattern": "^[0-9]+\\.[0-9]+(?:\\.[0-9]+)?$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "family",
+        "minimum_version",
+        "observed_version"
+      ],
+      "type": "object"
+    },
+    "node": {
+      "additionalProperties": false,
+      "properties": {
+        "binary_sha256": {
+          "const": "1bec56ef7cfa9a76f3e0b7c0a87f220eb73f23102b9c0b4c7529a3f7c3ce7c31"
+        },
+        "executable": {
+          "const": "/opt/tratto-control/toolchains/node-v22.22.0-linux-x64/bin/node"
+        },
+        "runtime_user_verified": {
+          "const": "tratto-control-web"
+        },
+        "version": {
+          "const": "v22.22.0"
+        }
+      },
+      "required": [
+        "binary_sha256",
+        "executable",
+        "runtime_user_verified",
+        "version"
+      ],
+      "type": "object"
+    },
+    "python": {
+      "additionalProperties": false,
+      "properties": {
+        "binary_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "cache_tag": {
+          "const": "cpython-312"
+        },
+        "executable": {
+          "const": "/usr/bin/python3.12"
+        },
+        "implementation": {
+          "const": "CPython"
+        },
+        "major_minor": {
+          "const": "3.12"
+        },
+        "observed_version": {
+          "pattern": "^3\\.12\\.[0-9]+$",
+          "type": "string"
+        },
+        "py_debug": {
+          "const": false
+        },
+        "runtime_users_verified": {
+          "const": [
+            "tratto-control-api",
+            "tratto-control-executor",
+            "tratto-control-fleet-migrator",
+            "tratto-control-migrator",
+            "tratto-control-proxy",
+            "tratto-control-web"
+          ]
+        },
+        "soabi": {
+          "const": "cpython-312-x86_64-linux-gnu"
+        }
+      },
+      "required": [
+        "binary_sha256",
+        "cache_tag",
+        "executable",
+        "implementation",
+        "major_minor",
+        "observed_version",
+        "py_debug",
+        "runtime_users_verified",
+        "soabi"
+      ],
+      "type": "object"
+    },
+    "root_validation": {
+      "additionalProperties": false,
+      "properties": {
+        "artifact_interpreter_execution": {
+          "const": false
+        },
+        "installed_policy_path": {
+          "const": "/etc/tratto-control/runtime-policy.json"
+        },
+        "setpriv_executable": {
+          "const": "/usr/bin/setpriv"
+        },
+        "trusted_runtime_metadata_only": {
+          "const": true
+        }
+      },
+      "required": [
+        "artifact_interpreter_execution",
+        "installed_policy_path",
+        "setpriv_executable",
+        "trusted_runtime_metadata_only"
+      ],
+      "type": "object"
+    },
+    "runtime_policy_sha256": {
+      "const": "c34e2b5655ed2df968b4f976db223bb9653a58e4aacce65f28300cb06b5dc5ae"
+    },
+    "schema_version": {
+      "const": 1,
+      "type": "integer"
+    },
+    "verdict": {
+      "const": "pass"
+    }
+  },
+  "required": [
+    "distribution",
+    "libc",
+    "node",
+    "python",
+    "root_validation",
+    "runtime_policy_sha256",
+    "schema_version",
+    "verdict"
+  ],
+  "title": "Tratto Control trusted host runtime attestation",
+  "type": "object",
+  "$defs": {
+    "sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    }
+  },
+  "$comment": "The normative attestor opens fixed root-owned binaries without symlinks, hashes by stable file descriptor, and executes metadata probes only after dropping to the reviewed runtime users."
+}

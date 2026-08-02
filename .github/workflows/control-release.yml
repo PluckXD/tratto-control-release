@@ -1,0 +1,222 @@
+name: Control release
+
+on:
+  workflow_dispatch:
+    inputs:
+      approval_path:
+        description: Canonical approvals/<release-id>.json on protected main
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  authorize:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      api_sha: ${{ steps.intent.outputs.api_sha }}
+      approval_sha256: ${{ steps.intent.outputs.approval_sha256 }}
+      ops_sha: ${{ steps.intent.outputs.ops_sha }}
+      release_id: ${{ steps.intent.outputs.release_id }}
+      web_sha: ${{ steps.intent.outputs.web_sha }}
+    steps:
+      - name: Checkout public trust root
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Pin controller Python
+        uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548
+        with:
+          architecture: x64
+          check-latest: false
+          python-version: '3.12.13'
+      - name: Validate append-only approval
+        env:
+          APPROVAL_PATH: ${{ inputs.approval_path }}
+          GITHUB_TOKEN: ${{ github.token }}
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: |
+          python3 -B scripts/validate-approval.py \
+            "$APPROVAL_PATH" \
+            --repository-root "$GITHUB_WORKSPACE" \
+            >"$RUNNER_TEMP/approval-summary.json"
+      - id: intent
+        name: Export bounded approval values
+        env:
+          APPROVAL_PATH: ${{ inputs.approval_path }}
+        run: |
+          python3 -B scripts/emit-approval-outputs.py \
+            --summary "$RUNNER_TEMP/approval-summary.json" \
+            --approval "$GITHUB_WORKSPACE/$APPROVAL_PATH" \
+            --github-output "$GITHUB_OUTPUT"
+      - name: Verify branch, environment, and Actions controls
+        env:
+          CONTROL_CONTROLLER_AUDIT_TOKEN: ${{ secrets.CONTROL_CONTROLLER_AUDIT_TOKEN }}
+        run: python3 -B scripts/verify-github-controls.py
+      - name: Enforce reviewed readiness
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: |
+          python3 -B scripts/policy-gate.py \
+            --readiness release-readiness.json \
+            --phase authorize
+
+  build_api:
+    needs: authorize
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: OIDC must be absent
+        run: |
+          test -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}"
+          test -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}"
+      - name: Checkout controller only
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          path: controller
+          persist-credentials: false
+      - name: Pin controller Python
+        uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548
+        with:
+          architecture: x64
+          check-latest: false
+          python-version: '3.12.13'
+      - name: Enforce isolated API builder readiness
+        working-directory: controller
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: |
+          python3 -B scripts/policy-gate.py \
+            --readiness release-readiness.json \
+            --phase build_api
+      - name: Build API in reviewed isolated OCI image
+        run: |
+          echo "RELEASE_POLICY_UNAVAILABLE: API builder image/identity not proven" >&2
+          exit 78
+
+  build_web:
+    needs: authorize
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: OIDC must be absent
+        run: |
+          test -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}"
+          test -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}"
+      - name: Checkout controller only
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          path: controller
+          persist-credentials: false
+      - name: Pin controller Python
+        uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548
+        with:
+          architecture: x64
+          check-latest: false
+          python-version: '3.12.13'
+      - name: Enforce isolated Web builder readiness
+        working-directory: controller
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: |
+          python3 -B scripts/policy-gate.py \
+            --readiness release-readiness.json \
+            --phase build_web
+      - name: Build Web in reviewed isolated OCI image
+        run: |
+          echo "RELEASE_POLICY_UNAVAILABLE: Web builder image/identity not proven" >&2
+          exit 78
+
+  build_ops:
+    needs: authorize
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: OIDC must be absent
+        run: |
+          test -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}"
+          test -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}"
+      - name: Checkout controller only
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          path: controller
+          persist-credentials: false
+      - name: Pin controller Python
+        uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548
+        with:
+          architecture: x64
+          check-latest: false
+          python-version: '3.12.13'
+      - name: Enforce isolated Ops packager readiness
+        working-directory: controller
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: |
+          python3 -B scripts/policy-gate.py \
+            --readiness release-readiness.json \
+            --phase build_ops
+      - name: Package reviewed ops/control as an immutable artifact
+        run: |
+          echo "RELEASE_POLICY_UNAVAILABLE: signed Ops artifact/host contract not proven" >&2
+          exit 78
+
+  verify:
+    needs: [authorize, build_api, build_ops, build_web]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: OIDC and product credentials must be absent
+        run: |
+          test -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}"
+          test -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}"
+          test -z "${CONTROL_API_READ_TOKEN:-}"
+          test -z "${CONTROL_WEB_READ_TOKEN:-}"
+      - name: Checkout independent verifier
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Pin verifier Python
+        uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548
+        with:
+          architecture: x64
+          check-latest: false
+          python-version: '3.12.13'
+      - name: Enforce verifier readiness
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: |
+          python3 -B scripts/policy-gate.py \
+            --readiness release-readiness.json \
+            --phase verify
+      - name: Verify carrier bytes and real isolated runtimes
+        run: |
+          echo "RELEASE_POLICY_UNAVAILABLE: runtime verifier/carrier identity not proven" >&2
+          exit 78
+
+  sign_release:
+    needs: [authorize, verify]
+    runs-on: ubuntu-24.04
+    environment: control-release
+    permissions:
+      actions: read
+      contents: none
+      id-token: write
+    steps:
+      - name: Signer has no source or product credentials
+        run: |
+          test ! -e .git
+          test -z "${CONTROL_API_READ_TOKEN:-}"
+          test -z "${CONTROL_WEB_READ_TOKEN:-}"
+          test -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}"
+          test -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}"
+      - name: Refuse signing until host accepts signed Ops atomically
+        run: |
+          echo "RELEASE_POLICY_UNAVAILABLE: v5 Ops envelope and atomic host switch are not proven" >&2
+          exit 78

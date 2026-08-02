@@ -1,0 +1,203 @@
+{
+  "$id": "https://github.com/PluckXD/tratto-control-release/schemas/runtime-policy.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "architecture": {
+      "const": "x86_64"
+    },
+    "distribution": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "const": "ubuntu"
+        },
+        "os_release_path": {
+          "const": "/usr/lib/os-release"
+        },
+        "version_id": {
+          "const": "24.04"
+        }
+      },
+      "required": [
+        "id",
+        "os_release_path",
+        "version_id"
+      ],
+      "type": "object"
+    },
+    "libc": {
+      "additionalProperties": false,
+      "properties": {
+        "family": {
+          "const": "glibc"
+        },
+        "minimum_version": {
+          "const": "2.39"
+        }
+      },
+      "required": [
+        "family",
+        "minimum_version"
+      ],
+      "type": "object"
+    },
+    "name": {
+      "const": "control-runtime-v1"
+    },
+    "node": {
+      "additionalProperties": false,
+      "properties": {
+        "archive_member": {
+          "const": "node-v22.22.0-linux-x64/bin/node"
+        },
+        "archive_name": {
+          "const": "node-v22.22.0-linux-x64.tar.xz"
+        },
+        "archive_sha256": {
+          "const": "9aa8e9d2298ab68c600bd6fb86a6c13bce11a4eca1ba9b39d79fa021755d7c37"
+        },
+        "archive_size_bytes": {
+          "const": 30779824,
+          "type": "integer"
+        },
+        "binary_sha256": {
+          "const": "1bec56ef7cfa9a76f3e0b7c0a87f220eb73f23102b9c0b4c7529a3f7c3ce7c31"
+        },
+        "binary_size_bytes": {
+          "const": 123405064,
+          "type": "integer"
+        },
+        "executable": {
+          "const": "/opt/tratto-control/toolchains/node-v22.22.0-linux-x64/bin/node"
+        },
+        "provisioning": {
+          "const": "root-owned-out-of-band"
+        },
+        "runtime_user": {
+          "const": "tratto-control-web"
+        },
+        "source_url": {
+          "const": "https://nodejs.org/dist/v22.22.0/node-v22.22.0-linux-x64.tar.xz"
+        },
+        "version": {
+          "const": "v22.22.0"
+        }
+      },
+      "required": [
+        "archive_member",
+        "archive_name",
+        "archive_sha256",
+        "archive_size_bytes",
+        "binary_sha256",
+        "binary_size_bytes",
+        "executable",
+        "provisioning",
+        "runtime_user",
+        "source_url",
+        "version"
+      ],
+      "type": "object"
+    },
+    "operating_system": {
+      "const": "Linux"
+    },
+    "python": {
+      "additionalProperties": false,
+      "properties": {
+        "abi": {
+          "const": "cp312"
+        },
+        "build_version": {
+          "const": "3.12.13"
+        },
+        "cache_tag": {
+          "const": "cpython-312"
+        },
+        "executable": {
+          "const": "/usr/bin/python3.12"
+        },
+        "implementation": {
+          "const": "CPython"
+        },
+        "major_minor": {
+          "const": "3.12"
+        },
+        "patch_compatibility": {
+          "const": "same-major-minor"
+        },
+        "py_debug": {
+          "const": false
+        },
+        "runtime_users": {
+          "const": [
+            "tratto-control-api",
+            "tratto-control-executor",
+            "tratto-control-fleet-migrator",
+            "tratto-control-migrator",
+            "tratto-control-proxy",
+            "tratto-control-web"
+          ]
+        },
+        "soabi": {
+          "const": "cpython-312-x86_64-linux-gnu"
+        }
+      },
+      "required": [
+        "abi",
+        "build_version",
+        "cache_tag",
+        "executable",
+        "implementation",
+        "major_minor",
+        "patch_compatibility",
+        "py_debug",
+        "runtime_users",
+        "soabi"
+      ],
+      "type": "object"
+    },
+    "root_validation": {
+      "additionalProperties": false,
+      "properties": {
+        "artifact_interpreter_execution": {
+          "const": false
+        },
+        "installed_policy_path": {
+          "const": "/etc/tratto-control/runtime-policy.json"
+        },
+        "setpriv_executable": {
+          "const": "/usr/bin/setpriv"
+        },
+        "trusted_runtime_metadata_only": {
+          "const": true
+        }
+      },
+      "required": [
+        "artifact_interpreter_execution",
+        "installed_policy_path",
+        "setpriv_executable",
+        "trusted_runtime_metadata_only"
+      ],
+      "type": "object"
+    },
+    "schema_version": {
+      "const": 1,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "architecture",
+    "distribution",
+    "libc",
+    "name",
+    "node",
+    "operating_system",
+    "python",
+    "root_validation",
+    "schema_version"
+  ],
+  "title": "Tratto Control reviewed runtime policy",
+  "type": "object",
+  "$comment": "scripts/runtime_policy.py is normative and requires canonical JSON plus the exact reviewed values."
+}

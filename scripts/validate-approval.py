@@ -8,21 +8,35 @@ caller-selected directory or a symlinkable working-tree path.
 
 from __future__ import annotations
 
+import sys
+sys.dont_write_bytecode = True
+
 import argparse
 import base64
 import binascii
 import datetime as dt
 import hashlib
+import importlib.util
 import json
 import os
 import re
 import stat
 import subprocess
-import sys
 import urllib.error
 import urllib.request
 from pathlib import Path, PurePosixPath
 from typing import Any
+
+
+HERE = Path(__file__).resolve().parent
+RUNTIME_SPEC = importlib.util.spec_from_file_location(
+    "control_release_runtime_policy",
+    HERE / "runtime_policy.py",
+)
+if RUNTIME_SPEC is None or RUNTIME_SPEC.loader is None:
+    raise RuntimeError("runtime policy validator is unavailable")
+RUNTIME = importlib.util.module_from_spec(RUNTIME_SPEC)
+RUNTIME_SPEC.loader.exec_module(RUNTIME)
 
 
 SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -67,18 +81,26 @@ CONTROLLER_KEYS = {
 MIGRATION_KEYS = {
     "base_revision",
     "database_scope",
+    "fleet_preflight_sha256",
     "head_revision",
     "mode",
+    "tenant_catalog_count",
+    "tenant_catalog_sha256",
+    "tenant_fleet_base_revision",
 }
 POLICY_KEYS = {"digest_sha256", "name", "path", "repository"}
 POLICY_DOCUMENT_KEYS = {
     "approval_max_seconds",
     "approval_path_prefix",
     "artifact_transport",
+    "carrier_authorizes_release",
+    "carrier_repository",
+    "carrier_trust",
     "controller_repository",
     "migration_database_scope",
     "product_repositories",
     "required_ref",
+    "runtime_policy",
     "schema_version",
     "signer_allows_product_credentials",
     "signer_allows_source_checkout",
@@ -89,6 +111,7 @@ EXPECTED_REPOSITORIES = {
     "web": "PluckXD/tratto-web",
 }
 EXPECTED_CONTROLLER_REPOSITORY = "PluckXD/tratto-control-release"
+EXPECTED_CARRIER_REPOSITORY = "PluckXD/tratto-control-release-carrier"
 EXPECTED_CONTROLLER_ORIGIN = (
     "https://github.com/PluckXD/tratto-control-release.git"
 )
@@ -460,8 +483,10 @@ def validate_migration(value: Any) -> None:
     if not isinstance(value, dict):
         reject("migration must be an object")
     exact_keys(value, MIGRATION_KEYS, "migration")
-    if value["database_scope"] != "control":
-        reject("migration.database_scope must be control")
+    if value["database_scope"] != "control-and-tenant-fleet":
+        reject(
+            "migration.database_scope must be control-and-tenant-fleet"
+        )
     if value["mode"] != "expand-only":
         reject("migration.mode must be expand-only")
     base = require_pattern(
@@ -470,8 +495,30 @@ def validate_migration(value: Any) -> None:
     head = require_pattern(
         value["head_revision"], REVISION_RE, "migration.head_revision"
     )
-    if base == head:
-        reject("migration base and head must differ")
+    tenant_base = require_pattern(
+        value["tenant_fleet_base_revision"],
+        REVISION_RE,
+        "migration.tenant_fleet_base_revision",
+    )
+    if (
+        base != "j1transpcod"
+        or tenant_base != "j1transpcod"
+        or head != "f29controlexec"
+    ):
+        reject("migration revision chain is not approved")
+    require_pattern(
+        value["tenant_catalog_sha256"],
+        SHA256_RE,
+        "migration.tenant_catalog_sha256",
+    )
+    require_pattern(
+        value["fleet_preflight_sha256"],
+        SHA256_RE,
+        "migration.fleet_preflight_sha256",
+    )
+    count = value["tenant_catalog_count"]
+    if type(count) is not int or not 1 <= count <= 512:
+        reject("migration tenant catalog count is invalid")
 
 
 def validate_policy(value: Any) -> None:
@@ -531,7 +578,10 @@ def validate_shape(
     return release_id, nonce
 
 
-def validate_policy_blob(raw: bytes, expected_digest: str) -> None:
+def validate_policy_blob(
+    raw: bytes,
+    expected_digest: str,
+) -> dict[str, str]:
     if hashlib.sha256(raw).hexdigest() != expected_digest:
         reject("policy digest does not match the controller base blob")
     value = parse_json(raw, "policy")
@@ -540,14 +590,22 @@ def validate_policy_blob(raw: bytes, expected_digest: str) -> None:
     expected = {
         "approval_max_seconds": 86400,
         "approval_path_prefix": "approvals/",
-        "artifact_transport": "private-only",
+        "artifact_transport": "private-untrusted-carrier",
+        "carrier_authorizes_release": False,
+        "carrier_repository": EXPECTED_CARRIER_REPOSITORY,
+        "carrier_trust": "transport-only",
         "controller_repository": EXPECTED_CONTROLLER_REPOSITORY,
-        "migration_database_scope": "control",
+        "migration_database_scope": "control-and-tenant-fleet",
         "product_repositories": [
             "PluckXD/tratto-api",
             "PluckXD/tratto-web",
         ],
         "required_ref": EXPECTED_REF,
+        "runtime_policy": {
+            "digest_sha256": RUNTIME.EXPECTED_POLICY_SHA256,
+            "name": "control-runtime-v1",
+            "path": "policies/control-runtime-v1.json",
+        },
         "schema_version": 1,
         "signer_allows_product_credentials": False,
         "signer_allows_source_checkout": False,
@@ -555,9 +613,11 @@ def validate_policy_blob(raw: bytes, expected_digest: str) -> None:
     if (
         type(value["schema_version"]) is not int
         or type(value["approval_max_seconds"]) is not int
+        or type(value["carrier_authorizes_release"]) is not bool
         or type(value["signer_allows_product_credentials"]) is not bool
         or type(value["signer_allows_source_checkout"]) is not bool
         or not isinstance(value["product_repositories"], list)
+        or not isinstance(value["runtime_policy"], dict)
         or not all(
             isinstance(repository, str)
             for repository in value["product_repositories"]
@@ -566,6 +626,7 @@ def validate_policy_blob(raw: bytes, expected_digest: str) -> None:
         reject("policy document field types diverge from the enforced contract")
     if value != expected:
         reject("policy document values diverge from the enforced contract")
+    return value["runtime_policy"]
 
 
 def historical_authorizations(
@@ -680,7 +741,21 @@ def verify_controller_commit(
     ):
         reject("workflow digest does not match the controller base blob")
     policy = git_blob(root, base_sha, value["policy"]["path"])
-    validate_policy_blob(policy, value["policy"]["digest_sha256"])
+    runtime_reference = validate_policy_blob(
+        policy,
+        value["policy"]["digest_sha256"],
+    )
+    runtime_policy = git_blob(
+        root,
+        base_sha,
+        runtime_reference["path"],
+    )
+    try:
+        _, observed_runtime_digest = RUNTIME.validate_bytes(runtime_policy)
+    except RUNTIME.RuntimePolicyError as error:
+        reject(f"runtime policy blob is invalid: {error}")
+    if observed_runtime_digest != runtime_reference["digest_sha256"]:
+        reject("runtime policy digest does not match the controller base blob")
 
 
 def validate(

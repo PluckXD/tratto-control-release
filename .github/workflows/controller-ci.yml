@@ -1,0 +1,47 @@
+name: Controller CI
+
+'on':
+  pull_request: {}
+  push: {}
+
+concurrency:
+  group: controller-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  controller-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      PIP_CONFIG_FILE: /dev/null
+      PIP_DISABLE_PIP_VERSION_CHECK: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Checkout controller
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Pin Python
+        uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548
+        with:
+          architecture: x64
+          check-latest: false
+          python-version: '3.12.13'
+
+      - name: Install hash-pinned test dependencies
+        run: >-
+          python3 -B -m pip install
+          --no-deps
+          --only-binary=:all:
+          --require-hashes
+          --index-url https://pypi.org/simple
+          --requirement requirements-ci.txt
+
+      - name: Run fail-closed controller tests
+        run: python3 -B -m pytest -q

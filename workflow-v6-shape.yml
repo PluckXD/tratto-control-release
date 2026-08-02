@@ -1,0 +1,464 @@
+# Review-only shape for the future production workflow.
+#
+# This file is intentionally outside .github/workflows and cannot run.  Every
+# unfinished trust producer fails with exit 78.  It may replace the production
+# workflow only after all FUTURE BLOCKER steps have reviewed implementations
+# and the resulting workflow digest has been pinned in production policy v2.
+name: Control release v6 review shape
+
+'on':
+  workflow_dispatch:
+    inputs:
+      approval_path:
+        description: Canonical approvals/<release-id>.json on the protected ledger main
+        required: true
+        type: string
+
+concurrency:
+  group: control-release-v6-${{ github.ref }}-${{ inputs.approval_path }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  authorize:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      api_sha: ${{ steps.intent.outputs.api_sha }}
+      approval_sha256: ${{ steps.intent.outputs.approval_sha256 }}
+      controller_commit_sha: ${{ steps.intent.outputs.controller_commit_sha }}
+      controller_release_id: ${{ steps.intent.outputs.controller_release_id }}
+      controller_repository_id: ${{ steps.controller_evidence.outputs.repository_id }}
+      controller_tag_ref: ${{ steps.intent.outputs.controller_tag_ref }}
+      controller_tag_object_sha: ${{ steps.intent.outputs.controller_tag_object_sha }}
+      ledger_head_sha: ${{ steps.intent.outputs.ledger_head_sha }}
+      ops_sha: ${{ steps.intent.outputs.ops_sha }}
+      release_id: ${{ steps.intent.outputs.release_id }}
+      web_sha: ${{ steps.intent.outputs.web_sha }}
+    steps:
+      - name: Authorization has no OIDC or product credentials
+        shell: bash
+        run: |
+          test -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}"
+          test -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}"
+          test -z "${CONTROL_API_READ_TOKEN:-}"
+          test -z "${CONTROL_WEB_READ_TOKEN:-}"
+
+      - name: Checkout the immutable controller tag
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          path: controller
+          persist-credentials: false
+          ref: ${{ github.ref }}
+
+      - name: Pin controller Python
+        uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548
+        with:
+          architecture: x64
+          check-latest: false
+          python-version: '3.12.13'
+
+      - name: Enforce the v6 release gate
+        working-directory: controller
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: python3 -B scripts/policy-gate-v2.py --phase authorize
+
+      - name: Validate the exact production policy v2
+        working-directory: controller
+        run: |
+          python3 -B scripts/validate-policy-v2.py \
+            --policy policies/control-production-v2.json \
+            >"$RUNNER_TEMP/policy-v2-summary.json"
+
+      - name: Require a direct canonical v6 semantic tag
+        env:
+          CONTROLLER_REF: ${{ github.ref }}
+        run: |
+          python3 -B - <<'PY'
+          import os
+          import re
+          import sys
+
+          pattern = (
+              r"^refs/tags/control-controller-v6\."
+              r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$"
+          )
+          if re.fullmatch(pattern, os.environ.get("CONTROLLER_REF", "")) is None:
+              print("RELEASE_POLICY_UNAVAILABLE: exact v6 tag required", file=sys.stderr)
+              raise SystemExit(78)
+          PY
+
+      - id: controller_evidence
+        name: FUTURE BLOCKER - produce canonical immutable-tag evidence
+        run: |
+          echo "RELEASE_POLICY_UNAVAILABLE: reviewed immutable-tag evidence producer is not provisioned" >&2
+          exit 78
+
+      - name: Validate the signed annotated tag and immutable release
+        working-directory: controller
+        env:
+          CONTROLLER_COMMIT_SHA: ${{ steps.controller_evidence.outputs.commit_sha }}
+          CONTROLLER_RELEASE_ID: ${{ steps.controller_evidence.outputs.release_id }}
+          CONTROLLER_REPOSITORY_ID: ${{ steps.controller_evidence.outputs.repository_id }}
+          CONTROLLER_TAG: ${{ steps.controller_evidence.outputs.tag }}
+          CONTROLLER_TAG_OBJECT_SHA: ${{ steps.controller_evidence.outputs.tag_object_sha }}
+        run: |
+          python3 -B scripts/verify-controller-tag.py \
+            --controller-tag "$CONTROLLER_TAG" \
+            --tag-object-sha "$CONTROLLER_TAG_OBJECT_SHA" \
+            --commit-sha "$CONTROLLER_COMMIT_SHA" \
+            --release-id "$CONTROLLER_RELEASE_ID" \
+            --repository-id "$CONTROLLER_REPOSITORY_ID" \
+            --github-context "$RUNNER_TEMP/controller-context.json" \
+            --local-git-tag "$RUNNER_TEMP/controller-local-tag.json" \
+            --release-response "$RUNNER_TEMP/controller-release.json" \
+            --immutable-releases-response "$RUNNER_TEMP/controller-immutable-releases.json" \
+            >"$RUNNER_TEMP/controller-tag-attestation.json"
+
+      - id: controls_evidence
+        name: FUTURE BLOCKER - produce canonical GitHub controls v2 evidence
+        run: |
+          echo "RELEASE_POLICY_UNAVAILABLE: reviewed GitHub controls evidence producer is not provisioned" >&2
+          exit 78
+
+      - name: Verify GitHub controls v2
+        working-directory: controller
+        run: |
+          python3 -B scripts/verify-github-controls-v2.py \
+            --controller-evidence "$RUNNER_TEMP/controller-controls-v2.json" \
+            --ledger-evidence "$RUNNER_TEMP/ledger-controls-v2.json" \
+            >"$RUNNER_TEMP/github-controls-v2-attestation.json"
+
+      - name: Checkout the protected approval ledger in isolation
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          path: approval-ledger
+          persist-credentials: false
+          ref: refs/heads/main
+          repository: PluckXD/tratto-control-release-ledger
+
+      - name: Validate the append-only ledger and selected approval
+        working-directory: controller
+        env:
+          APPROVAL_PATH: ${{ inputs.approval_path }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          LEDGER_HEAD_SHA="$(git -C "$GITHUB_WORKSPACE/approval-ledger" rev-parse HEAD)"
+          env \
+            GITHUB_ACTIONS=true \
+            GITHUB_API_URL=https://api.github.com \
+            GITHUB_REF=refs/heads/main \
+            GITHUB_REPOSITORY=PluckXD/tratto-control-release-ledger \
+            GITHUB_SERVER_URL=https://github.com \
+            GITHUB_SHA="$LEDGER_HEAD_SHA" \
+            RUNNER_ENVIRONMENT=github-hosted \
+            python3 -B scripts/validate-ledger.py \
+              "$APPROVAL_PATH" \
+              --repository-root "$GITHUB_WORKSPACE/approval-ledger" \
+              >"$RUNNER_TEMP/ledger-summary.json"
+
+      - name: Validate the selected approval v2 again at its stable path
+        working-directory: controller
+        env:
+          APPROVAL_PATH: ${{ inputs.approval_path }}
+        run: |
+          python3 -B scripts/validate-approval-v2.py \
+            "$GITHUB_WORKSPACE/approval-ledger/$APPROVAL_PATH" \
+            >"$RUNNER_TEMP/approval-v2-summary.json"
+
+      - id: intent
+        name: Emit only bounded approval v2 outputs
+        working-directory: controller
+        env:
+          APPROVAL_PATH: ${{ inputs.approval_path }}
+        run: |
+          python3 -B scripts/emit-approval-v2-outputs.py \
+            --approval "$GITHUB_WORKSPACE/approval-ledger/$APPROVAL_PATH" \
+            --ledger-summary "$RUNNER_TEMP/ledger-summary.json" \
+            --policy policies/control-production-v2.json \
+            --workflow .github/workflows/control-release.yml \
+            --signer-verifier scripts/validate-signer-freshness-v2.py \
+            --github-output "$GITHUB_OUTPUT"
+
+  build_api:
+    needs: authorize
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: API builder has no OIDC
+        run: |
+          test -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}"
+          test -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}"
+          test -z "${CONTROL_WEB_READ_TOKEN:-}"
+
+      - name: Checkout controller only
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          path: controller
+          persist-credentials: false
+          ref: ${{ github.ref }}
+
+      - name: Pin controller Python
+        uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548
+        with:
+          architecture: x64
+          check-latest: false
+          python-version: '3.12.13'
+
+      - name: Enforce isolated API builder readiness
+        working-directory: controller
+        env:
+          CONTROL_API_READ_TOKEN: ${{ secrets.CONTROL_API_READ_TOKEN }}
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: python3 -B scripts/policy-gate-v2.py --phase build_api
+
+      - name: FUTURE BLOCKER - API builder identity and image
+        env:
+          CONTROL_API_READ_TOKEN: ${{ secrets.CONTROL_API_READ_TOKEN }}
+        run: |
+          test -n "$CONTROL_API_READ_TOKEN"
+          echo "RELEASE_POLICY_UNAVAILABLE: reviewed API builder identity/image is not provisioned" >&2
+          exit 78
+
+  build_ops:
+    needs: authorize
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Ops builder has no OIDC
+        run: |
+          test -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}"
+          test -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}"
+          test -z "${CONTROL_WEB_READ_TOKEN:-}"
+
+      - name: Checkout controller only
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          path: controller
+          persist-credentials: false
+          ref: ${{ github.ref }}
+
+      - name: Pin controller Python
+        uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548
+        with:
+          architecture: x64
+          check-latest: false
+          python-version: '3.12.13'
+
+      - name: Enforce isolated Ops builder readiness
+        working-directory: controller
+        env:
+          CONTROL_API_READ_TOKEN: ${{ secrets.CONTROL_API_READ_TOKEN }}
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: python3 -B scripts/policy-gate-v2.py --phase build_ops
+
+      - name: FUTURE BLOCKER - Ops builder identity and image
+        env:
+          CONTROL_API_READ_TOKEN: ${{ secrets.CONTROL_API_READ_TOKEN }}
+        run: |
+          test -n "$CONTROL_API_READ_TOKEN"
+          echo "RELEASE_POLICY_UNAVAILABLE: reviewed Ops builder identity/image is not provisioned" >&2
+          exit 78
+
+  build_web:
+    needs: authorize
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Web builder has no OIDC
+        run: |
+          test -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}"
+          test -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}"
+          test -z "${CONTROL_API_READ_TOKEN:-}"
+
+      - name: Checkout controller only
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          path: controller
+          persist-credentials: false
+          ref: ${{ github.ref }}
+
+      - name: Pin controller Python
+        uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548
+        with:
+          architecture: x64
+          check-latest: false
+          python-version: '3.12.13'
+
+      - name: Enforce isolated Web builder readiness
+        working-directory: controller
+        env:
+          CONTROL_WEB_READ_TOKEN: ${{ secrets.CONTROL_WEB_READ_TOKEN }}
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: python3 -B scripts/policy-gate-v2.py --phase build_web
+
+      - name: FUTURE BLOCKER - Web builder identity and image
+        env:
+          CONTROL_WEB_READ_TOKEN: ${{ secrets.CONTROL_WEB_READ_TOKEN }}
+        run: |
+          test -n "$CONTROL_WEB_READ_TOKEN"
+          echo "RELEASE_POLICY_UNAVAILABLE: reviewed Web builder identity/image is not provisioned" >&2
+          exit 78
+
+  verify:
+    needs: [authorize, build_api, build_ops, build_web]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Verifier has no OIDC or product credentials
+        run: |
+          test -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}"
+          test -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}"
+          test -z "${CONTROL_API_READ_TOKEN:-}"
+          test -z "${CONTROL_WEB_READ_TOKEN:-}"
+
+      - name: Checkout independent verifier only
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          path: verifier
+          persist-credentials: false
+          ref: ${{ github.ref }}
+
+      - name: Pin verifier Python
+        uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548
+        with:
+          architecture: x64
+          check-latest: false
+          python-version: '3.12.13'
+
+      - name: Enforce verifier readiness
+        working-directory: verifier
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: python3 -B scripts/policy-gate-v2.py --phase verify
+
+      - name: FUTURE BLOCKER - runtime verifier and untrusted carrier
+        run: |
+          echo "RELEASE_POLICY_UNAVAILABLE: runtime verifier/carrier identity is not provisioned" >&2
+          exit 78
+
+  sign_release:
+    needs: [authorize, verify]
+    runs-on: ubuntu-24.04
+    environment: control-release
+    permissions:
+      actions: read
+      contents: none
+      id-token: write
+    steps:
+      - name: Pin source-free signer Python
+        uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548
+        with:
+          architecture: x64
+          check-latest: false
+          python-version: '3.12.13'
+
+      - name: Signer has OIDC but no checkout, source, or product credentials
+        run: |
+          test -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}"
+          test -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}"
+          test -z "${CONTROL_API_READ_TOKEN:-}"
+          test -z "${CONTROL_WEB_READ_TOKEN:-}"
+          test ! -e "$GITHUB_WORKSPACE/.git"
+          test ! -e "$GITHUB_WORKSPACE/controller"
+          test ! -e "$GITHUB_WORKSPACE/verifier"
+
+      - name: FUTURE BLOCKER - source-free verifier bundle identity
+        run: |
+          if test ! -r /opt/control-release-verifier-v6/identity.json; then
+            echo "RELEASE_POLICY_UNAVAILABLE: source-free verifier identity is not provisioned" >&2
+            exit 78
+          fi
+
+      - name: Gate the source-free signer
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: |
+          python3 -B /opt/control-release-verifier-v6/scripts/policy-gate-v2.py \
+            --phase sign_release
+
+      - name: FUTURE BLOCKER - fresh authenticated authority evidence
+        run: |
+          for evidence in \
+            approval-v2.json \
+            envelope-v6.json \
+            initial-controller-tag.json \
+            initial-github-controls.json \
+            initial-ledger.json \
+            controller-context.json \
+            controller-local-tag.json \
+            controller-release.json \
+            controller-immutable-releases.json \
+            controller-controls-v2.json \
+            ledger-controls-v2.json
+          do
+            if test ! -r "/run/control-release-evidence/$evidence"; then
+              echo "RELEASE_POLICY_UNAVAILABLE: fresh authenticated evidence carrier is not provisioned" >&2
+              exit 78
+            fi
+          done
+
+      - name: Revalidate controller, ledger, and controls immediately before Cosign
+        env:
+          APPROVAL_PATH: ${{ inputs.approval_path }}
+          CONTROLLER_COMMIT_SHA: ${{ needs.authorize.outputs.controller_commit_sha }}
+          CONTROLLER_RELEASE_ID: ${{ needs.authorize.outputs.controller_release_id }}
+          CONTROLLER_REPOSITORY_ID: ${{ needs.authorize.outputs.controller_repository_id }}
+          CONTROLLER_TAG_REF: ${{ needs.authorize.outputs.controller_tag_ref }}
+          CONTROLLER_TAG_OBJECT_SHA: ${{ needs.authorize.outputs.controller_tag_object_sha }}
+          GITHUB_TOKEN: ${{ github.token }}
+          LEDGER_HEAD_SHA: ${{ needs.authorize.outputs.ledger_head_sha }}
+        run: |
+          python3 -B /opt/control-release-verifier-v6/scripts/verify-controller-tag.py \
+            --controller-tag "${CONTROLLER_TAG_REF#refs/tags/}" \
+            --tag-object-sha "$CONTROLLER_TAG_OBJECT_SHA" \
+            --commit-sha "$CONTROLLER_COMMIT_SHA" \
+            --release-id "$CONTROLLER_RELEASE_ID" \
+            --repository-id "$CONTROLLER_REPOSITORY_ID" \
+            --github-context /run/control-release-evidence/controller-context.json \
+            --local-git-tag /run/control-release-evidence/controller-local-tag.json \
+            --release-response /run/control-release-evidence/controller-release.json \
+            --immutable-releases-response /run/control-release-evidence/controller-immutable-releases.json \
+            >/run/control-release-evidence/fresh-controller-tag.json
+          env \
+            GITHUB_ACTIONS=true \
+            GITHUB_API_URL=https://api.github.com \
+            GITHUB_REF=refs/heads/main \
+            GITHUB_REPOSITORY=PluckXD/tratto-control-release-ledger \
+            GITHUB_SERVER_URL=https://github.com \
+            GITHUB_SHA="$LEDGER_HEAD_SHA" \
+            RUNNER_ENVIRONMENT=github-hosted \
+            python3 -B /opt/control-release-verifier-v6/scripts/validate-ledger.py \
+              "$APPROVAL_PATH" \
+              --repository-root /run/control-release-evidence/approval-ledger \
+              >/run/control-release-evidence/fresh-ledger.json
+          python3 -B /opt/control-release-verifier-v6/scripts/verify-github-controls-v2.py \
+            --controller-evidence /run/control-release-evidence/controller-controls-v2.json \
+            --ledger-evidence /run/control-release-evidence/ledger-controls-v2.json \
+            >/run/control-release-evidence/fresh-github-controls.json
+          python3 -B /opt/control-release-verifier-v6/scripts/validate-signer-freshness-v2.py \
+            --approval /run/control-release-evidence/approval-v2.json \
+            --envelope /run/control-release-evidence/envelope-v6.json \
+            --initial-ledger-attestation /run/control-release-evidence/initial-ledger.json \
+            --fresh-ledger-attestation /run/control-release-evidence/fresh-ledger.json \
+            --initial-controller-tag-attestation /run/control-release-evidence/initial-controller-tag.json \
+            --fresh-controller-tag-attestation /run/control-release-evidence/fresh-controller-tag.json \
+            --initial-github-controls-attestation /run/control-release-evidence/initial-github-controls.json \
+            --fresh-github-controls-attestation /run/control-release-evidence/fresh-github-controls.json
+          echo "RELEASE_POLICY_UNAVAILABLE: reviewed Cosign verifier/identity is not provisioned" >&2
+          exit 78
+          # FUTURE COSIGN: replace the two fail-closed lines above only after
+          # the identity, envelope-v6 verifier, and exact command are reviewed.
