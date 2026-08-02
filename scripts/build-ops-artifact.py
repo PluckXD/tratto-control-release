@@ -218,6 +218,19 @@ def main() -> int:
             python_version=python_version,
         )
         entries = git_entries(root, args.release_sha)
+        TREE.validate_quiescence_helper_contract(
+            next(
+                (
+                    payload
+                    for path, kind, payload in entries
+                    if (
+                        kind == "file"
+                        and path == TREE.QUIESCENCE_HELPER_PATH
+                    )
+                ),
+                None,
+            )
+        )
         embedded_runtime_policy = next(
             (
                 payload

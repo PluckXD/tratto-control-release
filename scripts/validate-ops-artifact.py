@@ -130,6 +130,7 @@ def main() -> int:
         records: list[tuple[str, bytes]] = []
         markers: dict[str, bytes] = {}
         embedded_runtime_policy: bytes | None = None
+        quiescence_helper: bytes | None = None
         total = 0
         with archive:
             if archive.pax_headers:
@@ -192,11 +193,14 @@ def main() -> int:
                     == "release-root/policies/control-runtime-v1.json"
                 ):
                     embedded_runtime_policy = payload
+                if name == TREE.QUIESCENCE_HELPER_PATH:
+                    quiescence_helper = payload
 
         if set(markers) != TREE.MARKERS:
             reject("Ops archive markers are missing or ambiguous")
         TREE.validate_required_inventory(payload_paths)
         TREE.validate_bootstrap_required_file_modes(payload_modes)
+        TREE.validate_quiescence_helper_contract(quiescence_helper)
         for path in payload_paths:
             parent = str(Path(path).parent).replace("\\", "/")
             while parent not in {"", "."}:

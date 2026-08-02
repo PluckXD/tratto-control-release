@@ -87,6 +87,9 @@ descriptor to the pre-existing immutable lock wrapper as standard input:
   EXPECTED_ATTESTATION_SHA256="$EXPECTED_ATTESTATION_SHA256" \
   EXPECTED_CARRIER_SHA="$EXPECTED_CARRIER_SHA" \
   EXPECTED_CONTROLLER_SHA="$EXPECTED_CONTROLLER_SHA" \
+  EXPECTED_PREDECESSOR_KIT_ID="${EXPECTED_PREDECESSOR_KIT_ID:-}" \
+  EXPECTED_PREDECESSOR_CONTROLLER_SHA="${EXPECTED_PREDECESSOR_CONTROLLER_SHA:-}" \
+  EXPECTED_PREDECESSOR_PUBLISHER_INTENT_SHA256="${EXPECTED_PREDECESSOR_PUBLISHER_INTENT_SHA256:-}" \
   /usr/bin/bash --noprofile --norc <<'TRATTO_BOOTSTRAP'
 set -Eeuo pipefail
 : "${EXPECTED_HELPER_SHA256:?authenticated helper SHA-256 required}"
@@ -97,6 +100,21 @@ set -Eeuo pipefail
 [[ "$EXPECTED_ATTESTATION_SHA256" =~ ^[0-9a-f]{64}$ ]]
 [[ "$EXPECTED_CARRIER_SHA" =~ ^[0-9a-f]{40}$ ]]
 [[ "$EXPECTED_CONTROLLER_SHA" =~ ^[0-9a-f]{40}$ ]]
+predecessor_args=()
+if [[ -n "$EXPECTED_PREDECESSOR_KIT_ID" ||
+      -n "$EXPECTED_PREDECESSOR_CONTROLLER_SHA" ||
+      -n "$EXPECTED_PREDECESSOR_PUBLISHER_INTENT_SHA256" ]]; then
+  [[ "$EXPECTED_PREDECESSOR_KIT_ID" =~ ^[0-9a-f]{64}$ ]]
+  [[ "$EXPECTED_PREDECESSOR_CONTROLLER_SHA" =~ ^[0-9a-f]{40}$ ]]
+  [[ "$EXPECTED_PREDECESSOR_PUBLISHER_INTENT_SHA256" =~ ^[0-9a-f]{64}$ ]]
+  predecessor_args=(
+    --expected-predecessor-kit-id "$EXPECTED_PREDECESSOR_KIT_ID"
+    --expected-predecessor-controller-sha \
+      "$EXPECTED_PREDECESSOR_CONTROLLER_SHA"
+    --expected-predecessor-publisher-intent-sha256 \
+      "$EXPECTED_PREDECESSOR_PUBLISHER_INTENT_SHA256"
+  )
+fi
 
 incoming=/var/lib/tratto-control/incoming
 helper="$incoming/install-bootstrap-source-kit.py"
@@ -145,6 +163,7 @@ helper_size="$(/usr/bin/stat -Lc '%s' "$helper_fd_path")"
     --expected-attestation-sha256 "$EXPECTED_ATTESTATION_SHA256" \
     --expected-carrier-sha "$EXPECTED_CARRIER_SHA" \
     --expected-controller-sha "$EXPECTED_CONTROLLER_SHA" \
+    "${predecessor_args[@]}" \
   <&"$helper_fd"
 exec {helper_fd}<&-
 TRATTO_BOOTSTRAP
@@ -156,6 +175,19 @@ bindings, validates the signed helper block and every archive byte, and
 verifies all three separate blob signatures before it writes state or executes
 installed Operations. The helper-origin receipt is retained as release
 evidence; it is not an independent host trust root.
+
+The three predecessor bindings are normally empty. They may be supplied only
+to recover the exact authenticated state in which a previous source kit
+completed source exchange and retention but its bootstrap publisher failed
+before exchange. The successor approval must list the predecessor API commit
+in both API and Ops `required_ancestors`. The externally authenticated kit ID,
+controller SHA, and canonical publisher-intent SHA-256 must all match. The
+helper then records an append-only predecessor-to-successor authorization,
+archives the predecessor records and candidate by no-overwrite renames, and
+passes a bounded one-use authorization to the publisher over an inherited
+read-only pipe. A used predecessor, a post-exchange publisher, missing rollback
+evidence, mixed digests, partial records, or any different successor remains
+fail-closed.
 
 ## Stable controller v2 / envelope v6
 

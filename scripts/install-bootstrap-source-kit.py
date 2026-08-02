@@ -44,6 +44,8 @@ PREPARED_NAME = "bootstrap-source-kit.prepared.json"
 EXCHANGED_NAME = "bootstrap-source-kit.exchanged.json"
 RETAINED_NAME = "bootstrap-source-kit.retained.json"
 USED_NAME = "bootstrap-source-kit.used.json"
+SUPERSEDE_NAME = "bootstrap-source-kit.supersede.json"
+SUPERSEDED_RECORD_PREFIX = "bootstrap-source-kit."
 HELPER_NAME = "install-bootstrap-source-kit.py"
 HELPER_BUNDLE_NAME = "bootstrap-source-kit.sigstore.json"
 ATTESTATION_NAME = "release-attestation.json"
@@ -56,6 +58,17 @@ LOCK_DIRECTORY = Path("/run/tratto-control")
 LOCK_NAME = "deploy.lock"
 LOCK_FD_ENV = "TRATTO_CONTROL_LOCK_FD"
 LOCK_HELD_ENV = "TRATTO_CONTROL_LOCK_HELD"
+CONTROL_STAGING = Path("/opt/tratto-control/.staging")
+CONTROL_ROOT = Path("/opt/tratto-control")
+PUBLISHER_INTENT_NAME = "bootstrap-upgrade.intent.json"
+PUBLISHER_USED_NAME = "bootstrap-upgrade.used.json"
+PUBLISHER_SUPERSEDE_NAME = "bootstrap-upgrade.supersede.json"
+PUBLISHER_CANDIDATE_NAME = "bootstrap.upgrading"
+PUBLISHER_PREVIOUS_PREFIX = "bootstrap.previous."
+PUBLISHER_SUPERSEDE_FD_ENV = "TRATTO_CONTROL_BOOTSTRAP_SUPERSEDE_FD"
+PUBLISHER_SUPERSEDE_CONTRACT = (
+    "tratto-control-bootstrap-publisher-supersede-v1"
+)
 
 CARRIER_REPOSITORY = "PluckXD/tratto-control-release-carrier"
 CARRIER_WORKFLOW = ".github/workflows/control-bootstrap-v1.yml"
@@ -73,8 +86,14 @@ ARCHIVE_NAME_RE = re.compile(
     r"^tratto-control-ops-([0-9a-f]{40})\.tar\.gz$"
 )
 STATE_TEMP_RE = re.compile(
-    r"^bootstrap-source-kit\.(intent|prepared|exchanged|retained|used)"
+    r"^bootstrap-source-kit\."
+    r"(intent|prepared|exchanged|retained|used|supersede)"
     r"\.([0-9a-f]{64})\.installing$"
+)
+SUPERSEDED_RECORD_RE = re.compile(
+    r"^bootstrap-source-kit\."
+    r"(intent|prepared|exchanged|retained)"
+    r"\.superseded\.([0-9a-f]{64})\.json$"
 )
 
 MAX_HELPER_BYTES = 2 * 1024 * 1024
@@ -173,6 +192,18 @@ def require_sha(value: Any, label: str) -> str:
     if type(value) is not str or SHA_RE.fullmatch(value) is None:
         reject(f"{label} não é commit SHA canônico")
     return value
+
+
+def require_sha_list(value: Any, label: str) -> tuple[str, ...]:
+    if type(value) is not list or not value:
+        reject(f"{label} precisa ser lista não vazia de commits")
+    result = tuple(
+        require_sha(item, f"{label}[{index}]")
+        for index, item in enumerate(value)
+    )
+    if len(set(result)) != len(result):
+        reject(f"{label} contém commit duplicado")
+    return result
 
 
 def write_all(descriptor: int, payload: bytes) -> None:
@@ -432,6 +463,9 @@ class BootstrapExpectations:
     attestation_sha256: str
     carrier_sha: str
     controller_sha: str
+    predecessor_kit_id: str | None = None
+    predecessor_controller_sha: str | None = None
+    predecessor_publisher_intent_sha256: str | None = None
 
 
 def validate_expectations(
@@ -453,6 +487,26 @@ def validate_expectations(
         expectations.controller_sha,
         "controller SHA esperado",
     )
+    predecessor_values = (
+        expectations.predecessor_kit_id,
+        expectations.predecessor_controller_sha,
+        expectations.predecessor_publisher_intent_sha256,
+    )
+    if any(item is not None for item in predecessor_values):
+        if not all(item is not None for item in predecessor_values):
+            reject("bindings do predecessor precisam ser informados juntos")
+        require_hash(
+            expectations.predecessor_kit_id,
+            "kit ID predecessor esperado",
+        )
+        require_sha(
+            expectations.predecessor_controller_sha,
+            "controller predecessor esperado",
+        )
+        require_hash(
+            expectations.predecessor_publisher_intent_sha256,
+            "publisher intent predecessor esperado",
+        )
 
 
 @dataclass(frozen=True)
@@ -466,6 +520,8 @@ class AttestationBinding:
     ops_size: int
     helper_sha256: str
     approval_sha256: str
+    api_required_ancestors: tuple[str, ...]
+    ops_required_ancestors: tuple[str, ...]
     migration: Mapping[str, Any]
 
 
@@ -618,6 +674,14 @@ def validate_attestation(
         "Ops SHA aprovado",
     ) != api_sha:
         reject("API e Ops aprovados divergem")
+    api_required_ancestors = require_sha_list(
+        api_approval.get("required_ancestors"),
+        "required ancestors da API",
+    )
+    ops_required_ancestors = require_sha_list(
+        ops_approval.get("required_ancestors"),
+        "required ancestors de Ops",
+    )
 
     artifacts = exact_object(
         value["artifacts"],
@@ -718,6 +782,8 @@ def validate_attestation(
         ops_size=ops_artifact["size_bytes"],
         helper_sha256=helper_sha256,
         approval_sha256=approval["manifest_sha256"],
+        api_required_ancestors=api_required_ancestors,
+        ops_required_ancestors=ops_required_ancestors,
         migration=value["migration"],
     )
 
@@ -1237,6 +1303,60 @@ def scan_tree(
     return entries
 
 
+def protected_bootstrap_tree_digest(
+    descriptor: int,
+    *,
+    uid: int,
+    gid: int,
+) -> str:
+    entries = scan_tree(
+        descriptor,
+        uid=uid,
+        gid=gid,
+        root_modes={0o555},
+        directory_modes={0o555},
+        file_modes={0o444, 0o555},
+    )
+    children: dict[str, set[str]] = {".": set()}
+    for path, entry in entries.items():
+        parent = str(PurePosixPath(path).parent)
+        children.setdefault(parent, set()).add(PurePosixPath(path).name)
+        if entry.kind == "directory":
+            children.setdefault(path, set())
+    records: list[bytes] = []
+
+    def visit(relative: str) -> None:
+        records.append(
+            b"D\0"
+            + relative.encode("utf-8")
+            + b"\0"
+            + b"0555\n"
+        )
+        for name in sorted(children[relative]):
+            child = name if relative == "." else f"{relative}/{name}"
+            entry = entries[child]
+            if entry.kind == "directory":
+                visit(child)
+                continue
+            records.append(
+                b"F\0"
+                + child.encode("utf-8")
+                + b"\0"
+                + f"{entry.mode:04o}".encode("ascii")
+                + b"\0"
+                + str(entry.size).encode("ascii")
+                + b"\0"
+                + entry.sha256.encode("ascii")
+                + b"\n"
+            )
+
+    visit(".")
+    digest = hashlib.sha256()
+    for record in records:
+        digest.update(record)
+    return digest.hexdigest()
+
+
 def validate_exact_tree(
     descriptor: int,
     inventory: ArchiveInventory,
@@ -1576,6 +1696,234 @@ def marker_payload(
     )
 
 
+SOURCE_PHASE_NAMES = {
+    "intent": INTENT_NAME,
+    "prepared": PREPARED_NAME,
+    "exchanged": EXCHANGED_NAME,
+    "retained": RETAINED_NAME,
+}
+
+
+@dataclass(frozen=True)
+class SupersededSourceTransaction:
+    kit_id: str
+    api_sha: str
+    controller_sha: str
+    old_digest: str
+    new_digest: str
+    intent_raw: bytes
+    publisher_intent_sha256: str
+
+    def archived_name(self, phase: str) -> str:
+        if phase not in SOURCE_PHASE_NAMES:
+            reject("fase inválida no histórico do source kit")
+        return (
+            f"{SUPERSEDED_RECORD_PREFIX}{phase}.superseded."
+            f"{self.kit_id}.json"
+        )
+
+
+def validate_source_intent(
+    raw: bytes,
+    *,
+    allow_noop: bool = False,
+) -> SupersededSourceTransaction:
+    value = parse_canonical_json(raw, "bootstrap source intent predecessor")
+    exact_object(
+        value,
+        {
+            "api_sha",
+            "archive_name",
+            "attestation_sha256",
+            "carrier_sha",
+            "contract",
+            "controller_sha",
+            "helper_sha256",
+            "kit_id",
+            "new_source_tree_sha256",
+            "old_source_tree_sha256",
+            "ops_sha256",
+            "schema_version",
+        },
+        "bootstrap source intent predecessor",
+    )
+    api_sha = require_sha(value["api_sha"], "API SHA predecessor")
+    carrier_sha = require_sha(
+        value["carrier_sha"],
+        "carrier SHA predecessor",
+    )
+    controller_sha = require_sha(
+        value["controller_sha"],
+        "controller SHA predecessor",
+    )
+    attestation_sha256 = require_hash(
+        value["attestation_sha256"],
+        "attestation predecessor",
+    )
+    helper_sha256 = require_hash(
+        value["helper_sha256"],
+        "helper predecessor",
+    )
+    ops_sha256 = require_hash(
+        value["ops_sha256"],
+        "Ops predecessor",
+    )
+    old_digest = require_hash(
+        value["old_source_tree_sha256"],
+        "árvore source antiga predecessor",
+    )
+    new_digest = require_hash(
+        value["new_source_tree_sha256"],
+        "árvore source nova predecessor",
+    )
+    kit_id = require_hash(value["kit_id"], "kit ID predecessor")
+    archive_name = value["archive_name"]
+    archive_match = (
+        ARCHIVE_NAME_RE.fullmatch(archive_name)
+        if type(archive_name) is str
+        else None
+    )
+    if (
+        value["contract"] != CONTRACT
+        or value["schema_version"] != 1
+        or archive_match is None
+        or archive_match.group(1) != api_sha
+    ):
+        reject("intent predecessor não pertence a um source kit válido")
+    computed_kit_id = hashlib.sha256(
+        canonical_bytes(
+            {
+                "api_sha": api_sha,
+                "attestation_sha256": attestation_sha256,
+                "carrier_sha": carrier_sha,
+                "contract": CONTRACT,
+                "controller_sha": controller_sha,
+                "helper_sha256": helper_sha256,
+                "ops_sha256": ops_sha256,
+                "source_tree_sha256": new_digest,
+            }
+        )
+    ).hexdigest()
+    if (
+        kit_id != computed_kit_id
+        or (old_digest == new_digest and not allow_noop)
+    ):
+        reject("identidade do source kit predecessor diverge do intent")
+    return SupersededSourceTransaction(
+        kit_id=kit_id,
+        api_sha=api_sha,
+        controller_sha=controller_sha,
+        old_digest=old_digest,
+        new_digest=new_digest,
+        intent_raw=raw,
+        publisher_intent_sha256="",
+    )
+
+
+def source_supersede_payload(
+    predecessor: SupersededSourceTransaction,
+    *,
+    successor_kit_id: str,
+    successor_new_digest: str,
+) -> bytes:
+    require_hash(successor_kit_id, "kit ID sucessor")
+    require_hash(successor_new_digest, "árvore source sucessora")
+    return canonical_bytes(
+        {
+            "contract": CONTRACT,
+            "phase": "supersede",
+            "predecessor_api_sha": predecessor.api_sha,
+            "predecessor_controller_sha": predecessor.controller_sha,
+            "predecessor_intent_sha256": hashlib.sha256(
+                predecessor.intent_raw
+            ).hexdigest(),
+            "predecessor_kit_id": predecessor.kit_id,
+            "predecessor_new_source_tree_sha256": predecessor.new_digest,
+            "predecessor_old_source_tree_sha256": predecessor.old_digest,
+            "predecessor_publisher_intent_sha256": (
+                predecessor.publisher_intent_sha256
+            ),
+            "schema_version": 1,
+            "successor_kit_id": successor_kit_id,
+            "successor_new_source_tree_sha256": successor_new_digest,
+        }
+    )
+
+
+def validate_source_supersede(
+    raw: bytes,
+    *,
+    successor_kit_id: str,
+    successor_new_digest: str,
+) -> SupersededSourceTransaction:
+    value = parse_canonical_json(raw, "bootstrap source supersede")
+    exact_object(
+        value,
+        {
+            "contract",
+            "phase",
+            "predecessor_api_sha",
+            "predecessor_controller_sha",
+            "predecessor_intent_sha256",
+            "predecessor_kit_id",
+            "predecessor_new_source_tree_sha256",
+            "predecessor_old_source_tree_sha256",
+            "predecessor_publisher_intent_sha256",
+            "schema_version",
+            "successor_kit_id",
+            "successor_new_source_tree_sha256",
+        },
+        "bootstrap source supersede",
+    )
+    if (
+        value["contract"] != CONTRACT
+        or value["phase"] != "supersede"
+        or value["schema_version"] != 1
+        or value["successor_kit_id"] != successor_kit_id
+        or value["successor_new_source_tree_sha256"]
+        != successor_new_digest
+    ):
+        reject("source supersede não autoriza este kit sucessor")
+    predecessor = SupersededSourceTransaction(
+        kit_id=require_hash(
+            value["predecessor_kit_id"],
+            "kit ID predecessor no supersede",
+        ),
+        api_sha=require_sha(
+            value["predecessor_api_sha"],
+            "API predecessor no supersede",
+        ),
+        controller_sha=require_sha(
+            value["predecessor_controller_sha"],
+            "controller predecessor no supersede",
+        ),
+        old_digest=require_hash(
+            value["predecessor_old_source_tree_sha256"],
+            "árvore antiga predecessor no supersede",
+        ),
+        new_digest=require_hash(
+            value["predecessor_new_source_tree_sha256"],
+            "árvore nova predecessor no supersede",
+        ),
+        intent_raw=b"",
+        publisher_intent_sha256=require_hash(
+            value["predecessor_publisher_intent_sha256"],
+            "publisher intent predecessor no supersede",
+        ),
+    )
+    require_hash(
+        value["predecessor_intent_sha256"],
+        "intent predecessor no supersede",
+    )
+    if (
+        predecessor.kit_id == successor_kit_id
+        or predecessor.new_digest == successor_new_digest
+        or predecessor.old_digest == predecessor.new_digest
+    ):
+        reject("source supersede não representa uma sucessão distinta")
+    return predecessor
+
+
 def publish_record(
     parent: int,
     final_name: str,
@@ -1780,6 +2128,7 @@ def reject_foreign_state(
     *,
     uid: int,
     gid: int,
+    predecessor: SupersededSourceTransaction | None = None,
 ) -> None:
     allowed = {
         SOURCE_NAME,
@@ -1790,7 +2139,14 @@ def reject_foreign_state(
         EXCHANGED_NAME,
         RETAINED_NAME,
         USED_NAME,
+        SUPERSEDE_NAME,
     }
+    if predecessor is not None:
+        allowed.add(f"{PREVIOUS_PREFIX}{predecessor.kit_id}")
+        allowed.update(
+            predecessor.archived_name(phase)
+            for phase in SOURCE_PHASE_NAMES
+        )
     for name in os.listdir(state_descriptor):
         match = STATE_TEMP_RE.fullmatch(name)
         if match:
@@ -1802,6 +2158,14 @@ def reject_foreign_state(
             or name.startswith(PREVIOUS_PREFIX)
         ) and name not in allowed:
             reject("há source kit anterior ou concorrente não reconciliado")
+        archived = SUPERSEDED_RECORD_RE.fullmatch(name)
+        if archived is not None and name not in allowed:
+            reject("há histórico source superseded não reconhecido")
+        if (
+            name.startswith("bootstrap-source-kit.")
+            and name not in allowed
+        ):
+            reject("há journal source kit concorrente não reconhecido")
     for name in (
         INTENT_NAME,
         PREPARED_NAME,
@@ -1858,6 +2222,1043 @@ def read_record_if_present(
         )
     finally:
         os.close(descriptor)
+
+
+def validate_fixed_predecessor_publisher_state(
+    *,
+    uid: int,
+    gid: int,
+) -> str:
+    control = open_path_chain(
+        CONTROL_ROOT,
+        uid=uid,
+        gid=gid,
+        final_modes={0o711},
+    )
+    try:
+        staging = _open_named_directory(
+            control,
+            ".staging",
+            uid=uid,
+            gid=gid,
+            modes={0o700},
+        )
+        if staging is None:
+            reject("staging do publisher predecessor está ausente")
+        descriptor = os.open(
+            PUBLISHER_INTENT_NAME,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=staging,
+        )
+        info = os.fstat(descriptor)
+        try:
+            validate_regular(
+                info,
+                PUBLISHER_INTENT_NAME,
+                uid=uid,
+                gid=gid,
+                modes={0o400},
+                maximum=1024,
+            )
+            raw = read_all(
+                descriptor,
+                info,
+                maximum=1024,
+                label=PUBLISHER_INTENT_NAME,
+            )
+        finally:
+            os.close(descriptor)
+        value = parse_canonical_json(raw, PUBLISHER_INTENT_NAME)
+        exact_object(
+            value,
+            {
+                "new_tree_sha256",
+                "old_tree_sha256",
+                "phase",
+                "previous_name",
+                "schema_version",
+            },
+            PUBLISHER_INTENT_NAME,
+        )
+        old_digest = require_hash(
+            value["old_tree_sha256"],
+            "bootstrap antigo do publisher predecessor",
+        )
+        new_digest = require_hash(
+            value["new_tree_sha256"],
+            "bootstrap novo do publisher predecessor",
+        )
+        if (
+            value["phase"] != "intent"
+            or value["schema_version"] != 1
+            or value["previous_name"]
+            != PUBLISHER_PREVIOUS_PREFIX + old_digest[:32]
+            or old_digest == new_digest
+        ):
+            reject("publisher intent predecessor diverge do contrato")
+        allowed = {
+            PUBLISHER_INTENT_NAME,
+            PUBLISHER_CANDIDATE_NAME,
+        }
+        for name in os.listdir(staging):
+            if (
+                name == PUBLISHER_USED_NAME
+                or name == PUBLISHER_SUPERSEDE_NAME
+                or name.startswith(PUBLISHER_PREVIOUS_PREFIX)
+                or name.startswith("bootstrap-upgrade.intent.superseded.")
+                or name.startswith("bootstrap.upgrading.superseded.")
+                or (
+                    name.startswith("bootstrap-upgrade.")
+                    and name not in allowed
+                )
+                or (
+                    name.startswith("bootstrap.upgrading")
+                    and name not in allowed
+                )
+            ):
+                reject("publisher predecessor não está pré-exchange limpo")
+        try:
+            os.stat(
+                "current",
+                dir_fd=control,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            reject("runtime current já existe antes do bootstrap")
+        final = _open_named_directory(
+            control,
+            "bootstrap",
+            uid=uid,
+            gid=gid,
+            modes={0o555},
+        )
+        if final is None:
+            reject("bootstrap predecessor publicado está ausente")
+        try:
+            if (
+                protected_bootstrap_tree_digest(
+                    final,
+                    uid=uid,
+                    gid=gid,
+                )
+                != old_digest
+            ):
+                reject("bootstrap publicado diverge do publisher intent")
+        finally:
+            os.close(final)
+        candidate = _open_named_directory(
+            staging,
+            PUBLISHER_CANDIDATE_NAME,
+            uid=uid,
+            gid=gid,
+            modes={0o555},
+        )
+        if candidate is None:
+            reject("candidate predecessor do publisher está ausente")
+        try:
+            if (
+                protected_bootstrap_tree_digest(
+                    candidate,
+                    uid=uid,
+                    gid=gid,
+                )
+                != new_digest
+            ):
+                reject("candidate predecessor diverge do publisher intent")
+        finally:
+            os.close(candidate)
+        return hashlib.sha256(raw).hexdigest()
+    finally:
+        if "staging" in locals() and staging is not None:
+            os.close(staging)
+        os.close(control)
+
+
+def _expected_source_phase(
+    predecessor: SupersededSourceTransaction,
+    phase: str,
+) -> bytes:
+    if phase == "intent":
+        return predecessor.intent_raw
+    return marker_payload(
+        kit_id=predecessor.kit_id,
+        phase=phase,
+        old_digest=predecessor.old_digest,
+        new_digest=predecessor.new_digest,
+    )
+
+
+def _archive_source_record(
+    state_descriptor: int,
+    predecessor: SupersededSourceTransaction,
+    phase: str,
+    *,
+    uid: int,
+    gid: int,
+    runtime: Runtime,
+) -> None:
+    source_name = SOURCE_PHASE_NAMES[phase]
+    archived_name = predecessor.archived_name(phase)
+    expected = _expected_source_phase(predecessor, phase)
+    source_raw = read_record_if_present(
+        state_descriptor,
+        source_name,
+        uid=uid,
+        gid=gid,
+    )
+    archived_raw = read_record_if_present(
+        state_descriptor,
+        archived_name,
+        uid=uid,
+        gid=gid,
+    )
+    if archived_raw is not None:
+        if archived_raw != expected:
+            reject(f"histórico predecessor diverge: {archived_name}")
+        if source_raw == expected:
+            reject(f"record predecessor coexistente: {source_name}")
+        return
+    if source_raw != expected:
+        reject(f"record predecessor não recuperável: {source_name}")
+    try:
+        runtime.noreplace(
+            state_descriptor,
+            source_name,
+            state_descriptor,
+            archived_name,
+        )
+    except FileExistsError:
+        archived_raw = read_record_if_present(
+            state_descriptor,
+            archived_name,
+            uid=uid,
+            gid=gid,
+        )
+        if archived_raw != expected:
+            raise
+    os.fsync(state_descriptor)
+    if read_record_if_present(
+        state_descriptor,
+        archived_name,
+        uid=uid,
+        gid=gid,
+    ) != expected:
+        reject(f"record predecessor não foi arquivado: {source_name}")
+
+
+def _validate_predecessor_rollback(
+    state_descriptor: int,
+    predecessor: SupersededSourceTransaction,
+    *,
+    uid: int,
+    gid: int,
+) -> None:
+    candidate = _open_named_directory(
+        state_descriptor,
+        f"{CANDIDATE_PREFIX}{predecessor.kit_id}",
+        uid=uid,
+        gid=gid,
+        modes={0o555, 0o700},
+    )
+    if candidate is not None:
+        os.close(candidate)
+        reject("candidate predecessor coexistente após retenção")
+    previous = _open_named_directory(
+        state_descriptor,
+        f"{PREVIOUS_PREFIX}{predecessor.kit_id}",
+        uid=uid,
+        gid=gid,
+        modes={0o555},
+    )
+    if previous is None:
+        reject("rollback predecessor retido está ausente")
+    try:
+        observed = tree_digest(scan_tree(previous, uid=uid, gid=gid))
+    finally:
+        os.close(previous)
+    if observed != predecessor.old_digest:
+        reject("rollback predecessor retido diverge do intent")
+
+
+def validate_partial_source_record(
+    state_descriptor: int,
+    name: str,
+    expected: bytes,
+    *,
+    uid: int,
+    gid: int,
+) -> None:
+    """Valida um journal parcial sem completá-lo nem removê-lo."""
+
+    descriptor = os.open(
+        name,
+        os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        dir_fd=state_descriptor,
+    )
+    try:
+        info = os.fstat(descriptor)
+        validate_regular(
+            info,
+            name,
+            uid=uid,
+            gid=gid,
+            modes={0o600, 0o444},
+            maximum=len(expected),
+            allow_empty=True,
+        )
+        observed = (
+            read_all(
+                descriptor,
+                info,
+                maximum=len(expected),
+                label=name,
+            )
+            if info.st_size
+            else b""
+        )
+    finally:
+        os.close(descriptor)
+    if not expected.startswith(observed):
+        reject(f"{name} não é prefixo do journal sucessor")
+    if stat.S_IMODE(info.st_mode) == 0o444 and observed != expected:
+        reject(f"{name} imutável está incompleto")
+
+
+def validate_reserved_source_namespace(
+    state_descriptor: int,
+    *,
+    binding: AttestationBinding,
+    inventory: ArchiveInventory,
+    successor_kit_id: str,
+    successor_new_digest: str,
+    observed_source_digest: str,
+    predecessor_expected: bool,
+    uid: int,
+    gid: int,
+) -> None:
+    allowed = {
+        INTENT_NAME,
+        PREPARED_NAME,
+        EXCHANGED_NAME,
+        RETAINED_NAME,
+        USED_NAME,
+        SUPERSEDE_NAME,
+    }
+    supersede_raw = read_record_if_present(
+        state_descriptor,
+        SUPERSEDE_NAME,
+        uid=uid,
+        gid=gid,
+    )
+    predecessor: SupersededSourceTransaction | None = None
+    if supersede_raw is not None:
+        predecessor = validate_source_supersede(
+            supersede_raw,
+            successor_kit_id=successor_kit_id,
+            successor_new_digest=successor_new_digest,
+        )
+        allowed.update(
+            predecessor.archived_name(phase)
+            for phase in SOURCE_PHASE_NAMES
+        )
+
+    intent_raw = read_record_if_present(
+        state_descriptor,
+        INTENT_NAME,
+        uid=uid,
+        gid=gid,
+    )
+    intent = (
+        validate_source_intent(
+            intent_raw,
+            allow_noop=not predecessor_expected,
+        )
+        if intent_raw is not None
+        else None
+    )
+    active_records = {
+        phase: (
+            intent_raw
+            if phase == "intent"
+            else read_record_if_present(
+                state_descriptor,
+                SOURCE_PHASE_NAMES[phase],
+                uid=uid,
+                gid=gid,
+            )
+        )
+        for phase in SOURCE_PHASE_NAMES
+    }
+    all_predecessor_archived = False
+    if predecessor is not None:
+        archived_records = {
+            phase: read_record_if_present(
+                state_descriptor,
+                predecessor.archived_name(phase),
+                uid=uid,
+                gid=gid,
+            )
+            for phase in SOURCE_PHASE_NAMES
+        }
+        predecessor_intent_raw = (
+            archived_records["intent"]
+            if archived_records["intent"] is not None
+            else intent_raw
+        )
+        if predecessor_intent_raw is None:
+            reject("intent predecessor não está recuperável no preflight")
+        parsed_predecessor = validate_source_intent(
+            predecessor_intent_raw
+        )
+        supersede_value = parse_canonical_json(
+            supersede_raw,
+            "bootstrap source supersede",
+        )
+        if (
+            parsed_predecessor.kit_id != predecessor.kit_id
+            or parsed_predecessor.api_sha != predecessor.api_sha
+            or parsed_predecessor.controller_sha
+            != predecessor.controller_sha
+            or parsed_predecessor.old_digest != predecessor.old_digest
+            or parsed_predecessor.new_digest != predecessor.new_digest
+            or hashlib.sha256(predecessor_intent_raw).hexdigest()
+            != supersede_value["predecessor_intent_sha256"]
+        ):
+            reject("intent predecessor diverge no preflight source")
+        predecessor = SupersededSourceTransaction(
+            kit_id=predecessor.kit_id,
+            api_sha=predecessor.api_sha,
+            controller_sha=predecessor.controller_sha,
+            old_digest=predecessor.old_digest,
+            new_digest=predecessor.new_digest,
+            intent_raw=predecessor_intent_raw,
+            publisher_intent_sha256=(
+                predecessor.publisher_intent_sha256
+            ),
+        )
+        for phase in SOURCE_PHASE_NAMES:
+            archived = archived_records[phase]
+            if (
+                archived is not None
+                and archived != _expected_source_phase(
+                    predecessor,
+                    phase,
+                )
+            ):
+                reject(f"histórico predecessor diverge: {phase}")
+        archived_presence = tuple(
+            archived_records[phase] is not None
+            for phase in SOURCE_PHASE_NAMES
+        )
+        archived_count = sum(archived_presence)
+        if archived_presence != (
+            (True,) * archived_count
+            + (False,) * (len(SOURCE_PHASE_NAMES) - archived_count)
+        ):
+            reject("histórico predecessor não forma prefixo transacional")
+        all_predecessor_archived = all(
+            raw is not None for raw in archived_records.values()
+        )
+        if all_predecessor_archived:
+            successor_intent = intent_payload(
+                binding,
+                inventory,
+                successor_kit_id,
+                predecessor.new_digest,
+            )
+            for phase, active in active_records.items():
+                expected_successor = (
+                    successor_intent
+                    if phase == "intent"
+                    else marker_payload(
+                        kit_id=successor_kit_id,
+                        phase=phase,
+                        old_digest=predecessor.new_digest,
+                        new_digest=successor_new_digest,
+                    )
+                )
+                if active is not None and active != expected_successor:
+                    reject(f"fase ativa sucessora diverge: {phase}")
+        else:
+            for phase, active in active_records.items():
+                archived = archived_records[phase]
+                if archived is None:
+                    if active != _expected_source_phase(
+                        predecessor,
+                        phase,
+                    ):
+                        reject(
+                            f"fase predecessor não recuperável: {phase}"
+                        )
+                elif active is not None:
+                    reject(
+                        f"fase predecessor coexiste com arquivo: {phase}"
+                    )
+    used_raw = read_record_if_present(
+        state_descriptor,
+        USED_NAME,
+        uid=uid,
+        gid=gid,
+    )
+    if used_raw is not None and predecessor_expected and predecessor is None:
+        reject("source predecessor já foi marcado como usado")
+    predecessor_kit_id = (
+        predecessor.kit_id
+        if predecessor is not None
+        else (
+            intent.kit_id
+            if predecessor_expected
+            and intent is not None
+            and intent.kit_id != successor_kit_id
+            else None
+        )
+    )
+    if predecessor_kit_id is not None:
+        allowed.add(f"{PREVIOUS_PREFIX}{predecessor_kit_id}")
+
+    successor_stage = (
+        not predecessor_expected
+        or predecessor is not None
+        and all_predecessor_archived
+    )
+    successor_old_digest = (
+        predecessor.new_digest
+        if predecessor is not None
+        else (
+            intent.old_digest
+            if intent is not None and intent.kit_id == successor_kit_id
+            else observed_source_digest
+        )
+    )
+    successor_intent_raw = intent_payload(
+        binding,
+        inventory,
+        successor_kit_id,
+        successor_old_digest,
+    )
+    expected_successor_records = {
+        "intent": successor_intent_raw,
+        **{
+            phase: marker_payload(
+                kit_id=successor_kit_id,
+                phase=phase,
+                old_digest=successor_old_digest,
+                new_digest=successor_new_digest,
+            )
+            for phase in ("prepared", "exchanged", "retained", "used")
+        },
+    }
+    successor_is_noop = (
+        successor_stage
+        and successor_old_digest == successor_new_digest
+    )
+    if successor_is_noop and predecessor_expected:
+        reject("sucessão com predecessor não pode ser no-op")
+    if used_raw is not None and predecessor_expected and not successor_stage:
+        reject("used source predecessor não pode ser superado")
+    if successor_stage:
+        for phase, raw in active_records.items():
+            if raw is not None and raw != expected_successor_records[phase]:
+                reject(f"fase ativa sucessora diverge: {phase}")
+        if used_raw is not None and used_raw != expected_successor_records["used"]:
+            reject("used source não pertence ao sucessor íntegro")
+
+    names = os.listdir(state_descriptor)
+    successor_partials: set[str] = set()
+    for name in names:
+        temporary = STATE_TEMP_RE.fullmatch(name)
+        if (
+            temporary is None
+            or temporary.group(2) != successor_kit_id
+            or temporary.group(1) == "supersede"
+        ):
+            continue
+        phase = temporary.group(1)
+        if not successor_stage:
+            reject("journal parcial sucessor existe antes do seu estágio")
+        validate_partial_source_record(
+            state_descriptor,
+            name,
+            expected_successor_records[phase],
+            uid=uid,
+            gid=gid,
+        )
+        successor_partials.add(phase)
+
+    present = {
+        phase: active_records[phase] is not None
+        for phase in SOURCE_PHASE_NAMES
+    }
+    present["used"] = used_raw is not None
+    for phase in successor_partials:
+        if present[phase]:
+            reject(f"fase sucessora {phase} coexiste com record parcial")
+    if successor_stage:
+        ordered = (
+            ("intent", "retained", "used")
+            if successor_is_noop
+            else ("intent", "prepared", "exchanged", "retained", "used")
+        )
+        for index, phase in enumerate(ordered[1:], start=1):
+            if present[phase] and not all(
+                present[prior] for prior in ordered[:index]
+            ):
+                reject(f"fase sucessora {phase} está fora de ordem")
+        if successor_is_noop and (
+            present["prepared"]
+            or present["exchanged"]
+            or "prepared" in successor_partials
+            or "exchanged" in successor_partials
+        ):
+            reject("source kit no-op contém evidência de exchange")
+
+    candidate_name = f"{CANDIDATE_PREFIX}{successor_kit_id}"
+    previous_name = f"{PREVIOUS_PREFIX}{successor_kit_id}"
+    final_is_successor = observed_source_digest == successor_new_digest
+    candidate_exists = candidate_name in names
+    candidate_is_complete_new = False
+    candidate_is_complete_old = False
+    if candidate_exists:
+        if successor_is_noop:
+            reject("source kit no-op contém candidate")
+        candidate_has_intent = present["intent"] or (
+            not predecessor_expected
+            and "intent" in successor_partials
+        )
+        if not successor_stage or not candidate_has_intent:
+            reject("candidate sucessor existe antes do intent ativo")
+        candidate = _open_named_directory(
+            state_descriptor,
+            candidate_name,
+            uid=uid,
+            gid=gid,
+            modes={0o555, 0o700},
+        )
+        if candidate is None:
+            reject("candidate sucessor desapareceu durante o preflight")
+        try:
+            candidate_mode = stat.S_IMODE(os.fstat(candidate).st_mode)
+            if candidate_mode == 0o555:
+                candidate_entries = scan_tree(candidate, uid=uid, gid=gid)
+                candidate_digest = tree_digest(candidate_entries)
+                candidate_is_complete_new = (
+                    candidate_entries == dict(inventory.entries)
+                )
+                candidate_is_complete_old = (
+                    candidate_digest == successor_old_digest
+                )
+        finally:
+            os.close(candidate)
+        if final_is_successor:
+            if not candidate_is_complete_old:
+                reject("candidate pós-exchange não é a fonte anterior")
+        elif candidate_mode == 0o555 and not candidate_is_complete_new:
+            reject("candidate preparado diverge do kit sucessor")
+        allowed.add(candidate_name)
+
+    previous_exists = previous_name in names
+    previous_is_valid = False
+    if previous_exists:
+        if successor_is_noop:
+            reject("source kit no-op contém retenção anterior")
+        if (
+            not successor_stage
+            or not final_is_successor
+            or not present["exchanged"]
+            or candidate_exists
+        ):
+            reject("retenção sucessora existe fora do estágio pós-exchange")
+        previous = _open_named_directory(
+            state_descriptor,
+            previous_name,
+            uid=uid,
+            gid=gid,
+            modes={0o555},
+        )
+        if previous is None:
+            reject("retenção sucessora desapareceu durante o preflight")
+        try:
+            previous_is_valid = (
+                tree_digest(scan_tree(previous, uid=uid, gid=gid))
+                == successor_old_digest
+            )
+        finally:
+            os.close(previous)
+        if not previous_is_valid:
+            reject("fonte bootstrap anterior retida diverge")
+        allowed.add(previous_name)
+
+    if successor_is_noop:
+        if not final_is_successor:
+            reject("fonte do source kit no-op diverge do kit")
+        if "intent" in successor_partials and (
+            any(present.values())
+            or successor_partials != {"intent"}
+        ):
+            reject("intent parcial no-op está fora de estágio")
+        if "retained" in successor_partials and (
+            not present["intent"]
+            or present["retained"]
+            or present["used"]
+            or successor_partials != {"retained"}
+        ):
+            reject("retained parcial no-op está fora de estágio")
+        if "used" in successor_partials and (
+            not present["intent"]
+            or not present["retained"]
+            or present["used"]
+            or successor_partials != {"used"}
+        ):
+            reject("used parcial no-op está fora de estágio")
+        if used_raw is not None and (
+            not present["intent"]
+            or not present["retained"]
+        ):
+            reject("used source no-op está fora de estágio")
+    elif successor_stage:
+        successor_artifact_exists = (
+            any(present.values())
+            or bool(successor_partials)
+            or candidate_exists
+            or previous_exists
+        )
+        if (
+            not final_is_successor
+            and present["prepared"]
+            and not candidate_is_complete_new
+        ):
+            reject("prepared sucessor existe sem candidate íntegro")
+        if (
+            final_is_successor
+            and successor_artifact_exists
+            and (
+                not present["intent"]
+                or not present["prepared"]
+                or (
+                    successor_old_digest != successor_new_digest
+                    and not candidate_is_complete_old
+                    and not previous_is_valid
+                )
+            )
+        ):
+            reject("fonte sucessora está sem evidência recuperável da troca")
+        if not final_is_successor and (
+            present["exchanged"]
+            or present["retained"]
+            or present["used"]
+            or "exchanged" in successor_partials
+            or "retained" in successor_partials
+            or "used" in successor_partials
+        ):
+            reject("fase pós-exchange existe antes da troca da fonte")
+        if "prepared" in successor_partials and (
+            not present["intent"]
+            or not candidate_is_complete_new
+            or final_is_successor
+            or previous_exists
+        ):
+            reject("prepared parcial sucessor está fora de estágio")
+        if "exchanged" in successor_partials and (
+            not present["prepared"]
+            or not final_is_successor
+            or not candidate_is_complete_old
+            or previous_exists
+        ):
+            reject("exchanged parcial sucessor está fora de estágio")
+        if "retained" in successor_partials and (
+            not present["exchanged"]
+            or not final_is_successor
+            or not previous_is_valid
+            or candidate_exists
+        ):
+            reject("retained parcial sucessor está fora de estágio")
+        if "used" in successor_partials and (
+            not present["retained"]
+            or not final_is_successor
+            or not previous_is_valid
+            or candidate_exists
+        ):
+            reject("used parcial sucessor está fora de estágio")
+        if used_raw is not None and (
+            not final_is_successor
+            or not present["intent"]
+            or not present["prepared"]
+            or not present["exchanged"]
+            or not present["retained"]
+            or (
+                successor_old_digest != successor_new_digest
+                and not previous_is_valid
+            )
+            or candidate_exists
+        ):
+            reject("used source não pertence ao sucessor íntegro")
+
+    for name in names:
+        if not (
+            name.startswith("bootstrap-source-kit.")
+            or name.startswith(CANDIDATE_PREFIX)
+            or name.startswith(PREVIOUS_PREFIX)
+        ):
+            continue
+        if name in allowed:
+            continue
+        temporary = STATE_TEMP_RE.fullmatch(name)
+        if (
+            temporary is not None
+            and temporary.group(2) == successor_kit_id
+            and (
+                (
+                    temporary.group(1) == "supersede"
+                    and supersede_raw is None
+                    and predecessor_expected
+                    and intent is not None
+                    and intent.kit_id != successor_kit_id
+                )
+                or (
+                    temporary.group(1) != "supersede"
+                    and temporary.group(1) in successor_partials
+                )
+            )
+        ):
+            continue
+        reject("namespace reservado do source kit contém journal estrangeiro")
+
+
+def reconcile_superseded_source_transaction(
+    state_descriptor: int,
+    *,
+    observed_source_digest: str,
+    binding: AttestationBinding,
+    inventory: ArchiveInventory,
+    successor_kit_id: str,
+    expectations: BootstrapExpectations,
+    uid: int,
+    gid: int,
+    runtime: Runtime,
+    fault: Callable[[str], None],
+) -> SupersededSourceTransaction | None:
+    supersede_raw = read_record_if_present(
+        state_descriptor,
+        SUPERSEDE_NAME,
+        uid=uid,
+        gid=gid,
+    )
+    predecessor: SupersededSourceTransaction | None = None
+    if supersede_raw is None:
+        legacy_intent = read_record_if_present(
+            state_descriptor,
+            INTENT_NAME,
+            uid=uid,
+            gid=gid,
+        )
+        if legacy_intent is None:
+            if expectations.predecessor_kit_id is not None:
+                reject("predecessor esperado não está presente")
+            return None
+        if expectations.predecessor_kit_id is None:
+            return None
+        predecessor = validate_source_intent(legacy_intent)
+        if (
+            predecessor.kit_id != expectations.predecessor_kit_id
+            or predecessor.controller_sha
+            != expectations.predecessor_controller_sha
+            or predecessor.api_sha not in binding.api_required_ancestors
+            or predecessor.api_sha not in binding.ops_required_ancestors
+        ):
+            reject("aprovação sucessora não autoriza o predecessor")
+        publisher_intent_sha256 = validate_fixed_predecessor_publisher_state(
+            uid=uid,
+            gid=gid,
+        )
+        if (
+            publisher_intent_sha256
+            != expectations.predecessor_publisher_intent_sha256
+        ):
+            reject("publisher intent predecessor diverge do binding externo")
+        predecessor = SupersededSourceTransaction(
+            kit_id=predecessor.kit_id,
+            api_sha=predecessor.api_sha,
+            controller_sha=predecessor.controller_sha,
+            old_digest=predecessor.old_digest,
+            new_digest=predecessor.new_digest,
+            intent_raw=predecessor.intent_raw,
+            publisher_intent_sha256=publisher_intent_sha256,
+        )
+        if (
+            predecessor.kit_id == successor_kit_id
+            or predecessor.new_digest == inventory.tree_sha256
+            or observed_source_digest != predecessor.new_digest
+        ):
+            reject("source predecessor não está no estado pré-publisher")
+        for phase in ("prepared", "exchanged", "retained"):
+            observed = read_record_if_present(
+                state_descriptor,
+                SOURCE_PHASE_NAMES[phase],
+                uid=uid,
+                gid=gid,
+            )
+            if observed != _expected_source_phase(predecessor, phase):
+                reject(f"fase predecessor ausente ou divergente: {phase}")
+        if read_record_if_present(
+            state_descriptor,
+            USED_NAME,
+            uid=uid,
+            gid=gid,
+        ) is not None:
+            reject("source predecessor já foi marcado como usado")
+        for name in os.listdir(state_descriptor):
+            match = STATE_TEMP_RE.fullmatch(name)
+            if match is not None and (
+                match.group(1) != "supersede"
+                or match.group(2) != successor_kit_id
+            ):
+                reject("source predecessor possui record parcial")
+        _validate_predecessor_rollback(
+            state_descriptor,
+            predecessor,
+            uid=uid,
+            gid=gid,
+        )
+        supersede_raw = source_supersede_payload(
+            predecessor,
+            successor_kit_id=successor_kit_id,
+            successor_new_digest=inventory.tree_sha256,
+        )
+        publish_record(
+            state_descriptor,
+            SUPERSEDE_NAME,
+            supersede_raw,
+            kit_id=successor_kit_id,
+            uid=uid,
+            gid=gid,
+            runtime=runtime,
+        )
+        fault("after_source_supersede")
+    else:
+        predecessor = validate_source_supersede(
+            supersede_raw,
+            successor_kit_id=successor_kit_id,
+            successor_new_digest=inventory.tree_sha256,
+        )
+        if (
+            expectations.predecessor_kit_id != predecessor.kit_id
+            or expectations.predecessor_controller_sha
+            != predecessor.controller_sha
+            or expectations.predecessor_publisher_intent_sha256
+            != predecessor.publisher_intent_sha256
+            or predecessor.api_sha not in binding.api_required_ancestors
+            or predecessor.api_sha not in binding.ops_required_ancestors
+        ):
+            reject("bindings sucessores divergem do source supersede")
+        intent_raw = read_record_if_present(
+            state_descriptor,
+            predecessor.archived_name("intent"),
+            uid=uid,
+            gid=gid,
+        )
+        if intent_raw is None:
+            intent_raw = read_record_if_present(
+                state_descriptor,
+                INTENT_NAME,
+                uid=uid,
+                gid=gid,
+            )
+        if intent_raw is None:
+            reject("intent predecessor sumiu durante supersede")
+        parsed = validate_source_intent(intent_raw)
+        if (
+            parsed.kit_id != predecessor.kit_id
+            or parsed.api_sha != predecessor.api_sha
+            or parsed.controller_sha != predecessor.controller_sha
+            or parsed.old_digest != predecessor.old_digest
+            or parsed.new_digest != predecessor.new_digest
+            or hashlib.sha256(intent_raw).hexdigest()
+            != parse_canonical_json(
+                supersede_raw,
+                "bootstrap source supersede",
+            )["predecessor_intent_sha256"]
+        ):
+            reject("intent predecessor diverge do source supersede")
+        predecessor = SupersededSourceTransaction(
+            kit_id=parsed.kit_id,
+            api_sha=parsed.api_sha,
+            controller_sha=parsed.controller_sha,
+            old_digest=parsed.old_digest,
+            new_digest=parsed.new_digest,
+            intent_raw=intent_raw,
+            publisher_intent_sha256=(
+                predecessor.publisher_intent_sha256
+            ),
+        )
+        if observed_source_digest == predecessor.new_digest:
+            revalidated_publisher_intent_sha256 = (
+                validate_fixed_predecessor_publisher_state(
+                    uid=uid,
+                    gid=gid,
+                )
+            )
+            if (
+                revalidated_publisher_intent_sha256
+                != predecessor.publisher_intent_sha256
+            ):
+                reject(
+                    "publisher predecessor mudou durante source supersede"
+                )
+
+    assert predecessor is not None
+    _validate_predecessor_rollback(
+        state_descriptor,
+        predecessor,
+        uid=uid,
+        gid=gid,
+    )
+    if observed_source_digest not in {
+        predecessor.new_digest,
+        inventory.tree_sha256,
+    }:
+        reject("árvore source não pertence à sucessão autorizada")
+    for phase in ("intent", "prepared", "exchanged", "retained"):
+        _archive_source_record(
+            state_descriptor,
+            predecessor,
+            phase,
+            uid=uid,
+            gid=gid,
+            runtime=runtime,
+        )
+        fault(f"after_source_supersede_{phase}")
+    successor_intent_raw = read_record_if_present(
+        state_descriptor,
+        INTENT_NAME,
+        uid=uid,
+        gid=gid,
+    )
+    if successor_intent_raw is not None:
+        successor_intent = validate_source_intent(successor_intent_raw)
+        if (
+            successor_intent.kit_id != successor_kit_id
+            or successor_intent.old_digest != predecessor.new_digest
+            or successor_intent.new_digest != inventory.tree_sha256
+        ):
+            reject("intent source sucessor diverge da cadeia autorizada")
+    elif observed_source_digest == inventory.tree_sha256:
+        reject("source sucessor publicado está sem intent recuperável")
+    legacy_used = read_record_if_present(
+        state_descriptor,
+        USED_NAME,
+        uid=uid,
+        gid=gid,
+    )
+    if legacy_used is not None:
+        parsed_used = parse_canonical_json(
+            legacy_used,
+            USED_NAME,
+        )
+        if parsed_used.get("kit_id") == predecessor.kit_id:
+            reject("source predecessor usado não pode ser superado")
+    return predecessor
 
 
 @dataclass(frozen=True)
@@ -2181,9 +3582,36 @@ def verify_inherited_lock(
         os.close(check)
 
 
+def publisher_supersede_authorization(
+    predecessor: SupersededSourceTransaction,
+    *,
+    successor_kit_id: str,
+    successor_source_digest: str,
+) -> bytes:
+    require_hash(successor_kit_id, "kit ID sucessor do publisher")
+    require_hash(
+        successor_source_digest,
+        "árvore source sucessora do publisher",
+    )
+    return canonical_bytes(
+        {
+            "contract": PUBLISHER_SUPERSEDE_CONTRACT,
+            "predecessor_publisher_intent_sha256": (
+                predecessor.publisher_intent_sha256
+            ),
+            "predecessor_source_kit_id": predecessor.kit_id,
+            "predecessor_source_tree_sha256": predecessor.new_digest,
+            "schema_version": 1,
+            "successor_source_kit_id": successor_kit_id,
+            "successor_source_tree_sha256": successor_source_digest,
+        }
+    )
+
+
 def run_publisher(
     source_descriptor: int,
     lock_descriptor: int,
+    supersede_authorization: bytes | None,
 ) -> str:
     fixed_publisher = (
         STATE_ROOT
@@ -2234,32 +3662,66 @@ def run_publisher(
             info.st_gid,
         ):
             reject("publisher fixo diverge do snapshot validado")
-        result = subprocess.run(
-            [
-                str(PYTHON),
-                "-I",
-                "-B",
-                str(fixed_publisher),
-                "upgrade",
-            ],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env={
-                LOCK_FD_ENV: str(lock_descriptor),
-                LOCK_HELD_ENV: "1",
-                "LANG": "C",
-                "LC_ALL": "C",
-                "PATH": "/usr/bin:/bin",
-            },
-            pass_fds=(lock_descriptor,),
-            check=False,
-            timeout=300,
-        )
+        environment = {
+            LOCK_FD_ENV: str(lock_descriptor),
+            LOCK_HELD_ENV: "1",
+            "LANG": "C",
+            "LC_ALL": "C",
+            "PATH": "/usr/bin:/bin",
+        }
+        pass_descriptors = [lock_descriptor]
+        authorization_reader = -1
+        if supersede_authorization is not None:
+            if not 0 < len(supersede_authorization) <= 4096:
+                reject("autorização do publisher excede o limite")
+            authorization_reader, authorization_writer = os.pipe2(
+                os.O_CLOEXEC
+            )
+            try:
+                write_all(authorization_writer, supersede_authorization)
+            finally:
+                os.close(authorization_writer)
+            environment[PUBLISHER_SUPERSEDE_FD_ENV] = str(
+                authorization_reader
+            )
+            pass_descriptors.append(authorization_reader)
+        try:
+            result = subprocess.run(
+                [
+                    str(PYTHON),
+                    "-I",
+                    "-B",
+                    str(fixed_publisher),
+                    "upgrade",
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=environment,
+                pass_fds=tuple(pass_descriptors),
+                check=False,
+                timeout=300,
+            )
+        finally:
+            if authorization_reader >= 0:
+                os.close(authorization_reader)
     finally:
         os.close(publisher)
     if result.returncode != 0:
-        reject("publisher da árvore bootstrap recusou o upgrade")
+        diagnostic = result.stderr[:2048].decode(
+            "utf-8",
+            errors="replace",
+        )
+        diagnostic = " ".join(
+            item
+            for item in diagnostic.replace("\x00", "").split()
+            if item.isprintable()
+        )[:512]
+        suffix = f": {diagnostic}" if diagnostic else ""
+        reject(
+            "publisher da árvore bootstrap recusou o upgrade"
+            + suffix
+        )
     try:
         output = result.stdout.decode("ascii").strip()
     except UnicodeDecodeError:
@@ -2281,7 +3743,7 @@ def install_source(
     signature_verifier: (
         Callable[[int, int, int, str], None] | None
     ),
-    publisher: Callable[[int, int], str],
+    publisher: Callable[[int, int, bytes | None], str],
     lock_descriptor: int,
     fault: Callable[[str], None] = lambda _event: None,
 ) -> str:
@@ -2307,12 +3769,6 @@ def install_source(
             final_modes={0o555, 0o755},
         )
         try:
-            reject_foreign_state(
-                state,
-                kit_id,
-                uid=uid,
-                gid=gid,
-            )
             source = _open_named_directory(
                 state,
                 SOURCE_NAME,
@@ -2327,6 +3783,38 @@ def install_source(
                 observed_digest = tree_digest(old_entries)
             finally:
                 os.close(source)
+            validate_reserved_source_namespace(
+                state,
+                binding=inputs.binding,
+                inventory=inventory,
+                successor_kit_id=kit_id,
+                successor_new_digest=inventory.tree_sha256,
+                observed_source_digest=observed_digest,
+                predecessor_expected=(
+                    expectations.predecessor_kit_id is not None
+                ),
+                uid=uid,
+                gid=gid,
+            )
+            predecessor = reconcile_superseded_source_transaction(
+                state,
+                observed_source_digest=observed_digest,
+                binding=inputs.binding,
+                inventory=inventory,
+                successor_kit_id=kit_id,
+                expectations=expectations,
+                uid=uid,
+                gid=gid,
+                runtime=runtime,
+                fault=fault,
+            )
+            reject_foreign_state(
+                state,
+                kit_id,
+                uid=uid,
+                gid=gid,
+                predecessor=predecessor,
+            )
 
             existing_intent = read_record_if_present(
                 state,
@@ -2676,7 +4164,20 @@ def install_source(
                     uid=uid,
                     gid=gid,
                 )
-                publisher_result = publisher(source, lock_descriptor)
+                publisher_authorization = (
+                    publisher_supersede_authorization(
+                        predecessor,
+                        successor_kit_id=kit_id,
+                        successor_source_digest=inventory.tree_sha256,
+                    )
+                    if predecessor is not None
+                    else None
+                )
+                publisher_result = publisher(
+                    source,
+                    lock_descriptor,
+                    publisher_authorization,
+                )
             finally:
                 os.close(source)
             if publisher_result not in {"upgraded", "already-upgraded"}:
@@ -2718,6 +4219,9 @@ def parse_cli(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--expected-attestation-sha256", required=True)
     parser.add_argument("--expected-carrier-sha", required=True)
     parser.add_argument("--expected-controller-sha", required=True)
+    parser.add_argument("--expected-predecessor-kit-id")
+    parser.add_argument("--expected-predecessor-controller-sha")
+    parser.add_argument("--expected-predecessor-publisher-intent-sha256")
     required_options = (
         "--helper-fd",
         "--expected-helper-sha256",
@@ -2725,8 +4229,27 @@ def parse_cli(argv: list[str]) -> argparse.Namespace:
         "--expected-carrier-sha",
         "--expected-controller-sha",
     )
-    if len(argv) != 2 * len(required_options) or any(
+    predecessor_options = (
+        "--expected-predecessor-kit-id",
+        "--expected-predecessor-controller-sha",
+        "--expected-predecessor-publisher-intent-sha256",
+    )
+    predecessor_present = [
+        option for option in predecessor_options if option in argv
+    ]
+    expected_length = 2 * (
+        len(required_options)
+        + (len(predecessor_options) if predecessor_present else 0)
+    )
+    if (
+        len(argv) != expected_length
+        or any(
         argv.count(option) != 1 for option in required_options
+        )
+        or (
+            predecessor_present
+            and any(argv.count(option) != 1 for option in predecessor_options)
+        )
     ):
         reject("CLI do helper exige cada binding exatamente uma vez")
     args = parser.parse_args(argv)
@@ -2776,6 +4299,13 @@ def main() -> int:
         attestation_sha256=args.expected_attestation_sha256,
         carrier_sha=args.expected_carrier_sha,
         controller_sha=args.expected_controller_sha,
+        predecessor_kit_id=args.expected_predecessor_kit_id,
+        predecessor_controller_sha=(
+            args.expected_predecessor_controller_sha
+        ),
+        predecessor_publisher_intent_sha256=(
+            args.expected_predecessor_publisher_intent_sha256
+        ),
     )
     validate_expectations(expectations)
     previous_umask = os.umask(0o077)
