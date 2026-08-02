@@ -342,13 +342,30 @@ performs the source exchange. The publisher receives no pre-exchange
 override: it starts a new ordinary upgrade only after the terminal
 predecessor evidence is outside its reserved namespace.
 
+The authorization journal remains schema v1 for a flat terminal predecessor.
+When that predecessor already contains one complete source/publisher
+supersede, the helper writes schema v2 and binds the SHA-256 of both canonical
+nested supersede records. Before mutation it proves the nested source
+predecessor phases and rollback, cross-binds the publisher supersede to that
+source succession, and verifies the retained publisher intent name/hash and
+candidate name/digest/modes. It then preserves that history, in a fixed
+prefix order, under deterministic
+`.bootstrap-post-publisher.nested-*` names using only no-overwrite renames.
+The new standard source supersede cannot begin until the prelude has archived
+current source `used`, the current publisher terminal evidence, and every
+nested-history entry.
+
 Every archive boundary is retryable with the same ten values and signed
-inputs. Archived and active predecessor copies may never coexist. A partial
-record must be an exact prefix of its expected canonical bytes. A different
-successor, mixed `used` evidence, unknown journal, occupied deploy lock,
-failed or inconclusive quiescence proof, staged bundle, marker, or replay
-after stage is rejected without a cleanup bypass. Never delete, edit, or
-manually move these journals.
+inputs. Replay revalidates the journal bindings, the exact namespace, and the
+completed archival prefix before continuing idempotently. Except for the
+separately validated current `bootstrap-source-kit.supersede.json`, an
+archived historical name may never coexist with any active entry, even one
+with different bytes. Coexistence, tamper, missing or extra evidence,
+out-of-order history, a non-prefix partial record, a different successor,
+mixed `used` evidence, unknown journal, occupied deploy lock, failed or
+inconclusive quiescence proof, staged bundle, marker, or replay after stage is
+rejected before further mutation and without a cleanup bypass. Never delete,
+edit, or manually move these journals.
 
 ## Stable controller v2 / envelope v6
 
