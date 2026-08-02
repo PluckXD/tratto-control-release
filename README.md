@@ -22,6 +22,33 @@ manual-only and fail-closed. `workflow-v6-shape.yml` is deliberately outside
 that directory: it is a review artifact, not an executable workflow. Neither
 candidate can currently build, verify, sign, stage, or deploy a release.
 
+## Initial one-shot bootstrap
+
+The permanent multi-review release controller remains unavailable. The first
+Control Plane generation may instead use the narrowly scoped
+`single-operator-bootstrap` path exactly once:
+
+- the private carrier workflow must be
+  `.github/workflows/control-bootstrap-v1.yml` on its exact `main` commit;
+- a canonical approval pins the final API/Ops, Web, and reviewed public
+  controller commits, runtime policy, migrations, and fleet preflight;
+- isolated jobs build and test API, Ops, and Web, while a source-free job signs
+  the canonical schema-v5 envelope with GitHub OIDC and Cosign;
+- the host independently verifies the signature identity, envelope, approval,
+  behavioral report, artifact IDs and bytes before staging;
+- bootstrap is accepted only while both `current` and the root-owned
+  consumption marker are absent, with every Control runtime unit stopped;
+- successful validation creates the no-overwrite consumption marker before
+  any activation. Replays, a second generation, or the normal release path
+  remain fail-closed.
+
+This exception establishes the initial immutable runtime only. It does not
+change either readiness document, enable the permanent candidate, authorize a
+carrier commit, or weaken the separate runtime, database, egress, and edge
+controls. The bootstrap workflow, temporary repository credentials, and its
+signing environment must be disabled or removed after the single successful
+run.
+
 ## Stable controller v2 / envelope v6
 
 The v2/v6 candidate separates stable release authority from product source and
