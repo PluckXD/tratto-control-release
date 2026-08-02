@@ -32,10 +32,15 @@ Control Plane generation may instead use the narrowly scoped
   `.github/workflows/control-bootstrap-v1.yml` on its exact `main` commit;
 - a canonical approval pins the final API/Ops, Web, and reviewed public
   controller commits, runtime policy, migrations, and fleet preflight;
-- isolated jobs build and test API, Ops, and Web, while a source-free job signs
-  the canonical schema-v5 envelope with GitHub OIDC and Cosign;
+- isolated jobs build and test API, Ops, and Web, while a checkout-free job
+  signs the canonical schema-v5 envelope, the exact Ops archive, and the
+  reviewed bootstrap-source helper separately with GitHub OIDC and Cosign;
 - the host independently verifies the signature identity, envelope, approval,
-  behavioral report, artifact IDs and bytes before staging;
+  behavioral report, helper origin, artifact IDs and bytes before staging;
+- the helper runs only from the root-owned incoming directory under the
+  inherited deploy lock. It installs the signed Ops archive through an
+  append-only recovery journal and atomic exchange, retains the old source,
+  and then invokes the newly installed fixed publisher under the same lock;
 - bootstrap is accepted only while both `current` and the root-owned
   consumption marker are absent, with every Control runtime unit stopped;
 - successful validation creates the no-overwrite consumption marker before
@@ -48,6 +53,25 @@ carrier commit, or weaken the separate runtime, database, egress, and edge
 controls. The bootstrap workflow, temporary repository credentials, and its
 signing environment must be disabled or removed after the single successful
 run.
+
+The signed carrier output adds
+`install-bootstrap-source-kit.py`,
+`bootstrap-source-kit.sigstore.json`, and the canonical helper-origin
+receipt to the existing attestation, Ops archive, and their separate bundles.
+Only the helper and the five signature inputs it consumes are transferred as
+`root:root 0400` into `/var/lib/tratto-control/incoming`. Invoke it through
+the pre-existing immutable lock wrapper:
+
+```text
+/usr/bin/python3.12 -I -B \
+  /opt/tratto-control/bootstrap/scripts/with-deploy-lock.py -- \
+  /usr/bin/python3.12 -I -B \
+  /var/lib/tratto-control/incoming/install-bootstrap-source-kit.py
+```
+
+The helper-origin receipt is retained as release evidence; it is not a host
+trust input. The host instead requires all three blob signatures to carry the
+same exact carrier workflow SHA, ref, repository, and dispatch trigger.
 
 ## Stable controller v2 / envelope v6
 
