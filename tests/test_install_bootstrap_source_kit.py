@@ -641,6 +641,28 @@ def replace_signed_release(
     attestation_path.chmod(0o400)
 
 
+def signed_release_kit_id(incoming: Path) -> str:
+    execution = os.open(incoming / KIT.HELPER_NAME, os.O_RDONLY)
+    inputs = KIT.open_and_validate_inputs(
+        incoming,
+        uid=os.getuid(),
+        gid=os.getgid(),
+        execution_descriptor=execution,
+        expectations=expectations(incoming),
+        signature_verifier=lambda *_args: None,
+    )
+    try:
+        inventory = KIT.validate_ops_archive(
+            inputs.archive_descriptor,
+            inputs.archive_info,
+            inputs.binding,
+        )
+        return KIT.kit_identity(inputs.binding, inventory)
+    finally:
+        inputs.close()
+        os.close(execution)
+
+
 def prepare_pre_publisher_source_state(
     incoming: Path,
     state: Path,
@@ -894,6 +916,184 @@ def publish_fake_successor_bootstrap(control: Path) -> None:
     (staging / KIT.PUBLISHER_USED_NAME).write_bytes(canonical(used))
     (staging / KIT.PUBLISHER_INTENT_NAME).chmod(0o400)
     (staging / KIT.PUBLISHER_USED_NAME).chmod(0o400)
+
+
+def publish_fake_superseding_bootstrap(
+    control: Path,
+    authorization: dict[str, object],
+) -> None:
+    staging = control / ".staging"
+    final = control / "bootstrap"
+    predecessor_intent_path = staging / KIT.PUBLISHER_INTENT_NAME
+    predecessor_intent_raw = predecessor_intent_path.read_bytes()
+    predecessor_intent = json.loads(predecessor_intent_raw)
+    predecessor_candidate = staging / KIT.PUBLISHER_CANDIDATE_NAME
+    predecessor_candidate_fd = os.open(
+        predecessor_candidate,
+        os.O_RDONLY | os.O_DIRECTORY,
+    )
+    try:
+        predecessor_candidate_digest = (
+            KIT.protected_bootstrap_tree_digest(
+                predecessor_candidate_fd,
+                uid=os.getuid(),
+                gid=os.getgid(),
+            )
+        )
+    finally:
+        os.close(predecessor_candidate_fd)
+    assert (
+        predecessor_candidate_digest
+        == predecessor_intent["new_tree_sha256"]
+    )
+    successor_candidate = staging / ".publisher-successor"
+    successor_digest = protected_bootstrap_tree(
+        successor_candidate,
+        b"superseding-successor\n",
+    )
+    predecessor_intent_sha256 = hashlib.sha256(
+        predecessor_intent_raw
+    ).hexdigest()
+    retained_intent_name = (
+        "bootstrap-upgrade.intent.superseded."
+        f"{predecessor_intent_sha256}.json"
+    )
+    retained_candidate_name = (
+        "bootstrap.upgrading.superseded."
+        f"{predecessor_candidate_digest}"
+    )
+    supersede = {
+        "contract": KIT.PUBLISHER_SUPERSEDE_CONTRACT,
+        "phase": "superseded",
+        "predecessor_intent_sha256": predecessor_intent_sha256,
+        "predecessor_new_tree_sha256": predecessor_candidate_digest,
+        "predecessor_old_tree_sha256": predecessor_intent[
+            "old_tree_sha256"
+        ],
+        "predecessor_previous_name": predecessor_intent[
+            "previous_name"
+        ],
+        "retained_candidate_name": retained_candidate_name,
+        "retained_intent_name": retained_intent_name,
+        "schema_version": 1,
+        "source_predecessor_kit_id": authorization[
+            "predecessor_source_kit_id"
+        ],
+        "source_predecessor_tree_sha256": authorization[
+            "predecessor_source_tree_sha256"
+        ],
+        "source_successor_kit_id": authorization[
+            "successor_source_kit_id"
+        ],
+        "source_successor_tree_sha256": authorization[
+            "successor_source_tree_sha256"
+        ],
+        "successor_new_tree_sha256": successor_digest,
+    }
+    supersede_path = staging / KIT.PUBLISHER_SUPERSEDE_NAME
+    supersede_path.write_bytes(canonical(supersede))
+    supersede_path.chmod(0o400)
+    predecessor_candidate.rename(staging / retained_candidate_name)
+    predecessor_intent_path.rename(staging / retained_intent_name)
+
+    old_digest = str(predecessor_intent["old_tree_sha256"])
+    previous_name = KIT.PUBLISHER_PREVIOUS_PREFIX + old_digest[:32]
+    control.chmod(0o700)
+    final.chmod(0o700)
+    successor_candidate.chmod(0o700)
+    final.rename(staging / previous_name)
+    successor_candidate.rename(final)
+    (staging / previous_name).chmod(0o555)
+    final.chmod(0o555)
+    control.chmod(0o711)
+    intent = {
+        "new_tree_sha256": successor_digest,
+        "old_tree_sha256": old_digest,
+        "phase": "intent",
+        "previous_name": previous_name,
+        "schema_version": 1,
+    }
+    used = dict(intent)
+    used["phase"] = "used"
+    (staging / KIT.PUBLISHER_INTENT_NAME).write_bytes(canonical(intent))
+    (staging / KIT.PUBLISHER_USED_NAME).write_bytes(canonical(used))
+    (staging / KIT.PUBLISHER_INTENT_NAME).chmod(0o400)
+    (staging / KIT.PUBLISHER_USED_NAME).chmod(0o400)
+
+
+def prepare_nested_post_publisher_fixture(
+    root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[
+    Path,
+    Path,
+    list[str],
+    tuple[str, str, str, str, str, str],
+    Path,
+]:
+    incoming, state, calls = fixture(root)
+    predecessor_intent = prepare_pre_publisher_source_state(
+        incoming,
+        state,
+        calls,
+    )
+    control, publisher_intent_sha256 = prepare_fixed_publisher_state(root)
+    (control / KIT.BUNDLES_NAME).mkdir(mode=0o711)
+    configure_post_publisher_paths(monkeypatch, root, control)
+    replace_signed_release(
+        incoming,
+        api_sha="d" * 40,
+        required_ancestors=(str(predecessor_intent["api_sha"]),),
+    )
+    calls.clear()
+
+    def publish_superseding() -> None:
+        authorization = json.loads(calls[-2])
+        publish_fake_superseding_bootstrap(control, authorization)
+
+    assert (
+        install(
+            incoming,
+            state,
+            calls,
+            predecessor=(
+                str(predecessor_intent["kit_id"]),
+                str(predecessor_intent["controller_sha"]),
+                publisher_intent_sha256,
+            ),
+            publisher_callback=publish_superseding,
+        )
+        == "installed"
+    )
+    current_source_intent = (state / KIT.INTENT_NAME).read_bytes()
+    current_source_used = (state / KIT.USED_NAME).read_bytes()
+    current_source = KIT.validate_source_intent(current_source_intent)
+    publisher_intent = (
+        control / ".staging" / KIT.PUBLISHER_INTENT_NAME
+    ).read_bytes()
+    publisher_used = (
+        control / ".staging" / KIT.PUBLISHER_USED_NAME
+    ).read_bytes()
+    replace_signed_release(
+        incoming,
+        api_sha="e" * 40,
+        required_ancestors=(current_source.api_sha,),
+    )
+    calls.clear()
+    return (
+        incoming,
+        state,
+        calls,
+        (
+            current_source.kit_id,
+            current_source.controller_sha,
+            hashlib.sha256(current_source_intent).hexdigest(),
+            hashlib.sha256(current_source_used).hexdigest(),
+            hashlib.sha256(publisher_intent).hexdigest(),
+            hashlib.sha256(publisher_used).hexdigest(),
+        ),
+        control,
+    )
 
 
 def add_foreign_source_reserved_entry(
@@ -2345,6 +2545,628 @@ def test_post_publisher_successor_archives_terminal_evidence_and_replays(
         predecessor_digest,
         successor_digest,
     ]
+
+
+def test_post_publisher_successor_preserves_nested_supersede_and_replays(
+    secure_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    incoming, state, calls, bindings, control = (
+        prepare_nested_post_publisher_fixture(
+            secure_tmp_path,
+            monkeypatch,
+        )
+    )
+    source_supersede = json.loads(
+        (state / KIT.SUPERSEDE_NAME).read_text()
+    )
+    nested_source_kit = source_supersede["predecessor_kit_id"]
+    publisher_supersede = json.loads(
+        (
+            control / ".staging" / KIT.PUBLISHER_SUPERSEDE_NAME
+        ).read_text()
+    )
+
+    assert (
+        install(
+            incoming,
+            state,
+            calls,
+            post_predecessor=bindings,
+            publisher_callback=lambda: publish_fake_successor_bootstrap(
+                control
+            ),
+        )
+        == "installed"
+    )
+
+    current_source_kit = bindings[0]
+    for name in (
+        KIT.nested_source_archive_name(
+            "supersede",
+            current_source_kit,
+        ),
+        *(
+            KIT.nested_source_archive_name(
+                phase,
+                current_source_kit,
+            )
+            for phase in ("intent", "prepared", "exchanged", "retained")
+        ),
+        KIT.nested_source_archive_name(
+            "previous",
+            current_source_kit,
+        ),
+    ):
+        assert (state / name).exists()
+    assert not (
+        state / f"{KIT.PREVIOUS_PREFIX}{nested_source_kit}"
+    ).exists()
+    for kind in ("supersede", "intent", "candidate"):
+        assert (
+            control
+            / ".staging"
+            / KIT.nested_publisher_archive_name(
+                kind,
+                current_source_kit,
+            )
+        ).exists()
+    assert not (
+        control
+        / ".staging"
+        / publisher_supersede["retained_intent_name"]
+    ).exists()
+    assert not (
+        control
+        / ".staging"
+        / publisher_supersede["retained_candidate_name"]
+    ).exists()
+
+    state_before = immutable_tree_snapshot(state)
+    control_before = immutable_tree_snapshot(control)
+    calls.clear()
+    assert (
+        install(
+            incoming,
+            state,
+            calls,
+            post_predecessor=bindings,
+        )
+        == "already-installed"
+    )
+    assert immutable_tree_snapshot(state) == state_before
+    assert immutable_tree_snapshot(control) == control_before
+
+
+def test_nested_post_publisher_resumes_valid_partial_recovery_journal(
+    secure_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    incoming, state, calls, bindings, control = (
+        prepare_nested_post_publisher_fixture(
+            secure_tmp_path,
+            monkeypatch,
+        )
+    )
+    partial = (
+        state
+        / "bootstrap-source-kit.post-publisher-supersede."
+        f"{signed_release_kit_id(incoming)}.installing"
+    )
+    partial.write_bytes(b'{"contract":')
+    partial.chmod(0o600)
+
+    assert (
+        install(
+            incoming,
+            state,
+            calls,
+            post_predecessor=bindings,
+            publisher_callback=lambda: publish_fake_successor_bootstrap(
+                control
+            ),
+        )
+        == "installed"
+    )
+    assert not partial.exists()
+
+
+def test_nested_post_publisher_replay_rejects_another_signed_successor(
+    secure_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    incoming, state, calls, bindings, _control = (
+        prepare_nested_post_publisher_fixture(
+            secure_tmp_path,
+            monkeypatch,
+        )
+    )
+
+    def stop(event: str) -> None:
+        if event == "after_post_publisher_supersede":
+            raise RuntimeError("simulated crash")
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        install(
+            incoming,
+            state,
+            calls,
+            post_predecessor=bindings,
+            fault=stop,
+        )
+    replace_signed_release(
+        incoming,
+        api_sha="f" * 40,
+        required_ancestors=("d" * 40,),
+    )
+    state_before = immutable_tree_snapshot(state)
+    with pytest.raises(
+        KIT.BootstrapSourceError,
+        match="autoriza|successor|sucessor",
+    ):
+        install(
+            incoming,
+            state,
+            calls,
+            post_predecessor=bindings,
+        )
+    assert immutable_tree_snapshot(state) == state_before
+
+
+@pytest.mark.parametrize(
+    "event",
+    (
+        "after_nested_source_supersede_archive",
+        "after_nested_source_intent_archive",
+        "after_nested_source_prepared_archive",
+        "after_nested_source_exchanged_archive",
+        "after_nested_source_retained_archive",
+        "after_nested_source_previous_archive",
+        "after_nested_publisher_supersede_archive",
+        "after_nested_publisher_candidate_archive",
+        "after_nested_publisher_intent_archive",
+    ),
+)
+@pytest.mark.skipif(
+    not hasattr(os, "fork"),
+    reason="fault harness exige fork",
+)
+def test_nested_post_publisher_recovers_every_sigkill_boundary(
+    secure_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    event: str,
+) -> None:
+    incoming, state, calls, bindings, control = (
+        prepare_nested_post_publisher_fixture(
+            secure_tmp_path,
+            monkeypatch,
+        )
+    )
+
+    def publish_successor_once() -> None:
+        if not (
+            control / ".staging" / KIT.PUBLISHER_USED_NAME
+        ).exists():
+            publish_fake_successor_bootstrap(control)
+
+    child = os.fork()
+    if child == 0:
+        def kill_at(observed: str) -> None:
+            if observed == event:
+                os.kill(os.getpid(), signal.SIGKILL)
+
+        try:
+            install(
+                incoming,
+                state,
+                [],
+                post_predecessor=bindings,
+                publisher_callback=publish_successor_once,
+                fault=kill_at,
+            )
+        except BaseException:
+            os._exit(92)
+        os._exit(91)
+    _, status = os.waitpid(child, 0)
+    assert os.WIFSIGNALED(status)
+    assert os.WTERMSIG(status) == signal.SIGKILL
+
+    calls.clear()
+    assert (
+        install(
+            incoming,
+            state,
+            calls,
+            post_predecessor=bindings,
+            publisher_callback=publish_successor_once,
+        )
+        == "installed"
+    )
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    (
+        "source-supersede-noncanonical",
+        "source-other-successor",
+        "source-phase-content",
+        "source-phase-mode",
+        "source-previous-content",
+        "source-previous-mode",
+        "publisher-supersede-noncanonical",
+        "publisher-cross-binding",
+        "publisher-intent-content",
+        "publisher-intent-mode",
+        "publisher-candidate-content",
+        "publisher-candidate-mode",
+        "extra-source-history",
+        "extra-publisher-history",
+        "missing-source-phase",
+        "missing-publisher-intent",
+        "missing-publisher-candidate",
+        "coexisting-source-archive",
+        "coexisting-publisher-archive",
+        "partial-journal",
+    ),
+)
+def test_nested_post_publisher_rejects_tamper_without_mutation(
+    secure_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tamper: str,
+) -> None:
+    incoming, state, calls, bindings, control = (
+        prepare_nested_post_publisher_fixture(
+            secure_tmp_path,
+            monkeypatch,
+        )
+    )
+    staging = control / ".staging"
+    source_supersede_path = state / KIT.SUPERSEDE_NAME
+    source_supersede = json.loads(source_supersede_path.read_text())
+    nested_source_kit = str(source_supersede["predecessor_kit_id"])
+    source_phase = (
+        state
+        / f"bootstrap-source-kit.retained.superseded."
+        f"{nested_source_kit}.json"
+    )
+    source_previous = (
+        state / f"{KIT.PREVIOUS_PREFIX}{nested_source_kit}"
+    )
+    publisher_supersede_path = (
+        staging / KIT.PUBLISHER_SUPERSEDE_NAME
+    )
+    publisher_supersede = json.loads(
+        publisher_supersede_path.read_text()
+    )
+    publisher_intent = (
+        staging / str(publisher_supersede["retained_intent_name"])
+    )
+    publisher_candidate = (
+        staging
+        / str(publisher_supersede["retained_candidate_name"])
+    )
+
+    def rewrite(path: Path, raw: bytes, mode: int) -> None:
+        path.chmod(0o600)
+        path.write_bytes(raw)
+        path.chmod(mode)
+
+    if tamper == "source-supersede-noncanonical":
+        rewrite(
+            source_supersede_path,
+            source_supersede_path.read_bytes().rstrip(b"\n") + b" \n",
+            0o444,
+        )
+    elif tamper == "source-other-successor":
+        source_supersede["successor_kit_id"] = "9" * 64
+        rewrite(
+            source_supersede_path,
+            canonical(source_supersede),
+            0o444,
+        )
+    elif tamper == "source-phase-content":
+        value = json.loads(source_phase.read_text())
+        value["old_source_tree_sha256"] = "9" * 64
+        rewrite(source_phase, canonical(value), 0o444)
+    elif tamper == "source-phase-mode":
+        source_phase.chmod(0o400)
+    elif tamper == "source-previous-content":
+        source_previous.chmod(0o700)
+        child = next(source_previous.iterdir())
+        child.chmod(0o600)
+        child.write_bytes(b"tampered source rollback\n")
+        child.chmod(0o444)
+        source_previous.chmod(0o555)
+    elif tamper == "source-previous-mode":
+        source_previous.chmod(0o700)
+    elif tamper == "publisher-supersede-noncanonical":
+        rewrite(
+            publisher_supersede_path,
+            publisher_supersede_path.read_bytes().rstrip(b"\n")
+            + b" \n",
+            0o400,
+        )
+    elif tamper == "publisher-cross-binding":
+        publisher_supersede["source_successor_kit_id"] = "9" * 64
+        rewrite(
+            publisher_supersede_path,
+            canonical(publisher_supersede),
+            0o400,
+        )
+    elif tamper == "publisher-intent-content":
+        value = json.loads(publisher_intent.read_text())
+        value["new_tree_sha256"] = "9" * 64
+        rewrite(publisher_intent, canonical(value), 0o400)
+    elif tamper == "publisher-intent-mode":
+        publisher_intent.chmod(0o444)
+    elif tamper == "publisher-candidate-content":
+        publisher_candidate.chmod(0o700)
+        child = publisher_candidate / "version"
+        child.chmod(0o600)
+        child.write_bytes(b"tampered publisher candidate\n")
+        child.chmod(0o444)
+        publisher_candidate.chmod(0o555)
+    elif tamper == "publisher-candidate-mode":
+        publisher_candidate.chmod(0o700)
+    elif tamper == "extra-source-history":
+        extra = state / (
+            "bootstrap-source-kit.intent.superseded."
+            f"{'9' * 64}.json"
+        )
+        extra.write_bytes(b"foreign\n")
+        extra.chmod(0o444)
+    elif tamper == "extra-publisher-history":
+        extra = staging / (
+            "bootstrap-upgrade.intent.superseded."
+            f"{'9' * 64}.json"
+        )
+        extra.write_bytes(b"foreign\n")
+        extra.chmod(0o400)
+    elif tamper == "missing-source-phase":
+        source_phase.unlink()
+    elif tamper == "missing-publisher-intent":
+        publisher_intent.unlink()
+    elif tamper == "missing-publisher-candidate":
+        publisher_candidate.chmod(0o700)
+        for child in publisher_candidate.iterdir():
+            child.chmod(0o600)
+        shutil.rmtree(publisher_candidate)
+    elif tamper == "coexisting-source-archive":
+        archive = state / KIT.nested_source_archive_name(
+            "supersede",
+            bindings[0],
+        )
+        archive.write_bytes(source_supersede_path.read_bytes())
+        archive.chmod(0o444)
+    elif tamper == "coexisting-publisher-archive":
+        archive = staging / KIT.nested_publisher_archive_name(
+            "supersede",
+            bindings[0],
+        )
+        archive.write_bytes(publisher_supersede_path.read_bytes())
+        archive.chmod(0o400)
+    else:
+        successor_kit_id = signed_release_kit_id(incoming)
+        partial = (
+            state
+            / "bootstrap-source-kit.post-publisher-supersede."
+            f"{successor_kit_id}.installing"
+        )
+        partial.write_bytes(b'{"corrupt":')
+        partial.chmod(0o600)
+
+    state_before = immutable_tree_snapshot(state)
+    control_before = immutable_tree_snapshot(control)
+    with pytest.raises(KIT.BootstrapSourceError):
+        install(
+            incoming,
+            state,
+            calls,
+            post_predecessor=bindings,
+        )
+    assert immutable_tree_snapshot(state) == state_before
+    assert immutable_tree_snapshot(control) == control_before
+
+
+def test_nested_post_publisher_rejects_wrong_owner_without_mutation(
+    secure_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    incoming, state, calls, bindings, control = (
+        prepare_nested_post_publisher_fixture(
+            secure_tmp_path,
+            monkeypatch,
+        )
+    )
+    target = (
+        control / ".staging" / KIT.PUBLISHER_SUPERSEDE_NAME
+    )
+    target_inode = target.stat().st_ino
+    real_fstat = os.fstat
+
+    def wrong_owner(descriptor: int) -> os.stat_result:
+        observed = real_fstat(descriptor)
+        if observed.st_ino != target_inode:
+            return observed
+        fields = list(observed)
+        fields[4] = observed.st_uid + 1
+        return os.stat_result(fields)
+
+    state_before = immutable_tree_snapshot(state)
+    control_before = immutable_tree_snapshot(control)
+    monkeypatch.setattr(KIT.os, "fstat", wrong_owner)
+    with pytest.raises(
+        KIT.BootstrapSourceError,
+        match="protegido",
+    ):
+        install(
+            incoming,
+            state,
+            calls,
+            post_predecessor=bindings,
+        )
+    assert immutable_tree_snapshot(state) == state_before
+    assert immutable_tree_snapshot(control) == control_before
+
+
+@pytest.mark.parametrize(
+    ("event", "tamper"),
+    (
+        (
+            "after_post_publisher_previous_archive",
+            "archive-collision",
+        ),
+        (
+            "after_post_publisher_source_used_archive",
+            "out-of-order",
+        ),
+        (
+            "after_nested_source_supersede_archive",
+            "source-coexistence",
+        ),
+        (
+            "after_nested_publisher_supersede_archive",
+            "publisher-coexistence",
+        ),
+        (
+            "after_post_publisher_supersede",
+            "journal-binding",
+        ),
+    ),
+)
+def test_nested_post_publisher_replay_rejects_collision_or_coexistence(
+    secure_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    event: str,
+    tamper: str,
+) -> None:
+    incoming, state, calls, bindings, control = (
+        prepare_nested_post_publisher_fixture(
+            secure_tmp_path,
+            monkeypatch,
+        )
+    )
+
+    def stop(observed: str) -> None:
+        if observed == event:
+            raise RuntimeError("simulated crash")
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        install(
+            incoming,
+            state,
+            calls,
+            post_predecessor=bindings,
+            fault=stop,
+        )
+
+    if tamper == "archive-collision":
+        collision = state / KIT.nested_source_archive_name(
+            "supersede",
+            bindings[0],
+        )
+        collision.write_bytes(b'{"foreign":true}\n')
+        collision.chmod(0o444)
+    elif tamper == "out-of-order":
+        (state / KIT.SUPERSEDE_NAME).rename(
+            state
+            / KIT.nested_source_archive_name(
+                "supersede",
+                bindings[0],
+            )
+        )
+    elif tamper == "source-coexistence":
+        archived = state / KIT.nested_source_archive_name(
+            "supersede",
+            bindings[0],
+        )
+        duplicate = state / KIT.SUPERSEDE_NAME
+        duplicate.write_bytes(archived.read_bytes())
+        duplicate.chmod(0o444)
+    elif tamper == "publisher-coexistence":
+        staging = control / ".staging"
+        archived = staging / KIT.nested_publisher_archive_name(
+            "supersede",
+            bindings[0],
+        )
+        duplicate = staging / KIT.PUBLISHER_SUPERSEDE_NAME
+        duplicate.write_bytes(archived.read_bytes())
+        duplicate.chmod(0o400)
+    else:
+        journal = state / KIT.POST_PUBLISHER_SUPERSEDE_NAME
+        value = json.loads(journal.read_text())
+        value["nested_publisher_supersede_sha256"] = "9" * 64
+        journal.chmod(0o600)
+        journal.write_bytes(canonical(value))
+        journal.chmod(0o444)
+
+    state_before = immutable_tree_snapshot(state)
+    control_before = immutable_tree_snapshot(control)
+    with pytest.raises(KIT.BootstrapSourceError):
+        install(
+            incoming,
+            state,
+            calls,
+            post_predecessor=bindings,
+        )
+    assert immutable_tree_snapshot(state) == state_before
+    assert immutable_tree_snapshot(control) == control_before
+
+
+def test_nested_replay_rejects_different_active_intent_after_archive(
+    secure_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    incoming, state, calls, bindings, control = (
+        prepare_nested_post_publisher_fixture(
+            secure_tmp_path,
+            monkeypatch,
+        )
+    )
+
+    def stop(event: str) -> None:
+        if event == "after_nested_source_intent_archive":
+            raise RuntimeError("simulated crash")
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        install(
+            incoming,
+            state,
+            calls,
+            post_predecessor=bindings,
+            fault=stop,
+        )
+
+    nested_supersede = json.loads(
+        (
+            state
+            / KIT.nested_source_archive_name(
+                "supersede",
+                bindings[0],
+            )
+        ).read_text()
+    )
+    active_intent = state / (
+        "bootstrap-source-kit.intent.superseded."
+        f"{nested_supersede['predecessor_kit_id']}.json"
+    )
+    active_intent.write_bytes(b'{"different":true}\n')
+    active_intent.chmod(0o444)
+
+    state_before = immutable_tree_snapshot(state)
+    control_before = immutable_tree_snapshot(control)
+    with pytest.raises(
+        KIT.BootstrapSourceError,
+        match="coexiste",
+    ):
+        install(
+            incoming,
+            state,
+            calls,
+            post_predecessor=bindings,
+        )
+    assert immutable_tree_snapshot(state) == state_before
+    assert immutable_tree_snapshot(control) == control_before
 
 
 @pytest.mark.parametrize(
