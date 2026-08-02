@@ -81,6 +81,10 @@ OPS_BUILDER = load_module(
     "release_controller_ops_builder",
     ROOT / "scripts" / "build-ops-artifact.py",
 )
+OPS_VALIDATOR = load_module(
+    "release_controller_ops_validator",
+    ROOT / "scripts" / "validate-ops-artifact.py",
+)
 BOOTSTRAP_ENVELOPE = load_module(
     "release_controller_bootstrap_envelope",
     ROOT / "scripts" / "build-bootstrap-envelope.py",
@@ -1449,6 +1453,20 @@ def test_ops_artifact_round_trip_uses_canonical_modes_and_digest(
     monkeypatch,
     capsys,
 ) -> None:
+    quiescence_fixture = b"QUIESCENCE_CONTRACT_VERSION = 2\n"
+    quiescence_fixture_sha256 = hashlib.sha256(
+        quiescence_fixture
+    ).hexdigest()
+    monkeypatch.setattr(
+        TREE,
+        "QUIESCENCE_HELPER_SHA256",
+        quiescence_fixture_sha256,
+    )
+    monkeypatch.setattr(
+        OPS_BUILDER.TREE,
+        "QUIESCENCE_HELPER_SHA256",
+        quiescence_fixture_sha256,
+    )
     source = tmp_path / "source"
     source.mkdir()
     git(source, "init", "-b", "main")
@@ -1461,6 +1479,8 @@ def test_ops_artifact_round_trip_uses_canonical_modes_and_digest(
             path.write_bytes(
                 (ROOT / "policies" / "control-runtime-v1.json").read_bytes()
             )
+        elif relative == TREE.QUIESCENCE_HELPER_PATH:
+            path.write_bytes(quiescence_fixture)
         else:
             path.write_text(f"{relative}\n", encoding="utf-8")
         if (
@@ -1517,10 +1537,11 @@ def test_ops_artifact_round_trip_uses_canonical_modes_and_digest(
         label="ops",
         release_sha=release_sha,
     )
-    validate = subprocess.run(
+    monkeypatch.setattr(
+        sys,
+        "argv",
         [
-            sys.executable,
-            str(ROOT / "scripts" / "validate-ops-artifact.py"),
+            "validate-ops-artifact.py",
             "--archive",
             str(archive),
             "--approval",
@@ -1536,11 +1557,9 @@ def test_ops_artifact_round_trip_uses_canonical_modes_and_digest(
             "--expected-service-digest",
             summary["service_digest"],
         ],
-        capture_output=True,
-        text=True,
-        check=False,
     )
-    assert validate.returncode == 0, validate.stderr
+    assert OPS_VALIDATOR.main() == 0
+    capsys.readouterr()
     with tarfile.open(archive, "r:gz") as handle:
         members = handle.getmembers()
         manifest_member = handle.getmember("artifact-manifest.json")
@@ -1615,6 +1634,77 @@ def test_ops_mode_contract_matches_bootstrap_source_helper_minimum() -> None:
         if mode == 0o555
     }
     assert helper_executables == TREE.BOOTSTRAP_REQUIRED_FILE_MODES
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        None,
+        b"",
+        b"QUIESCENCE_CONTRACT_VERSION = 1\n",
+        b"QUIESCENCE_CONTRACT_VERSION = 2\r\n",
+        b"QUIESCENCE_CONTRACT_VERSION = current_version\n",
+        (
+            b"QUIESCENCE_CONTRACT_VERSION = 2\n"
+            b"QUIESCENCE_CONTRACT_VERSION = 2\n"
+        ),
+        b"QUIESCENCE_CONTRACT_VERSION =\n",
+    ),
+)
+def test_ops_quiescence_helper_contract_rejects_missing_or_ambiguous_version(
+    payload: bytes | None,
+) -> None:
+    with pytest.raises(TREE.OpsTreeError, match="quiescence helper"):
+        TREE.validate_quiescence_helper_contract(payload)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        b"QUIESCENCE_CONTRACT_VERSION = 2.0\n",
+        (
+            b"QUIESCENCE_CONTRACT_VERSION = 2\n"
+            b"QUIESCENCE_CONTRACT_VERSION += -1\n"
+        ),
+        (
+            b"QUIESCENCE_CONTRACT_VERSION = 2\n"
+            b"if True:\n"
+            b"    QUIESCENCE_CONTRACT_VERSION = 1\n"
+        ),
+        (
+            b"QUIESCENCE_CONTRACT_VERSION = 2\n"
+            b"del QUIESCENCE_CONTRACT_VERSION\n"
+        ),
+        b"def QUIESCENCE_CONTRACT_VERSION():\n    return 2\n",
+    ),
+)
+def test_ops_quiescence_ast_gate_rejects_ambiguous_runtime_binding(
+    payload: bytes,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        TREE,
+        "QUIESCENCE_HELPER_SHA256",
+        hashlib.sha256(payload).hexdigest(),
+    )
+    with pytest.raises(TREE.OpsTreeError, match="quiescence helper"):
+        TREE.validate_quiescence_helper_contract(payload)
+
+
+def test_ops_quiescence_helper_contract_accepts_reviewed_version(
+    monkeypatch,
+) -> None:
+    payload = (
+        b"#!/usr/bin/python3.12\n"
+        b'"""fixture"""\n'
+        b"QUIESCENCE_CONTRACT_VERSION = 2\n"
+    )
+    monkeypatch.setattr(
+        TREE,
+        "QUIESCENCE_HELPER_SHA256",
+        hashlib.sha256(payload).hexdigest(),
+    )
+    TREE.validate_quiescence_helper_contract(payload)
 
 
 def test_ops_builder_process_rejects_unreviewed_host_platform(

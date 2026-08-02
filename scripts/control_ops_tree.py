@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 sys.dont_write_bytecode = True
 
+import ast
 import hashlib
 import posixpath
 import re
@@ -17,6 +18,12 @@ HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 MARKERS = {"RELEASE_SHA", "artifact-manifest.json"}
 MAX_MEMBERS = 10_000
 MAX_UNCOMPRESSED_BYTES = 512 * 1024 * 1024
+QUIESCENCE_HELPER_PATH = "scripts/verify-control-stack-quiescent.py"
+QUIESCENCE_CONTRACT_VERSION = 2
+QUIESCENCE_HELPER_SHA256 = (
+    "2f745c4dd99e811eb2e50f2800a31ca99f97c41579c9a0ca96ac728df55f35c8"
+)
+MAX_QUIESCENCE_HELPER_BYTES = 256 * 1024
 BOOTSTRAP_REQUIRED_FILE_MODES = {
     "scripts/provision-node-runtime.py": 0o555,
     "scripts/publish-bootstrap-tree.py": 0o555,
@@ -176,3 +183,94 @@ def validate_bootstrap_required_file_modes(
             "Ops bootstrap executable mode contract diverges: "
             f"{mismatched}"
         )
+
+
+def validate_quiescence_helper_contract(payload: bytes | None) -> None:
+    if (
+        payload is None
+        or not payload
+        or len(payload) > MAX_QUIESCENCE_HELPER_BYTES
+    ):
+        reject("Ops quiescence helper is missing or exceeds its size limit")
+    try:
+        source = payload.decode("utf-8")
+    except UnicodeDecodeError:
+        reject("Ops quiescence helper is not UTF-8")
+    if "\x00" in source or "\r" in source:
+        reject("Ops quiescence helper source is not canonical")
+    if hashlib.sha256(payload).hexdigest() != QUIESCENCE_HELPER_SHA256:
+        reject("Ops quiescence helper digest diverges")
+    try:
+        module = ast.parse(source, filename=QUIESCENCE_HELPER_PATH)
+    except (SyntaxError, ValueError):
+        reject("Ops quiescence helper is not valid Python")
+    assignments: list[tuple[ast.AST, ast.Name, ast.AST]] = []
+    for node in module.body:
+        if isinstance(node, ast.Assign):
+            matching = [
+                target
+                for target in node.targets
+                if (
+                    isinstance(target, ast.Name)
+                    and target.id == "QUIESCENCE_CONTRACT_VERSION"
+                )
+            ]
+            if matching:
+                if len(node.targets) != 1 or len(matching) != 1:
+                    reject("Ops quiescence helper contract is ambiguous")
+                assignments.append((node, matching[0], node.value))
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == "QUIESCENCE_CONTRACT_VERSION"
+        ):
+            if node.value is None:
+                reject("Ops quiescence helper contract is not literal")
+            assignments.append((node, node.target, node.value))
+    if len(assignments) != 1:
+        reject("Ops quiescence helper contract version diverges")
+    try:
+        version = ast.literal_eval(assignments[0][2])
+    except (ValueError, TypeError):
+        reject("Ops quiescence helper contract is not literal")
+    if (
+        type(version) is not int
+        or version != QUIESCENCE_CONTRACT_VERSION
+    ):
+        reject("Ops quiescence helper contract version diverges")
+    approved_target = assignments[0][1]
+    for node in ast.walk(module):
+        if (
+            isinstance(node, ast.Name)
+            and node.id == "QUIESCENCE_CONTRACT_VERSION"
+            and not isinstance(node.ctx, ast.Load)
+            and node is not approved_target
+        ):
+            reject("Ops quiescence helper contract is rebound")
+        if (
+            isinstance(
+                node,
+                (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
+            )
+            and node.name == "QUIESCENCE_CONTRACT_VERSION"
+        ):
+            reject("Ops quiescence helper contract is rebound")
+        if (
+            isinstance(node, ast.arg)
+            and node.arg == "QUIESCENCE_CONTRACT_VERSION"
+        ):
+            reject("Ops quiescence helper contract is rebound")
+        if (
+            isinstance(node, (ast.Global, ast.Nonlocal))
+            and "QUIESCENCE_CONTRACT_VERSION" in node.names
+        ):
+            reject("Ops quiescence helper contract is rebound")
+        if (
+            isinstance(node, ast.ExceptHandler)
+            and node.name == "QUIESCENCE_CONTRACT_VERSION"
+        ):
+            reject("Ops quiescence helper contract is rebound")
+        if isinstance(node, ast.alias):
+            bound = node.asname or node.name.split(".", 1)[0]
+            if bound == "QUIESCENCE_CONTRACT_VERSION":
+                reject("Ops quiescence helper contract is rebound")
