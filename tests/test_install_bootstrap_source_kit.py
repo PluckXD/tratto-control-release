@@ -7,12 +7,14 @@ import importlib.util
 import io
 import json
 import os
+import signal
 import shutil
 import stat
 import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -108,6 +110,7 @@ def build_archive(
     omit: str | None = None,
     quiescence_kind: bytes = tarfile.REGTYPE,
     quiescence_mode: int = 0o555,
+    quiescence_payload: bytes = b"quiescence\n",
 ) -> None:
     approval = {
         "api": {
@@ -148,10 +151,18 @@ def build_archive(
         "scripts/provision-node-runtime.py": (b"provision\n", 0o555),
         "scripts/publish-bootstrap-tree.py": (b"publisher\n", 0o555),
         "scripts/verify-control-stack-quiescent.py": (
-            b"quiescence\n",
+            quiescence_payload,
             quiescence_mode,
         ),
         "scripts/with-deploy-lock.py": (b"lock\n", 0o555),
+        "systemd/tratto-control.slice": (
+            b"[Unit]\nDescription=Tratto Control\n",
+            0o444,
+        ),
+        "systemd/tratto-control-recovery.service": (
+            b"[Unit]\nDescription=Tratto Control recovery\n",
+            0o444,
+        ),
     }
     if extra is not None:
         files[extra[0]] = (extra[1], extra[2])
@@ -169,13 +180,14 @@ def build_archive(
                 mode="w",
                 format=tarfile.USTAR_FORMAT,
             ) as archive:
-                archive.addfile(
-                    tar_info(
-                        "scripts",
-                        mode=0o555,
-                        kind=tarfile.DIRTYPE,
+                for directory in ("scripts", "systemd"):
+                    archive.addfile(
+                        tar_info(
+                            directory,
+                            mode=0o555,
+                            kind=tarfile.DIRTYPE,
+                        )
                     )
-                )
                 for name in ("RELEASE_SHA", "artifact-manifest.json"):
                     payload, mode = files.pop(name)
                     archive.addfile(
@@ -498,6 +510,11 @@ def install(
     *,
     fault=lambda _event: None,
     predecessor: tuple[str, str, str] | None = None,
+    post_predecessor: (
+        tuple[str, str, str, str, str, str] | None
+    ) = None,
+    publisher_callback=None,
+    quiescence_callback=None,
 ) -> str:
     def verifier(
         _cosign: int,
@@ -519,7 +536,23 @@ def install(
             assert authorization is not None
             calls.append(authorization.decode("utf-8"))
         calls.append("publisher")
+        if publisher_callback is not None:
+            publisher_callback()
         return "upgraded"
+
+    def quiescence(
+        _archive: int,
+        _archive_info: os.stat_result,
+        _inventory: object,
+        _archive_sha256: str,
+        lock_descriptor: int,
+        current_bootstrap_digest: str,
+    ) -> None:
+        assert lock_descriptor == 99
+        assert len(current_bootstrap_digest) == 64
+        calls.append("quiescence")
+        if quiescence_callback is not None:
+            quiescence_callback(current_bootstrap_digest)
 
     helper_path = incoming / KIT.HELPER_NAME
     execution_descriptor = os.open(helper_path, os.O_RDONLY)
@@ -546,11 +579,30 @@ def install(
                 predecessor_publisher_intent_sha256=(
                     predecessor[2] if predecessor else None
                 ),
+                post_publisher_predecessor_kit_id=(
+                    post_predecessor[0] if post_predecessor else None
+                ),
+                post_publisher_predecessor_controller_sha=(
+                    post_predecessor[1] if post_predecessor else None
+                ),
+                post_publisher_source_intent_sha256=(
+                    post_predecessor[2] if post_predecessor else None
+                ),
+                post_publisher_source_used_sha256=(
+                    post_predecessor[3] if post_predecessor else None
+                ),
+                post_publisher_publisher_intent_sha256=(
+                    post_predecessor[4] if post_predecessor else None
+                ),
+                post_publisher_publisher_used_sha256=(
+                    post_predecessor[5] if post_predecessor else None
+                ),
             ),
             runtime=fake_runtime(),
             signature_verifier=verifier,
             publisher=publisher,
             lock_descriptor=99,
+            quiescence=quiescence,
             fault=fault,
         )
     finally:
@@ -681,6 +733,167 @@ def prepare_fixed_publisher_state(
     staging.chmod(0o700)
     control.chmod(0o711)
     return control, hashlib.sha256(intent).hexdigest()
+
+
+def protected_bootstrap_tree(path: Path, version: bytes) -> str:
+    path.mkdir(mode=0o700)
+    (path / ".complete").write_bytes(b"BOOTSTRAP_READY=1\n")
+    (path / "version").write_bytes(version)
+    for child in path.iterdir():
+        child.chmod(0o444)
+    path.chmod(0o555)
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        return KIT.protected_bootstrap_tree_digest(
+            descriptor,
+            uid=os.getuid(),
+            gid=os.getgid(),
+        )
+    finally:
+        os.close(descriptor)
+
+
+def prepare_terminal_publisher_state(
+    root: Path,
+) -> tuple[Path, dict[str, object]]:
+    control = root / "tratto-control"
+    staging = control / ".staging"
+    bundles = control / KIT.BUNDLES_NAME
+    staging.mkdir(parents=True, mode=0o700)
+    bundles.mkdir(mode=0o711)
+    provisional_previous = staging / ".publisher-old"
+    old_digest = protected_bootstrap_tree(
+        provisional_previous,
+        b"old\n",
+    )
+    final = control / "bootstrap"
+    new_digest = protected_bootstrap_tree(final, b"published\n")
+    previous_name = KIT.PUBLISHER_PREVIOUS_PREFIX + old_digest[:32]
+    provisional_previous.rename(staging / previous_name)
+    intent_value = {
+        "new_tree_sha256": new_digest,
+        "old_tree_sha256": old_digest,
+        "phase": "intent",
+        "previous_name": previous_name,
+        "schema_version": 1,
+    }
+    used_value = dict(intent_value)
+    used_value["phase"] = "used"
+    intent_raw = canonical(intent_value)
+    used_raw = canonical(used_value)
+    (staging / KIT.PUBLISHER_INTENT_NAME).write_bytes(intent_raw)
+    (staging / KIT.PUBLISHER_USED_NAME).write_bytes(used_raw)
+    (staging / KIT.PUBLISHER_INTENT_NAME).chmod(0o400)
+    (staging / KIT.PUBLISHER_USED_NAME).chmod(0o400)
+    control.chmod(0o711)
+    return control, {
+        "intent_sha256": hashlib.sha256(intent_raw).hexdigest(),
+        "used_sha256": hashlib.sha256(used_raw).hexdigest(),
+        "old_digest": old_digest,
+        "new_digest": new_digest,
+        "previous_name": previous_name,
+    }
+
+
+def configure_post_publisher_paths(
+    monkeypatch: pytest.MonkeyPatch,
+    root: Path,
+    control: Path,
+) -> None:
+    monkeypatch.setattr(KIT, "CONTROL_ROOT", control)
+    monkeypatch.setattr(
+        KIT,
+        "BOOTSTRAP_RELEASE_MARKER",
+        root / "etc" / "bootstrap-release.env",
+    )
+    monkeypatch.setattr(
+        KIT,
+        "RELEASE_STATE_MARKER",
+        root / "etc" / "release-state.env",
+    )
+    monkeypatch.setattr(
+        KIT,
+        "ACTIVATION_JOURNAL",
+        root / "etc" / "activation.env",
+    )
+    monkeypatch.setattr(
+        KIT,
+        "ACTIVATION_EPOCH_MARKER",
+        root / "etc" / "activation-epoch.env",
+    )
+
+
+def prepare_post_publisher_fixture(
+    root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[
+    Path,
+    Path,
+    list[str],
+    tuple[str, str, str, str, str, str],
+    Path,
+]:
+    incoming, state, calls = fixture(root)
+    assert install(incoming, state, calls) == "installed"
+    source_intent = (state / KIT.INTENT_NAME).read_bytes()
+    source_used = (state / KIT.USED_NAME).read_bytes()
+    source = KIT.validate_source_intent(source_intent)
+    control, publisher = prepare_terminal_publisher_state(root)
+    configure_post_publisher_paths(monkeypatch, root, control)
+    successor_api_sha = "d" * 40
+    replace_signed_release(
+        incoming,
+        api_sha=successor_api_sha,
+        required_ancestors=(source.api_sha,),
+    )
+    calls.clear()
+    bindings = (
+        source.kit_id,
+        source.controller_sha,
+        hashlib.sha256(source_intent).hexdigest(),
+        hashlib.sha256(source_used).hexdigest(),
+        str(publisher["intent_sha256"]),
+        str(publisher["used_sha256"]),
+    )
+    return incoming, state, calls, bindings, control
+
+
+def publish_fake_successor_bootstrap(control: Path) -> None:
+    staging = control / ".staging"
+    final = control / "bootstrap"
+    final_descriptor = os.open(final, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        old_digest = KIT.protected_bootstrap_tree_digest(
+            final_descriptor,
+            uid=os.getuid(),
+            gid=os.getgid(),
+        )
+    finally:
+        os.close(final_descriptor)
+    candidate = staging / ".publisher-successor"
+    new_digest = protected_bootstrap_tree(candidate, b"successor\n")
+    previous_name = KIT.PUBLISHER_PREVIOUS_PREFIX + old_digest[:32]
+    control.chmod(0o700)
+    final.chmod(0o700)
+    candidate.chmod(0o700)
+    final.rename(staging / previous_name)
+    candidate.rename(final)
+    (staging / previous_name).chmod(0o555)
+    final.chmod(0o555)
+    control.chmod(0o711)
+    intent = {
+        "new_tree_sha256": new_digest,
+        "old_tree_sha256": old_digest,
+        "phase": "intent",
+        "previous_name": previous_name,
+        "schema_version": 1,
+    }
+    used = dict(intent)
+    used["phase"] = "used"
+    (staging / KIT.PUBLISHER_INTENT_NAME).write_bytes(canonical(intent))
+    (staging / KIT.PUBLISHER_USED_NAME).write_bytes(canonical(used))
+    (staging / KIT.PUBLISHER_INTENT_NAME).chmod(0o400)
+    (staging / KIT.PUBLISHER_USED_NAME).chmod(0o400)
 
 
 def add_foreign_source_reserved_entry(
@@ -1302,6 +1515,40 @@ def test_successor_replay_rejects_foreign_partial_without_mutation(
 
     assert immutable_tree_snapshot(state) == before
     assert not (state / KIT.INTENT_NAME).exists()
+
+
+def test_normal_mode_rejects_post_publisher_partial_with_typed_error(
+    secure_tmp_path: Path,
+) -> None:
+    incoming, state, calls = fixture(secure_tmp_path)
+
+    def stop_after_intent(event: str) -> None:
+        if event == "after_intent":
+            raise RuntimeError("stop after intent")
+
+    with pytest.raises(RuntimeError, match="stop after intent"):
+        install(
+            incoming,
+            state,
+            calls,
+            fault=stop_after_intent,
+        )
+    successor = json.loads((state / KIT.INTENT_NAME).read_text())
+    partial = state / (
+        "bootstrap-source-kit.post-publisher-supersede."
+        f"{successor['kit_id']}.installing"
+    )
+    partial.write_bytes(b"foreign partial\n")
+    partial.chmod(0o444)
+    before = immutable_tree_snapshot(state)
+
+    with pytest.raises(
+        KIT.BootstrapSourceError,
+        match="namespace reservado",
+    ):
+        install(incoming, state, calls)
+
+    assert immutable_tree_snapshot(state) == before
 
 
 def prepare_successor_after_predecessor_archives(
@@ -2007,6 +2254,416 @@ def test_rejects_different_kit_after_intent(
         install(incoming, state, [])
 
 
+def test_post_publisher_successor_archives_terminal_evidence_and_replays(
+    secure_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    incoming, state, calls, bindings, control = (
+        prepare_post_publisher_fixture(secure_tmp_path, monkeypatch)
+    )
+    observed_bootstrap_digests: list[str] = []
+    predecessor = os.open(
+        control / "bootstrap",
+        os.O_RDONLY | os.O_DIRECTORY,
+    )
+    try:
+        predecessor_digest = KIT.protected_bootstrap_tree_digest(
+            predecessor,
+            uid=os.getuid(),
+            gid=os.getgid(),
+        )
+    finally:
+        os.close(predecessor)
+
+    assert (
+        install(
+            incoming,
+            state,
+            calls,
+            post_predecessor=bindings,
+            publisher_callback=lambda: publish_fake_successor_bootstrap(
+                control
+            ),
+            quiescence_callback=observed_bootstrap_digests.append,
+        )
+        == "installed"
+    )
+    assert calls == [
+        "signature",
+        "signature",
+        "signature",
+        "quiescence",
+        "publisher",
+    ]
+    predecessor_kit = bindings[0]
+    assert (state / KIT.POST_PUBLISHER_SUPERSEDE_NAME).is_file()
+    assert (state / KIT.SUPERSEDE_NAME).is_file()
+    assert (
+        state
+        / f"bootstrap-source-kit.used.superseded."
+        f"{predecessor_kit}.json"
+    ).is_file()
+    for kind in ("used", "intent", "previous"):
+        assert (
+            control
+            / ".staging"
+            / KIT.post_publisher_archive_name(kind, predecessor_kit)
+        ).exists()
+    assert (state / KIT.USED_NAME).is_file()
+    successor = os.open(
+        control / "bootstrap",
+        os.O_RDONLY | os.O_DIRECTORY,
+    )
+    try:
+        successor_digest = KIT.protected_bootstrap_tree_digest(
+            successor,
+            uid=os.getuid(),
+            gid=os.getgid(),
+        )
+    finally:
+        os.close(successor)
+    assert observed_bootstrap_digests == [predecessor_digest]
+
+    calls.clear()
+    assert (
+        install(
+            incoming,
+            state,
+            calls,
+            post_predecessor=bindings,
+            quiescence_callback=observed_bootstrap_digests.append,
+        )
+        == "already-installed"
+    )
+    assert calls == [
+        "signature",
+        "signature",
+        "signature",
+        "quiescence",
+    ]
+    assert observed_bootstrap_digests == [
+        predecessor_digest,
+        successor_digest,
+    ]
+
+
+@pytest.mark.parametrize(
+    "event",
+    (
+        "after_post_publisher_supersede",
+        "after_post_publisher_source_used_archive",
+        "after_post_publisher_used_archive",
+        "after_post_publisher_intent_archive",
+        "after_post_publisher_previous_archive",
+        "after_post_publisher_standard_supersede",
+        "after_source_supersede_intent",
+        "after_source_supersede_prepared",
+        "after_source_supersede_exchanged",
+        "after_source_supersede_retained",
+        "after_intent",
+        "after_candidate",
+        "after_exchange",
+        "after_retention_rename",
+        "before_publisher",
+        "after_publisher",
+    ),
+)
+@pytest.mark.skipif(
+    not hasattr(os, "fork"),
+    reason="fault harness exige fork",
+)
+def test_post_publisher_successor_recovers_every_sigkill_boundary(
+    secure_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    event: str,
+) -> None:
+    incoming, state, calls, bindings, control = (
+        prepare_post_publisher_fixture(secure_tmp_path, monkeypatch)
+    )
+
+    def publish_successor_once() -> None:
+        if not (
+            control / ".staging" / KIT.PUBLISHER_USED_NAME
+        ).exists():
+            publish_fake_successor_bootstrap(control)
+
+    child = os.fork()
+    if child == 0:
+        def kill_at(observed: str) -> None:
+            if observed == event:
+                os.kill(os.getpid(), signal.SIGKILL)
+
+        try:
+            install(
+                incoming,
+                state,
+                [],
+                post_predecessor=bindings,
+                publisher_callback=publish_successor_once,
+                fault=kill_at,
+            )
+        except BaseException:
+            os._exit(92)
+        os._exit(91)
+    _, status = os.waitpid(child, 0)
+    assert os.WIFSIGNALED(status)
+    assert os.WTERMSIG(status) == signal.SIGKILL
+    calls.clear()
+    assert (
+        install(
+            incoming,
+            state,
+            calls,
+            post_predecessor=bindings,
+            publisher_callback=publish_successor_once,
+        )
+        == "installed"
+    )
+
+
+@pytest.mark.parametrize(
+    "residue",
+    (
+        "current",
+        "bundle",
+        "bootstrap-release",
+        "release-state",
+        "activation",
+        "activation-epoch",
+        "consumed",
+    ),
+)
+def test_post_publisher_rejects_any_pre_stage_residue_without_mutation(
+    secure_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    residue: str,
+) -> None:
+    incoming, state, calls, bindings, control = (
+        prepare_post_publisher_fixture(secure_tmp_path, monkeypatch)
+    )
+    if residue == "current":
+        (control / "current").symlink_to("bootstrap")
+    elif residue == "bundle":
+        (control / KIT.BUNDLES_NAME / ("f" * 64)).mkdir()
+    elif residue == "consumed":
+        (state / KIT.BOOTSTRAP_CONSUMED_NAME).write_bytes(b"used\n")
+    else:
+        paths = {
+            "bootstrap-release": KIT.BOOTSTRAP_RELEASE_MARKER,
+            "release-state": KIT.RELEASE_STATE_MARKER,
+            "activation": KIT.ACTIVATION_JOURNAL,
+            "activation-epoch": KIT.ACTIVATION_EPOCH_MARKER,
+        }
+        path = paths[residue]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"foreign\n")
+    before = immutable_tree_snapshot(state)
+    with pytest.raises(
+        KIT.BootstrapSourceError,
+        match="pré-stage|current|bundle|marker|activation|consumption",
+    ):
+        install(
+            incoming,
+            state,
+            calls,
+            post_predecessor=bindings,
+        )
+    assert immutable_tree_snapshot(state) == before
+
+
+@pytest.mark.parametrize("binding_index", range(6))
+def test_post_publisher_rejects_mixed_external_binding_without_mutation(
+    secure_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    binding_index: int,
+) -> None:
+    incoming, state, calls, bindings, _control = (
+        prepare_post_publisher_fixture(secure_tmp_path, monkeypatch)
+    )
+    tampered = list(bindings)
+    tampered[binding_index] = (
+        "9" * 40 if binding_index == 1 else "9" * 64
+    )
+    before = immutable_tree_snapshot(state)
+    with pytest.raises(KIT.BootstrapSourceError):
+        install(
+            incoming,
+            state,
+            calls,
+            post_predecessor=tuple(tampered),
+        )
+    assert immutable_tree_snapshot(state) == before
+
+
+def test_post_publisher_rejects_duplicate_predecessor_used_after_archive(
+    secure_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    incoming, state, calls, bindings, _control = (
+        prepare_post_publisher_fixture(secure_tmp_path, monkeypatch)
+    )
+
+    def stop(event: str) -> None:
+        if event == "after_post_publisher_source_used_archive":
+            raise RuntimeError("SIGKILL")
+
+    with pytest.raises(RuntimeError, match="SIGKILL"):
+        install(
+            incoming,
+            state,
+            calls,
+            post_predecessor=bindings,
+            fault=stop,
+        )
+    archived = (
+        state
+        / f"bootstrap-source-kit.used.superseded."
+        f"{bindings[0]}.json"
+    )
+    duplicate = state / KIT.USED_NAME
+    duplicate.write_bytes(archived.read_bytes())
+    duplicate.chmod(0o444)
+    before = immutable_tree_snapshot(state)
+    with pytest.raises(KIT.BootstrapSourceError, match="coexiste"):
+        install(
+            incoming,
+            state,
+            calls,
+            post_predecessor=bindings,
+        )
+    assert immutable_tree_snapshot(state) == before
+
+
+def test_post_publisher_replay_rejects_unknown_signed_successor(
+    secure_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    incoming, state, calls, bindings, _control = (
+        prepare_post_publisher_fixture(secure_tmp_path, monkeypatch)
+    )
+
+    def stop(event: str) -> None:
+        if event == "after_post_publisher_supersede":
+            raise RuntimeError("SIGKILL")
+
+    with pytest.raises(RuntimeError, match="SIGKILL"):
+        install(
+            incoming,
+            state,
+            calls,
+            post_predecessor=bindings,
+            fault=stop,
+        )
+    replace_signed_release(
+        incoming,
+        api_sha="e" * 40,
+        required_ancestors=("a" * 40,),
+    )
+    before = immutable_tree_snapshot(state)
+    with pytest.raises(
+        KIT.BootstrapSourceError,
+        match="autoriza|successor|sucessor",
+    ):
+        install(
+            incoming,
+            state,
+            calls,
+            post_predecessor=bindings,
+        )
+    assert immutable_tree_snapshot(state) == before
+
+
+def test_post_publisher_terminal_replay_rejects_another_signed_successor(
+    secure_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    incoming, state, calls, bindings, control = (
+        prepare_post_publisher_fixture(secure_tmp_path, monkeypatch)
+    )
+    assert (
+        install(
+            incoming,
+            state,
+            calls,
+            post_predecessor=bindings,
+            publisher_callback=lambda: publish_fake_successor_bootstrap(
+                control
+            ),
+        )
+        == "installed"
+    )
+    replace_signed_release(
+        incoming,
+        api_sha="e" * 40,
+        required_ancestors=("a" * 40,),
+    )
+    state_before = immutable_tree_snapshot(state)
+    control_before = immutable_tree_snapshot(control)
+    with pytest.raises(
+        KIT.BootstrapSourceError,
+        match="autoriza|successor|sucessor",
+    ):
+        install(
+            incoming,
+            state,
+            calls,
+            post_predecessor=bindings,
+        )
+    assert immutable_tree_snapshot(state) == state_before
+    assert immutable_tree_snapshot(control) == control_before
+
+
+@pytest.mark.parametrize(
+    "event",
+    (
+        "after_post_publisher_supersede",
+        "after_post_publisher_source_used_archive",
+        "after_post_publisher_used_archive",
+        "after_post_publisher_intent_archive",
+        "after_post_publisher_previous_archive",
+        "after_post_publisher_standard_supersede",
+    ),
+)
+@pytest.mark.parametrize("binding_index", range(6))
+def test_post_publisher_partial_retry_rejects_every_mixed_binding(
+    secure_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    event: str,
+    binding_index: int,
+) -> None:
+    incoming, state, calls, bindings, control = (
+        prepare_post_publisher_fixture(secure_tmp_path, monkeypatch)
+    )
+
+    def stop(observed: str) -> None:
+        if observed == event:
+            raise RuntimeError(f"SIGKILL:{event}")
+
+    with pytest.raises(RuntimeError, match="SIGKILL"):
+        install(
+            incoming,
+            state,
+            calls,
+            post_predecessor=bindings,
+            fault=stop,
+        )
+    tampered = list(bindings)
+    tampered[binding_index] = (
+        "9" * 40 if binding_index == 1 else "9" * 64
+    )
+    state_before = immutable_tree_snapshot(state)
+    control_before = immutable_tree_snapshot(control)
+    with pytest.raises(KIT.BootstrapSourceError):
+        install(
+            incoming,
+            state,
+            calls,
+            post_predecessor=tuple(tampered),
+        )
+    assert immutable_tree_snapshot(state) == state_before
+    assert immutable_tree_snapshot(control) == control_before
+
+
 def test_archive_rejects_links_before_any_mutation(
     secure_tmp_path: Path,
 ) -> None:
@@ -2081,6 +2738,567 @@ def test_archive_rejects_invalid_quiescence_helper_before_source_exchange(
         b"old source\n"
     )
     assert not (state / KIT.INTENT_NAME).exists(), tamper
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux" or not hasattr(os, "memfd_create"),
+    reason="requires Linux sealed memfd",
+)
+@pytest.mark.parametrize("outcome", ("success", "unknown-unit"))
+def test_post_publisher_runs_only_signed_incoming_quiescence_memfd(
+    secure_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+) -> None:
+    incoming, _state, _calls = fixture(secure_tmp_path)
+    archive = next(incoming.glob("tratto-control-ops-*.tar.gz"))
+    archive.chmod(0o600)
+    if outcome == "success":
+        verifier = (
+            b"print('stack Control totalmente parada e sem "
+            b"concorrencia systemd'.replace('concorrencia', "
+            b"'concorr\\u00eancia'))\n"
+        )
+    else:
+        verifier = (
+            b"raise SystemExit('preflight bootstrap Control recusado: "
+            b"unit Fleet futura desconhecida')\n"
+        )
+    build_archive(
+        archive,
+        "a" * 40,
+        quiescence_payload=verifier,
+    )
+    archive.chmod(0o400)
+    raw = json.loads((incoming / KIT.ATTESTATION_NAME).read_text())
+    raw["artifacts"]["ops"]["sha256"] = hashlib.sha256(
+        archive.read_bytes()
+    ).hexdigest()
+    raw["artifacts"]["ops"]["size_bytes"] = archive.stat().st_size
+    attestation_path = incoming / KIT.ATTESTATION_NAME
+    attestation_path.chmod(0o600)
+    attestation_path.write_bytes(canonical(raw))
+    attestation_path.chmod(0o400)
+    execution = os.open(incoming / KIT.HELPER_NAME, os.O_RDONLY)
+    inputs = KIT.open_and_validate_inputs(
+        incoming,
+        uid=os.getuid(),
+        gid=os.getgid(),
+        execution_descriptor=execution,
+        expectations=expectations(incoming),
+        signature_verifier=lambda *_args: None,
+    )
+    lock_descriptor = -1
+    try:
+        inventory = KIT.validate_ops_archive(
+            inputs.archive_descriptor,
+            inputs.archive_info,
+            inputs.binding,
+        )
+        monkeypatch.setattr(KIT, "EXPECTED_UID", os.getuid())
+        monkeypatch.setattr(KIT, "EXPECTED_GID", os.getgid())
+        monkeypatch.setattr(KIT, "PYTHON", Path(sys.executable))
+        monkeypatch.setattr(KIT, "SYSTEMCTL", Path("/usr/bin/true"))
+        monkeypatch.setattr(
+            KIT,
+            "STATE_ROOT",
+            secure_tmp_path / "forbidden-predecessor",
+        )
+        control = secure_tmp_path / "quiescence-control"
+        current_digest = published_unit_catalog_tree(
+            control,
+            {
+                "tratto-control.slice": b"published slice\n",
+                "tratto-control-recovery.service": (
+                    b"published recovery\n"
+                ),
+            },
+        )
+        monkeypatch.setattr(KIT, "CONTROL_ROOT", control)
+        lock_path = secure_tmp_path / "quiescence.lock"
+        lock_path.write_bytes(b"")
+        lock_path.chmod(0o600)
+        lock_descriptor = os.open(lock_path, os.O_RDWR)
+        fcntl.flock(lock_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if outcome == "success":
+            KIT.run_quiescence_verifier(
+                inputs.archive_descriptor,
+                inputs.archive_info,
+                inventory,
+                inputs.binding.ops_sha256,
+                lock_descriptor,
+                current_digest,
+            )
+        else:
+            with pytest.raises(
+                KIT.BootstrapSourceError,
+                match="não foi provada",
+            ):
+                KIT.run_quiescence_verifier(
+                    inputs.archive_descriptor,
+                    inputs.archive_info,
+                    inventory,
+                    inputs.binding.ops_sha256,
+                    lock_descriptor,
+                    current_digest,
+                )
+    finally:
+        if lock_descriptor >= 0:
+            os.close(lock_descriptor)
+        inputs.close()
+        os.close(execution)
+
+
+def test_quiescence_protocol_is_pre_reload_then_final_with_same_fds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def run(
+        command: list[str],
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[bytes]:
+        calls.append((command, kwargs))
+        output = (
+            b""
+            if command[0] == str(KIT.SYSTEMCTL)
+            else KIT.QUIESCENCE_SUCCESS
+        )
+        return subprocess.CompletedProcess(command, 0, output, b"")
+
+    monkeypatch.setattr(KIT.subprocess, "run", run)
+    KIT.run_quiescence_protocol(41, 42, 43)
+
+    assert [call[0] for call in calls] == [
+        [
+            str(KIT.PYTHON),
+            "-I",
+            "-B",
+            "/proc/self/fd/41",
+            "--sealed-packaged-unit-catalog-pre-reload-fd",
+            "42",
+        ],
+        [
+            str(KIT.SYSTEMCTL),
+            "--no-ask-password",
+            "daemon-reload",
+        ],
+        [
+            str(KIT.PYTHON),
+            "-I",
+            "-B",
+            "/proc/self/fd/41",
+            "--sealed-packaged-unit-catalog-fd",
+            "42",
+        ],
+    ]
+    assert calls[0][1]["pass_fds"] == (41, 42, 43)
+    assert calls[1][1]["pass_fds"] == (43,)
+    assert calls[2][1]["pass_fds"] == (41, 42, 43)
+    for _command, arguments in calls:
+        environment = arguments["env"]
+        assert isinstance(environment, dict)
+        assert environment[KIT.LOCK_FD_ENV] == "43"
+        assert environment[KIT.LOCK_HELD_ENV] == "1"
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_calls", "message"),
+    (
+        ("pre", 1, "pré-reload"),
+        ("reload", 2, "daemon-reload"),
+    ),
+)
+def test_quiescence_protocol_short_circuits_before_final_on_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+    expected_calls: int,
+    message: str,
+) -> None:
+    calls: list[list[str]] = []
+
+    def run(
+        command: list[str],
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[bytes]:
+        calls.append(command)
+        is_reload = command[0] == str(KIT.SYSTEMCTL)
+        should_fail = (
+            failure == "pre" and len(calls) == 1
+        ) or (failure == "reload" and is_reload)
+        return subprocess.CompletedProcess(
+            command,
+            78 if should_fail else 0,
+            b"" if is_reload else KIT.QUIESCENCE_SUCCESS,
+            b"controlled failure\n" if should_fail else b"",
+        )
+
+    monkeypatch.setattr(KIT.subprocess, "run", run)
+    with pytest.raises(KIT.BootstrapSourceError, match=message):
+        KIT.run_quiescence_protocol(51, 52, 53)
+    assert len(calls) == expected_calls
+    assert not any(
+        "--sealed-packaged-unit-catalog-fd" in command
+        for command in calls
+    )
+
+
+def test_fork_guardian_retains_same_lock_after_parent_sigkill(
+    secure_tmp_path: Path,
+) -> None:
+    lock_directory = secure_tmp_path / "guardian-lock"
+    lock_directory.mkdir(mode=0o700)
+    lock_path = lock_directory / KIT.LOCK_NAME
+    lock_path.write_bytes(b"")
+    lock_path.chmod(0o600)
+    ready_reader, ready_writer = os.pipe()
+    release_reader, release_writer = os.pipe()
+    parent = os.fork()
+    if parent == 0:
+        os.close(ready_reader)
+        os.close(release_writer)
+        try:
+            lock = KIT.acquire_fixed_deploy_lock(
+                uid=os.getuid(),
+                gid=os.getgid(),
+                lock_directory=lock_directory,
+            )
+
+            def held_action() -> None:
+                os.write(ready_writer, b"ready\n")
+                if os.read(release_reader, 1) != b"x":
+                    raise RuntimeError("release inválido")
+
+            KIT.run_fork_guardian(lock, held_action)
+        except BaseException:
+            os._exit(78)
+        os._exit(0)
+    os.close(ready_writer)
+    os.close(release_reader)
+    acquired = -1
+    try:
+        assert os.read(ready_reader, len(b"ready\n")) == b"ready\n"
+        os.kill(parent, signal.SIGKILL)
+        waited, status = os.waitpid(parent, 0)
+        assert waited == parent
+        assert os.WIFSIGNALED(status)
+        assert os.WTERMSIG(status) == signal.SIGKILL
+        with pytest.raises(
+            KIT.BootstrapSourceError,
+            match="já está ocupado",
+        ):
+            KIT.acquire_fixed_deploy_lock(
+                uid=os.getuid(),
+                gid=os.getgid(),
+                lock_directory=lock_directory,
+            )
+        os.write(release_writer, b"x")
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                acquired = KIT.acquire_fixed_deploy_lock(
+                    uid=os.getuid(),
+                    gid=os.getgid(),
+                    lock_directory=lock_directory,
+                )
+                break
+            except KIT.BootstrapSourceError:
+                time.sleep(0.01)
+        assert acquired >= 0
+    finally:
+        if acquired >= 0:
+            os.close(acquired)
+        os.close(release_writer)
+        os.close(ready_reader)
+
+
+def inventory_entry(
+    path: str,
+    *,
+    kind: str = "file",
+    mode: int = 0o444,
+    size: int = 1,
+) -> object:
+    payload = b"x" * size
+    return KIT.TreeEntry(
+        path=path,
+        kind=kind,
+        mode=mode,
+        size=size,
+        sha256=hashlib.sha256(payload).hexdigest(),
+    )
+
+
+def published_unit_catalog_tree(
+    control: Path,
+    units: dict[str, bytes],
+) -> str:
+    bootstrap = control / "bootstrap"
+    systemd = bootstrap / "systemd"
+    systemd.mkdir(parents=True, mode=0o700)
+    for name, payload in units.items():
+        path = systemd / name
+        path.write_bytes(payload)
+        path.chmod(0o444)
+    systemd.chmod(0o555)
+    bootstrap.chmod(0o555)
+    control.chmod(0o711)
+    descriptor = os.open(bootstrap, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        return KIT.protected_bootstrap_tree_digest(
+            descriptor,
+            uid=os.getuid(),
+            gid=os.getgid(),
+        )
+    finally:
+        os.close(descriptor)
+
+
+def test_packaged_unit_names_are_exact_sorted_and_accept_templates() -> None:
+    entries = {
+        path: inventory_entry(path)
+        for path in (
+            "systemd/tratto-control.slice",
+            "systemd/tratto-control-recovery.service",
+            "systemd/tratto-control-web.service",
+            "systemd/tratto-control-migrate@.service",
+            "scripts/tratto-control-not-a-unit.service",
+            "systemd/vendor-unrelated.service",
+        )
+    }
+    inventory = KIT.ArchiveInventory(entries=entries, tree_sha256="0" * 64)
+
+    assert KIT.packaged_unit_names(inventory) == (
+        "tratto-control-migrate@.service",
+        "tratto-control-recovery.service",
+        "tratto-control-web.service",
+        "tratto-control.slice",
+    )
+
+
+def test_packaged_units_catalog_hashes_authenticated_published_units(
+    secure_tmp_path: Path,
+) -> None:
+    units = {
+        "tratto-control.slice": b"published slice\n",
+        "tratto-control-recovery.service": b"published recovery\n",
+        "tratto-control-web.service": b"published web\n",
+        "vendor-unrelated.service": b"ignored but authenticated\n",
+    }
+    control = secure_tmp_path / "catalog-control"
+    digest = published_unit_catalog_tree(control, units)
+    entries = {
+        f"systemd/{name}": inventory_entry(f"systemd/{name}")
+        for name in (
+            "tratto-control.slice",
+            "tratto-control-recovery.service",
+            "tratto-control-web.service",
+        )
+    }
+    inventory = KIT.ArchiveInventory(entries=entries, tree_sha256="0" * 64)
+
+    assert KIT.packaged_units_catalog(
+        inventory,
+        digest,
+        uid=os.getuid(),
+        gid=os.getgid(),
+        control_root=control,
+    ) == b"".join(
+        (
+            name.encode("ascii")
+            + b" "
+            + hashlib.sha256(units[name]).hexdigest().encode("ascii")
+            + b"\n"
+        )
+        for name in (
+            "tratto-control-recovery.service",
+            "tratto-control-web.service",
+            "tratto-control.slice",
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("tamper", "message"),
+    (
+        ("digest", "journal autenticado"),
+        ("name", "divergem do sucessor"),
+        ("mode", "arquivo regular protegido"),
+    ),
+)
+def test_packaged_units_catalog_rejects_untrusted_published_state(
+    secure_tmp_path: Path,
+    tamper: str,
+    message: str,
+) -> None:
+    units = {
+        "tratto-control.slice": b"published slice\n",
+        "tratto-control-recovery.service": b"published recovery\n",
+    }
+    control = secure_tmp_path / f"catalog-control-{tamper}"
+    digest = published_unit_catalog_tree(control, units)
+    if tamper == "name":
+        systemd = control / "bootstrap" / "systemd"
+        systemd.chmod(0o755)
+        extra = systemd / "tratto-control-extra.service"
+        extra.write_bytes(b"extra\n")
+        extra.chmod(0o444)
+        systemd.chmod(0o555)
+        descriptor = os.open(
+            control / "bootstrap",
+            os.O_RDONLY | os.O_DIRECTORY,
+        )
+        try:
+            digest = KIT.protected_bootstrap_tree_digest(
+                descriptor,
+                uid=os.getuid(),
+                gid=os.getgid(),
+            )
+        finally:
+            os.close(descriptor)
+    elif tamper == "mode":
+        (control / "bootstrap" / "systemd" / "tratto-control.slice").chmod(
+            0o555
+        )
+        descriptor = os.open(
+            control / "bootstrap",
+            os.O_RDONLY | os.O_DIRECTORY,
+        )
+        try:
+            digest = KIT.protected_bootstrap_tree_digest(
+                descriptor,
+                uid=os.getuid(),
+                gid=os.getgid(),
+            )
+        finally:
+            os.close(descriptor)
+    else:
+        digest = "f" * 64
+    entries = {
+        f"systemd/{name}": inventory_entry(f"systemd/{name}")
+        for name in units
+    }
+    inventory = KIT.ArchiveInventory(entries=entries, tree_sha256="0" * 64)
+
+    with pytest.raises(KIT.BootstrapSourceError, match=message):
+        KIT.packaged_units_catalog(
+            inventory,
+            digest,
+            uid=os.getuid(),
+            gid=os.getgid(),
+            control_root=control,
+        )
+
+
+@pytest.mark.parametrize(
+    ("entries", "message"),
+    (
+        (
+            {
+                "systemd/tratto-control-web.service": inventory_entry(
+                    "systemd/tratto-control-web.service"
+                ),
+                "systemd/tratto-control-recovery.service": inventory_entry(
+                    "systemd/tratto-control-recovery.service"
+                ),
+            },
+            "incompleto",
+        ),
+        (
+            {
+                "systemd/tratto-control.slice": inventory_entry(
+                    "systemd/tratto-control.slice",
+                    mode=0o555,
+                ),
+                "systemd/tratto-control-recovery.service": inventory_entry(
+                    "systemd/tratto-control-recovery.service"
+                ),
+            },
+            "tipo, modo ou nome",
+        ),
+        (
+            {
+                "systemd/tratto-control.slice": inventory_entry(
+                    "systemd/tratto-control.slice",
+                    size=KIT.MAX_PACKAGED_UNIT_BYTES + 1,
+                ),
+                "systemd/tratto-control-recovery.service": inventory_entry(
+                    "systemd/tratto-control-recovery.service"
+                ),
+            },
+            "tipo, modo ou nome",
+        ),
+        (
+            {
+                "systemd/tratto-control.slice": inventory_entry(
+                    "systemd/tratto-control.slice",
+                    size=0,
+                ),
+                "systemd/tratto-control-recovery.service": inventory_entry(
+                    "systemd/tratto-control-recovery.service"
+                ),
+            },
+            "tipo, modo ou nome",
+        ),
+        (
+            {
+                "systemd/tratto-control.slice": inventory_entry(
+                    "systemd/tratto-control.slice",
+                    kind="directory",
+                ),
+                "systemd/tratto-control-recovery.service": inventory_entry(
+                    "systemd/tratto-control-recovery.service"
+                ),
+            },
+            "tipo, modo ou nome",
+        ),
+        (
+            {
+                "systemd/tratto-control.slice": inventory_entry(
+                    "systemd/tratto-control.slice"
+                ),
+                "systemd/tratto-control-recovery.service": inventory_entry(
+                    "systemd/tratto-control-recovery.service"
+                ),
+                "systemd/tratto-control.invalid": inventory_entry(
+                    "systemd/tratto-control.invalid"
+                ),
+            },
+            "tipo, modo ou nome",
+        ),
+    ),
+)
+def test_packaged_units_catalog_rejects_incomplete_or_ambiguous_inventory(
+    entries: dict[str, object],
+    message: str,
+) -> None:
+    inventory = KIT.ArchiveInventory(entries=entries, tree_sha256="0" * 64)
+
+    with pytest.raises(KIT.BootstrapSourceError, match=message):
+        KIT.packaged_unit_names(inventory)
+
+
+def test_packaged_units_catalog_rejects_oversize_payload() -> None:
+    entries = {
+        "systemd/tratto-control.slice": inventory_entry(
+            "systemd/tratto-control.slice"
+        ),
+        "systemd/tratto-control-recovery.service": inventory_entry(
+            "systemd/tratto-control-recovery.service"
+        ),
+    }
+    for index in range(800):
+        name = (
+            f"tratto-control-{index:04d}-"
+            + ("x" * 64)
+            + ".service"
+        )
+        path = f"systemd/{name}"
+        entries[path] = inventory_entry(path)
+    inventory = KIT.ArchiveInventory(entries=entries, tree_sha256="0" * 64)
+
+    with pytest.raises(KIT.BootstrapSourceError, match="excede o limite"):
+        KIT.packaged_unit_names(inventory)
 
 
 @pytest.mark.parametrize("tamper", ["traversal", "concatenated-gzip"])
@@ -2296,6 +3514,36 @@ def test_cli_requires_fd_and_all_external_bindings() -> None:
         ]
     )
     assert successor.expected_predecessor_kit_id == "5" * 64
+    post_publisher = KIT.parse_cli(
+        [
+            "--helper-fd",
+            "0",
+            "--expected-helper-sha256",
+            "1" * 64,
+            "--expected-attestation-sha256",
+            "2" * 64,
+            "--expected-carrier-sha",
+            "3" * 40,
+            "--expected-controller-sha",
+            "4" * 40,
+            "--expected-post-publisher-predecessor-kit-id",
+            "5" * 64,
+            "--expected-post-publisher-predecessor-controller-sha",
+            "6" * 40,
+            "--expected-post-publisher-source-intent-sha256",
+            "7" * 64,
+            "--expected-post-publisher-source-used-sha256",
+            "8" * 64,
+            "--expected-post-publisher-publisher-intent-sha256",
+            "9" * 64,
+            "--expected-post-publisher-publisher-used-sha256",
+            "a" * 64,
+        ]
+    )
+    assert (
+        post_publisher.expected_post_publisher_predecessor_kit_id
+        == "5" * 64
+    )
     with pytest.raises(KIT.BootstrapSourceError, match="CLI"):
         KIT.parse_cli(
             [
@@ -2356,6 +3604,23 @@ def test_cli_requires_fd_and_all_external_bindings() -> None:
                 "5" * 64,
             ]
         )
+    with pytest.raises(KIT.BootstrapSourceError, match="exatamente"):
+        KIT.parse_cli(
+            [
+                "--helper-fd",
+                "0",
+                "--expected-helper-sha256",
+                "1" * 64,
+                "--expected-attestation-sha256",
+                "2" * 64,
+                "--expected-carrier-sha",
+                "3" * 40,
+                "--expected-controller-sha",
+                "4" * 40,
+                "--expected-post-publisher-predecessor-kit-id",
+                "5" * 64,
+            ]
+        )
 
 
 def test_readme_verifies_same_helper_fd_before_lock_wrapper() -> None:
@@ -2413,6 +3678,53 @@ def test_readme_verifies_same_helper_fd_before_lock_wrapper() -> None:
         "  /var/lib/tratto-control/incoming/"
         "install-bootstrap-source-kit.py"
     ) not in text
+
+
+def test_readme_post_publisher_bridge_uses_verified_fd_without_bad_wrapper(
+) -> None:
+    text = README.read_text(encoding="utf-8")
+    start = text.index("### One-use post-publisher/pre-stage recovery")
+    end = text.index("## Stable controller v2", start)
+    section = text[start:end]
+    opened = section.index('exec {helper_fd}<"$helper"')
+    signature = section.index("/usr/local/bin/cosign verify-blob")
+    direct = section.index(
+        '/usr/bin/python3.12 -I -B "$helper_fd_path"'
+    )
+    assert opened < signature < direct
+    assert (
+        "/opt/tratto-control/bootstrap/scripts/with-deploy-lock.py"
+        not in section
+    )
+    assert "/run/tratto-control/deploy.lock" in section
+    assert "non-blocking" in section
+    assert "sealed anonymous Linux `memfd`" in section
+    assert (
+        "--sealed-packaged-unit-catalog-pre-reload-fd"
+        in section
+    )
+    assert "--sealed-packaged-unit-catalog-fd" in section
+    assert (
+        "/usr/bin/systemctl --no-ask-password daemon-reload"
+        in section
+    )
+    assert "journal-authenticated" in section
+    assert "guardian" in section
+    assert "same open-file-description lock" in section
+    assert "SIGKILL" in section
+    assert "authoritative `UnitPath`" in section
+    assert "drop-ins" in section
+    assert "aliases" in section
+    assert "templates with no runtime instance" in section
+    for option in (
+        "--expected-post-publisher-predecessor-kit-id",
+        "--expected-post-publisher-predecessor-controller-sha",
+        "--expected-post-publisher-source-intent-sha256",
+        "--expected-post-publisher-source-used-sha256",
+        "--expected-post-publisher-publisher-intent-sha256",
+        "--expected-post-publisher-publisher-used-sha256",
+    ):
+        assert option in section[direct:]
 
 
 def test_execution_entrypoint_fails_closed_without_linux_procfs(
@@ -2550,6 +3862,230 @@ def test_requires_the_inherited_inode_to_be_actually_locked(
         ) == inherited
     finally:
         os.close(inherited)
+
+
+def test_post_publisher_bridge_acquires_exact_global_lock_exclusively(
+    secure_tmp_path: Path,
+) -> None:
+    lock_directory = secure_tmp_path / "run-post"
+    lock_directory.mkdir(mode=0o700)
+    lock_path = lock_directory / KIT.LOCK_NAME
+    lock_path.write_bytes(b"")
+    lock_path.chmod(0o600)
+
+    acquired = KIT.acquire_fixed_deploy_lock(
+        uid=os.getuid(),
+        gid=os.getgid(),
+        lock_directory=lock_directory,
+    )
+    try:
+        with pytest.raises(
+            KIT.BootstrapSourceError,
+            match="ocupado",
+        ):
+            KIT.acquire_fixed_deploy_lock(
+                uid=os.getuid(),
+                gid=os.getgid(),
+                lock_directory=lock_directory,
+            )
+        observed = os.open(lock_path, os.O_RDWR)
+        try:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(
+                    observed,
+                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                )
+        finally:
+            os.close(observed)
+    finally:
+        os.close(acquired)
+
+    retried = KIT.acquire_fixed_deploy_lock(
+        uid=os.getuid(),
+        gid=os.getgid(),
+        lock_directory=lock_directory,
+    )
+    os.close(retried)
+
+
+def _post_publisher_main_args(helper_fd: int):
+    return KIT.parse_cli(
+        [
+            "--helper-fd",
+            str(helper_fd),
+            "--expected-helper-sha256",
+            "1" * 64,
+            "--expected-attestation-sha256",
+            "2" * 64,
+            "--expected-carrier-sha",
+            "3" * 40,
+            "--expected-controller-sha",
+            "4" * 40,
+            "--expected-post-publisher-predecessor-kit-id",
+            "5" * 64,
+            "--expected-post-publisher-predecessor-controller-sha",
+            "6" * 40,
+            "--expected-post-publisher-source-intent-sha256",
+            "7" * 64,
+            "--expected-post-publisher-source-used-sha256",
+            "8" * 64,
+            "--expected-post-publisher-publisher-intent-sha256",
+            "9" * 64,
+            "--expected-post-publisher-publisher-used-sha256",
+            "a" * 64,
+        ]
+    )
+
+
+def test_post_publisher_main_rejects_any_inherited_lock_environment(
+    secure_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    helper_fd = os.open(SCRIPT, os.O_RDONLY)
+    args = _post_publisher_main_args(helper_fd)
+    acquired = False
+
+    def unexpected_acquire(**_kwargs):
+        nonlocal acquired
+        acquired = True
+        raise AssertionError("post-publisher must reject before acquisition")
+
+    monkeypatch.setattr(KIT, "parse_cli", lambda _argv: args)
+    monkeypatch.setattr(
+        KIT,
+        "validate_execution_entrypoint",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(KIT, "EXPECTED_UID", os.geteuid())
+    monkeypatch.setattr(KIT, "EXPECTED_GID", os.getegid())
+    monkeypatch.setattr(KIT, "acquire_fixed_deploy_lock", unexpected_acquire)
+    monkeypatch.setattr(
+        KIT,
+        "verify_inherited_lock",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("inherited verifier must not run")
+        ),
+    )
+    monkeypatch.setenv(KIT.LOCK_FD_ENV, "91")
+    try:
+        with pytest.raises(
+            KIT.BootstrapSourceError,
+            match="recusa lock herdado",
+        ):
+            KIT.main()
+    finally:
+        os.close(helper_fd)
+
+    assert acquired is False
+
+
+@pytest.mark.parametrize("install_fails", (False, True))
+def test_post_publisher_main_holds_and_closes_exact_direct_lock(
+    secure_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    install_fails: bool,
+) -> None:
+    lock_directory = secure_tmp_path / "run-main-post"
+    lock_directory.mkdir(mode=0o700)
+    lock_path = lock_directory / KIT.LOCK_NAME
+    lock_path.write_bytes(b"")
+    lock_path.chmod(0o600)
+    helper_fd = os.open(SCRIPT, os.O_RDONLY)
+    args = _post_publisher_main_args(helper_fd)
+    real_acquire = KIT.acquire_fixed_deploy_lock
+    acquired_fds: list[int] = []
+    publisher_fds: list[int] = []
+
+    def acquire(**kwargs) -> int:
+        assert kwargs == {"uid": os.geteuid(), "gid": os.getegid()}
+        descriptor = real_acquire(
+            uid=os.geteuid(),
+            gid=os.getegid(),
+            lock_directory=lock_directory,
+        )
+        acquired_fds.append(descriptor)
+        return descriptor
+
+    def assert_lock_is_held(descriptor: int) -> None:
+        fixed = os.stat(lock_path, follow_symlinks=False)
+        observed = os.fstat(descriptor)
+        assert (observed.st_dev, observed.st_ino) == (
+            fixed.st_dev,
+            fixed.st_ino,
+        )
+        with pytest.raises(KIT.BootstrapSourceError, match="ocupado"):
+            real_acquire(
+                uid=os.geteuid(),
+                gid=os.getegid(),
+                lock_directory=lock_directory,
+            )
+
+    def publisher(
+        _source_descriptor: int,
+        lock_descriptor: int,
+        _authorization: bytes | None,
+    ) -> str:
+        assert lock_descriptor == acquired_fds[0]
+        assert_lock_is_held(lock_descriptor)
+        publisher_fds.append(lock_descriptor)
+        return "upgraded"
+
+    def install_source(**kwargs) -> str:
+        descriptor = kwargs["lock_descriptor"]
+        assert descriptor == acquired_fds[0]
+        assert_lock_is_held(descriptor)
+        assert kwargs["publisher"] is publisher
+        assert kwargs["publisher"](123, descriptor, b"authorization") == (
+            "upgraded"
+        )
+        if install_fails:
+            raise KIT.BootstrapSourceError("simulated install failure")
+        return "installed"
+
+    monkeypatch.delenv(KIT.LOCK_FD_ENV, raising=False)
+    monkeypatch.delenv(KIT.LOCK_HELD_ENV, raising=False)
+    monkeypatch.setattr(KIT, "parse_cli", lambda _argv: args)
+    monkeypatch.setattr(
+        KIT,
+        "validate_execution_entrypoint",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(KIT, "EXPECTED_UID", os.geteuid())
+    monkeypatch.setattr(KIT, "EXPECTED_GID", os.getegid())
+    monkeypatch.setattr(KIT, "acquire_fixed_deploy_lock", acquire)
+    monkeypatch.setattr(
+        KIT,
+        "verify_inherited_lock",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("inherited verifier must not run")
+        ),
+    )
+    monkeypatch.setattr(KIT, "production_runtime", lambda: object())
+    monkeypatch.setattr(KIT, "run_publisher", publisher)
+    monkeypatch.setattr(KIT, "install_source", install_source)
+
+    try:
+        if install_fails:
+            with pytest.raises(
+                KIT.BootstrapSourceError,
+                match="simulated install failure",
+            ):
+                KIT.main()
+        else:
+            assert KIT.main() == 0
+    finally:
+        os.close(helper_fd)
+
+    assert len(acquired_fds) == 1
+    assert publisher_fds == acquired_fds
+    with pytest.raises(OSError):
+        os.fstat(acquired_fds[0])
+    reacquired = real_acquire(
+        uid=os.geteuid(),
+        gid=os.getegid(),
+        lock_directory=lock_directory,
+    )
+    os.close(reacquired)
 
 
 def test_open_path_chain_rejects_world_writable_parent(

@@ -1453,7 +1453,7 @@ def test_ops_artifact_round_trip_uses_canonical_modes_and_digest(
     monkeypatch,
     capsys,
 ) -> None:
-    quiescence_fixture = b"QUIESCENCE_CONTRACT_VERSION = 2\n"
+    quiescence_fixture = b"QUIESCENCE_CONTRACT_VERSION = 3\n"
     quiescence_fixture_sha256 = hashlib.sha256(
         quiescence_fixture
     ).hexdigest()
@@ -1642,11 +1642,12 @@ def test_ops_mode_contract_matches_bootstrap_source_helper_minimum() -> None:
         None,
         b"",
         b"QUIESCENCE_CONTRACT_VERSION = 1\n",
-        b"QUIESCENCE_CONTRACT_VERSION = 2\r\n",
+        b"QUIESCENCE_CONTRACT_VERSION = 2\n",
+        b"QUIESCENCE_CONTRACT_VERSION = 3\r\n",
         b"QUIESCENCE_CONTRACT_VERSION = current_version\n",
         (
-            b"QUIESCENCE_CONTRACT_VERSION = 2\n"
-            b"QUIESCENCE_CONTRACT_VERSION = 2\n"
+            b"QUIESCENCE_CONTRACT_VERSION = 3\n"
+            b"QUIESCENCE_CONTRACT_VERSION = 3\n"
         ),
         b"QUIESCENCE_CONTRACT_VERSION =\n",
     ),
@@ -1661,21 +1662,21 @@ def test_ops_quiescence_helper_contract_rejects_missing_or_ambiguous_version(
 @pytest.mark.parametrize(
     "payload",
     (
-        b"QUIESCENCE_CONTRACT_VERSION = 2.0\n",
+        b"QUIESCENCE_CONTRACT_VERSION = 3.0\n",
         (
-            b"QUIESCENCE_CONTRACT_VERSION = 2\n"
+            b"QUIESCENCE_CONTRACT_VERSION = 3\n"
             b"QUIESCENCE_CONTRACT_VERSION += -1\n"
         ),
         (
-            b"QUIESCENCE_CONTRACT_VERSION = 2\n"
+            b"QUIESCENCE_CONTRACT_VERSION = 3\n"
             b"if True:\n"
             b"    QUIESCENCE_CONTRACT_VERSION = 1\n"
         ),
         (
-            b"QUIESCENCE_CONTRACT_VERSION = 2\n"
+            b"QUIESCENCE_CONTRACT_VERSION = 3\n"
             b"del QUIESCENCE_CONTRACT_VERSION\n"
         ),
-        b"def QUIESCENCE_CONTRACT_VERSION():\n    return 2\n",
+        b"def QUIESCENCE_CONTRACT_VERSION():\n    return 3\n",
     ),
 )
 def test_ops_quiescence_ast_gate_rejects_ambiguous_runtime_binding(
@@ -1697,7 +1698,7 @@ def test_ops_quiescence_helper_contract_accepts_reviewed_version(
     payload = (
         b"#!/usr/bin/python3.12\n"
         b'"""fixture"""\n'
-        b"QUIESCENCE_CONTRACT_VERSION = 2\n"
+        b"QUIESCENCE_CONTRACT_VERSION = 3\n"
     )
     monkeypatch.setattr(
         TREE,
