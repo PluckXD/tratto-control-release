@@ -43,6 +43,14 @@ if APPROVAL_SPEC is None or APPROVAL_SPEC.loader is None:
     raise SystemExit("approval validator unavailable")
 APPROVAL = importlib.util.module_from_spec(APPROVAL_SPEC)
 APPROVAL_SPEC.loader.exec_module(APPROVAL)
+APPROVAL_V2_SPEC = importlib.util.spec_from_file_location(
+    "control_release_product_approval_v2",
+    HERE / "validate-approval-v2.py",
+)
+if APPROVAL_V2_SPEC is None or APPROVAL_V2_SPEC.loader is None:
+    raise SystemExit("approval-v2 validator unavailable")
+APPROVAL_V2 = importlib.util.module_from_spec(APPROVAL_V2_SPEC)
+APPROVAL_V2_SPEC.loader.exec_module(APPROVAL_V2)
 
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 MAX_MEMBERS = 350_000
@@ -167,14 +175,28 @@ def load_approval(
 ) -> tuple[dict[str, Any], bytes]:
     try:
         raw = path.read_bytes()
-        value = APPROVAL.parse_json(raw, "approval")
-        APPROVAL.require_canonical(raw, value, "approval")
-        APPROVAL.validate_shape(
-            value,
-            now=dt.datetime.now(dt.timezone.utc),
-            historical=False,
-        )
-    except (OSError, APPROVAL.ApprovalError) as error:
+        dispatch = json.loads(raw)
+        if isinstance(dispatch, dict) and dispatch.get("schema_version") == 2:
+            value = APPROVAL_V2.parse_canonical_json(raw)
+            APPROVAL_V2.validate_shape(
+                value,
+                now=dt.datetime.now(dt.timezone.utc),
+                historical=False,
+            )
+        else:
+            value = APPROVAL.parse_json(raw, "approval")
+            APPROVAL.require_canonical(raw, value, "approval")
+            APPROVAL.validate_shape(
+                value,
+                now=dt.datetime.now(dt.timezone.utc),
+                historical=False,
+            )
+    except (
+        OSError,
+        json.JSONDecodeError,
+        APPROVAL.ApprovalError,
+        APPROVAL_V2.ApprovalV2Error,
+    ) as error:
         reject(f"approval is invalid: {error}")
     approved = value["api" if kind == "api" else "web"]["commit_sha"]
     if approved != release_sha:
@@ -612,6 +634,7 @@ def main() -> int:
         UnicodeDecodeError,
         subprocess.SubprocessError,
         APPROVAL.ApprovalError,
+        APPROVAL_V2.ApprovalV2Error,
         COMPONENT.ComponentManifestError,
         RUNTIME.RuntimePolicyError,
         ProductArtifactError,

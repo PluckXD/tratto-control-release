@@ -190,6 +190,7 @@ def test_authorize_has_exact_checkouts_and_all_v2_validations() -> None:
 
     text = run_text(authorize)
     required_commands = {
+        "scripts/collect-github-evidence-v2.py",
         "scripts/policy-gate-v2.py --phase authorize",
         "scripts/validate-policy-v2.py",
         "scripts/verify-controller-tag.py",
@@ -199,8 +200,9 @@ def test_authorize_has_exact_checkouts_and_all_v2_validations() -> None:
         "scripts/emit-approval-v2-outputs.py",
     }
     assert all(command in text for command in required_commands)
-    assert "FUTURE BLOCKER" in repr(authorize)
-    assert text.count("exit 78") >= 2
+    assert "FUTURE BLOCKER" not in repr(authorize)
+    assert secret_names(authorize) == {"CONTROL_CONTROLLER_AUDIT_TOKEN"}
+    assert "$RUNNER_TEMP/control-evidence-v2" in text
     assert 'APPROVAL_PATH: "${{ inputs.approval_path }}"' not in repr(authorize)
 
 
@@ -307,7 +309,7 @@ def test_every_placeholder_is_an_explicit_exit_78_gate() -> None:
             for step in steps(job)
             if "FUTURE BLOCKER" in str(step.get("name", ""))
         )
-    assert len(blockers) == 8
+    assert len(blockers) == 6
     for blocker in blockers:
         assert "exit 78" in str(blocker.get("run", ""))
         assert blocker.get("continue-on-error") is not True

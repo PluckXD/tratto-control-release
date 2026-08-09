@@ -39,6 +39,14 @@ if APPROVAL_SPEC is None or APPROVAL_SPEC.loader is None:
     raise RuntimeError("approval validator is unavailable")
 APPROVAL = importlib.util.module_from_spec(APPROVAL_SPEC)
 APPROVAL_SPEC.loader.exec_module(APPROVAL)
+APPROVAL_V2_SPEC = importlib.util.spec_from_file_location(
+    "control_release_runtime_approval_v2",
+    HERE / "validate-approval-v2.py",
+)
+if APPROVAL_V2_SPEC is None or APPROVAL_V2_SPEC.loader is None:
+    raise RuntimeError("approval-v2 validator is unavailable")
+APPROVAL_V2 = importlib.util.module_from_spec(APPROVAL_V2_SPEC)
+APPROVAL_V2_SPEC.loader.exec_module(APPROVAL_V2)
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -225,7 +233,15 @@ def validate_component_manifests(
 ) -> None:
     approval_raw, approval = regular_json(approval_path, "approval")
     try:
-        APPROVAL.validate_shape(approval, now=None, historical=True)
+        if approval.get("schema_version") == 2:
+            validated = APPROVAL_V2.validate_bytes(
+                approval_raw,
+                historical=True,
+            )
+            if validated != approval:
+                fail("approval-v2 canonical value changed during validation")
+        else:
+            APPROVAL.validate_shape(approval, now=None, historical=True)
         validate_approval_component_shas(
             approval,
             api_sha=api_sha,
@@ -263,6 +279,7 @@ def validate_component_manifests(
         )
     except (
         APPROVAL.ApprovalError,
+        APPROVAL_V2.ApprovalV2Error,
         COMPONENT.ComponentManifestError,
         RUNTIME.RuntimePolicyError,
     ) as error:

@@ -108,8 +108,15 @@ On `PluckXD/tratto-control-release`:
    require full-SHA references:
    - `actions/checkout@11d5960a326750d5838078e36cf38b85af677262`;
    - `actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548`.
-   The currently observed `allowed_actions: all` and
-   `sha_pinning_required: false` are blockers.
+   The 2026-08-09 observation is `allowed_actions: selected` with required
+   full-SHA pinning, but its allowlist also contains an unused pinned
+   `actions/upload-artifact` revision. Remove that third entry; every release
+   must still collect and independently verify a fresh canonical observation.
+
+The 2026-08-09 controller `main` observation requires zero approvals and has
+both CODEOWNERS review and last-push approval disabled. Signed commits, linear
+history, administrator enforcement, stale-review dismissal, and force/delete
+protection are enabled, but the incomplete review controls remain a blocker.
 
 Do not change these settings from a release workflow.
 
@@ -126,7 +133,9 @@ For `control-release`:
    selected-Actions, environment, and append-only ledger controls immediately
    before requesting OIDC. A pre-build snapshot is not fresh enough.
 
-The currently observed administrator bypass is a blocker.
+The 2026-08-09 observation has administrator bypass disabled and self-review
+prevention enabled. Only `PluckXD` is currently available, so the independent
+environment reviewer requirement remains unsatisfied and must not be reduced.
 
 ## 4. Isolated identities and images
 
@@ -181,11 +190,27 @@ remote-main/ancestor verification with `persist-credentials: false`, then
 removed before product code executes. The carrier credential is introduced
 only after the isolated build process has terminated.
 
+The reviewed repository-side boundary is now explicit:
+`verify-source-revision-v2.py` proves the prepared checkout is the exact
+approval-v2 `main` with every required ancestor; the API, Ops, and Web
+packagers accept canonical, unexpired approval-v2 bytes; and the independent
+runtime verifier accepts the same schema without relaxing its artifact and
+service-tree bindings. Image contents, wheel/npm preparation, and the
+least-privilege identities remain external evidence, not values inferred by
+these scripts.
+
 ## 5. Carrier contract
 
 Keep `PluckXD/tratto-control-release-carrier` private and Actions disabled.
 Upload API, Web, Ops, build records, the verified envelope, and the Sigstore
 bundle only as private GitHub Release assets. Use unique release IDs/run IDs.
+
+`scripts/carrier-artifact-v2.py` can only upload to an already provisioned
+numeric release ID or download an exact numeric asset ID. It streams bounded
+bytes, requires the expected name, size, and SHA-256, writes private
+no-overwrite outputs, and cannot create, edit, or delete releases. Provision
+the unique transport-only release separately with an identity that has no
+product, controller, ledger, environment, or signing authority.
 
 Always download by numeric asset ID and independently approved digest. Asset
 name, release tag, carrier commit, and carrier administrator are metadata, not
