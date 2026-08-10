@@ -106,7 +106,6 @@ def validate(
 
 
 EXPECTED_BLOCKERS = {
-    "actions-policy",
     "builder-identities-images",
     "carrier-identities",
     "controller-branch-controls",
@@ -135,7 +134,6 @@ def test_checked_in_readiness_v2_is_canonical_and_unavailable() -> None:
     assert {item["id"] for item in value["blockers"]} == EXPECTED_BLOCKERS
     joined = " ".join(item["resolution"] for item in value["blockers"])
     for required in (
-        "full commit SHA",
         "builder images pinned by digest",
         "carrier read and write identities",
         "controller main",

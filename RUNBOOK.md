@@ -109,9 +109,9 @@ On `PluckXD/tratto-control-release`:
    - `actions/checkout@11d5960a326750d5838078e36cf38b85af677262`;
    - `actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548`.
    The 2026-08-09 observation is `allowed_actions: selected` with required
-   full-SHA pinning, but its allowlist also contains an unused pinned
-   `actions/upload-artifact` revision. Remove that third entry; every release
-   must still collect and independently verify a fresh canonical observation.
+   full-SHA pinning and exactly those two allowlisted revisions. Every release
+   must still collect and independently verify a fresh canonical observation;
+   the historical observation is not release authority.
 
 The 2026-08-09 controller `main` observation requires zero approvals and has
 both CODEOWNERS review and last-push approval disabled. Signed commits, linear
