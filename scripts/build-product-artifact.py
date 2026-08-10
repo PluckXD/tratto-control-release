@@ -51,6 +51,16 @@ if APPROVAL_V2_SPEC is None or APPROVAL_V2_SPEC.loader is None:
     raise SystemExit("approval-v2 validator unavailable")
 APPROVAL_V2 = importlib.util.module_from_spec(APPROVAL_V2_SPEC)
 APPROVAL_V2_SPEC.loader.exec_module(APPROVAL_V2)
+SOURCE_CONTRACT_SPEC = importlib.util.spec_from_file_location(
+    "control_release_product_source_contract",
+    HERE / "product-source-contract.py",
+)
+if SOURCE_CONTRACT_SPEC is None or SOURCE_CONTRACT_SPEC.loader is None:
+    raise SystemExit("product source contract verifier unavailable")
+SOURCE_CONTRACT = importlib.util.module_from_spec(SOURCE_CONTRACT_SPEC)
+SOURCE_CONTRACT_SPEC.loader.exec_module(SOURCE_CONTRACT)
+SOURCE_CONTRACT_ROOT = HERE.parent / "contracts" / "product-source"
+LEGACY_SOURCE_CONTRACT_EXEMPT_HEADS = {"j1transpcod", "f29controlexec"}
 
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 MAX_MEMBERS = 350_000
@@ -216,6 +226,46 @@ def validate_source(root: Path, release_sha: str) -> str:
     if SHA_RE.fullmatch(tree_sha) is None:
         reject("source tree SHA is invalid")
     return tree_sha
+
+
+def validate_exact_product_sources(
+    *,
+    kind: str,
+    approval: dict[str, Any],
+    repository_root: Path,
+    bundle_root: Path,
+) -> str | None:
+    """Apply the controller-owned contract to guarded migration heads.
+
+    Selection is derived exclusively from the approved migration head.  A
+    workflow input therefore cannot substitute a contract that blesses
+    attacker-chosen source bytes.
+    """
+
+    if kind != "api":
+        return None
+    migration = approval.get("migration")
+    if not isinstance(migration, dict):
+        reject("approval migration contract is invalid")
+    migration_head = migration.get("head_revision")
+    if not isinstance(migration_head, str):
+        reject("approval migration head is invalid")
+    if migration_head in LEGACY_SOURCE_CONTRACT_EXEMPT_HEADS:
+        return None
+    contract_path = SOURCE_CONTRACT_ROOT / f"{migration_head}.json"
+    if not contract_path.is_file():
+        reject(
+            "guarded API migration head requires its controller-owned "
+            "exact source contract"
+        )
+    contract, digest = SOURCE_CONTRACT.load(contract_path)
+    SOURCE_CONTRACT.verify(
+        contract,
+        repository_root=repository_root,
+        bundle_root=bundle_root,
+        expected_migration_head=migration_head,
+    )
+    return digest
 
 
 def canonical_path(value: str) -> str:
@@ -535,6 +585,12 @@ def main() -> int:
             release_sha=args.release_sha,
         )
         tree_sha = validate_source(args.repository_root, args.release_sha)
+        validate_exact_product_sources(
+            kind=args.kind,
+            approval=approval,
+            repository_root=args.repository_root,
+            bundle_root=args.bundle_root,
+        )
         runtime_policy, runtime_policy_digest = RUNTIME.load(
             args.runtime_policy
         )
@@ -636,6 +692,7 @@ def main() -> int:
         APPROVAL.ApprovalError,
         APPROVAL_V2.ApprovalV2Error,
         COMPONENT.ComponentManifestError,
+        SOURCE_CONTRACT.ProductSourceContractError,
         RUNTIME.RuntimePolicyError,
         ProductArtifactError,
     ) as error:
