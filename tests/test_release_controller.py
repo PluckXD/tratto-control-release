@@ -1235,6 +1235,19 @@ def test_component_manifest_v4_rejects_host_patch_as_build_version() -> None:
         )
 
 
+def test_component_migration_allows_guarded_f42_but_no_intermediate_head() -> None:
+    migration = dict(approval_value()["migration"])
+    migration["head_revision"] = "f42customerlink"
+    assert COMPONENT.validate_migration(migration) == migration
+
+    migration["head_revision"] = "f41paymentintent"
+    with pytest.raises(
+        COMPONENT.ComponentManifestError,
+        match="outside the approved chain",
+    ):
+        COMPONENT.validate_migration(migration)
+
+
 def test_external_control_validator_rejects_observed_bypass_and_open_actions() -> None:
     with pytest.raises(CONTROLS.ControlsError, match="bypass"):
         CONTROLS.validate_environment(

@@ -30,6 +30,7 @@ MIGRATION_KEYS = {
     "tenant_catalog_sha256",
     "tenant_fleet_base_revision",
 }
+APPROVED_MIGRATION_HEADS = {"f29controlexec", "f42customerlink"}
 
 
 class ComponentManifestError(ValueError):
@@ -127,7 +128,7 @@ def validate_migration(value: Any) -> dict[str, Any]:
         value["database_scope"] != "control-and-tenant-fleet"
         or value["base_revision"] != "j1transpcod"
         or value["tenant_fleet_base_revision"] != "j1transpcod"
-        or value["head_revision"] != "f29controlexec"
+        or value["head_revision"] not in APPROVED_MIGRATION_HEADS
         or value["mode"] != "expand-only"
         or type(count) is not int
         or not 1 <= count <= 512
