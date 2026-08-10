@@ -272,17 +272,22 @@ def test_builder_rejects_needle_only_payment_source(
     relative = "app/services/pagamento.py"
     reviewed = b"def reconcile():\n    return 'safe'\n"
     fake = b"# return 'safe'\ndef reconcile():\n    return 'post-again'\n"
+    reviewed_files = {
+        path: (reviewed if path == relative else f"{path}\n".encode())
+        for path in MODULE.PAYMENT_SOURCE_CONTRACT_REQUIRED_PATHS
+    }
     repository = tmp_path / "repository"
     bundle = tmp_path / "bundle"
     repository.mkdir()
     bundle.mkdir()
     for root in (repository, bundle):
-        write(root / relative, fake)
-        (root / relative).chmod(0o440)
+        for path, payload in reviewed_files.items():
+            write(root / path, fake if path == relative else payload)
+            (root / path).chmod(0o440)
     contract_root = tmp_path / "contracts"
     contract_root.mkdir()
     contract = contract_root / "f42customerlink.json"
-    _source_contract(contract, {relative: reviewed})
+    _source_contract(contract, reviewed_files)
     monkeypatch.setattr(MODULE, "SOURCE_CONTRACT_ROOT", contract_root)
 
     with pytest.raises(
@@ -295,6 +300,39 @@ def test_builder_rejects_needle_only_payment_source(
                 "migration": {
                     "head_revision": "f42customerlink",
                 }
+            },
+            repository_root=repository,
+            bundle_root=bundle,
+        )
+
+
+def test_guarded_contract_cannot_omit_a_required_payment_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    required = sorted(MODULE.PAYMENT_SOURCE_CONTRACT_REQUIRED_PATHS)
+    omitted = required[-1]
+    files = {path: f"{path}\n".encode() for path in required if path != omitted}
+    repository = tmp_path / "repository"
+    bundle = tmp_path / "bundle"
+    for root in (repository, bundle):
+        root.mkdir()
+        for path, payload in files.items():
+            write(root / path, payload)
+            (root / path).chmod(0o440)
+    contract_root = tmp_path / "contracts"
+    contract_root.mkdir()
+    _source_contract(contract_root / "f42customerlink.json", files)
+    monkeypatch.setattr(MODULE, "SOURCE_CONTRACT_ROOT", contract_root)
+
+    with pytest.raises(
+        MODULE.SOURCE_CONTRACT.ProductSourceContractError,
+        match="omits required security-critical source",
+    ):
+        MODULE.validate_exact_product_sources(
+            kind="api",
+            approval={
+                "migration": {"head_revision": "f42customerlink"}
             },
             repository_root=repository,
             bundle_root=bundle,

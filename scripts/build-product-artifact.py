@@ -61,6 +61,39 @@ SOURCE_CONTRACT = importlib.util.module_from_spec(SOURCE_CONTRACT_SPEC)
 SOURCE_CONTRACT_SPEC.loader.exec_module(SOURCE_CONTRACT)
 SOURCE_CONTRACT_ROOT = HERE.parent / "contracts" / "product-source"
 LEGACY_SOURCE_CONTRACT_EXEMPT_HEADS = {"j1transpcod", "f29controlexec"}
+PAYMENT_SOURCE_CONTRACT_REQUIRED_PATHS = frozenset(
+    {
+        "alembic/env.py",
+        "alembic/versions/f39paymentfence_cobranca_external_unica.py",
+        (
+            "alembic/versions/"
+            "f40asaasfence_preflight_parcelamento_asaas.py"
+        ),
+        "alembic/versions/f41paymentintent_intent_state_machine.py",
+        (
+            "alembic/versions/"
+            "f42customerlink_pagamento_cliente_vinculo.py"
+        ),
+        "app/core/config.py",
+        "app/main.py",
+        "app/models/__init__.py",
+        "app/models/pagamento.py",
+        "app/pagamento/asaas.py",
+        "app/pagamento/base.py",
+        "app/pagamento/registry.py",
+        "app/routers/loja.py",
+        "app/routers/loja_admin.py",
+        "app/routers/pagamentos.py",
+        "app/services/erp_worker.py",
+        "app/services/pagamento.py",
+        "app/services/pagamento_intent_worker.py",
+        "ops/control/scripts/run-control-fleet-migration.py",
+        "ops/control/scripts/validate-artifact.py",
+        "ops/control/scripts/validate-bundle.py",
+        "ops/control/scripts/verify-control-stack-quiescent.py",
+        "scripts/migrate_all_tenants.py",
+    }
+)
 
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 MAX_MEMBERS = 350_000
@@ -264,6 +297,7 @@ def validate_exact_product_sources(
         repository_root=repository_root,
         bundle_root=bundle_root,
         expected_migration_head=migration_head,
+        required_files=PAYMENT_SOURCE_CONTRACT_REQUIRED_PATHS,
     )
     return digest
 

@@ -202,11 +202,19 @@ def verify(
     repository_root: Path,
     bundle_root: Path,
     expected_migration_head: str,
+    required_files: frozenset[str] = frozenset(),
 ) -> dict[str, str]:
     """Verify exact reviewed bytes in source and packaged runtime roots."""
 
     if contract.get("migration_head") != expected_migration_head:
         reject("source contract migration head diverges from approval")
+    normalized_required = {_canonical_path(path) for path in required_files}
+    missing = normalized_required - set(contract["files"])
+    if missing:
+        reject(
+            "source contract omits required security-critical source: "
+            f"{min(missing, key=lambda item: item.encode('utf-8'))}"
+        )
     repository = _root(repository_root, label="repository")
     bundle = _root(bundle_root, label="bundle")
     observed: dict[str, str] = {}
