@@ -91,6 +91,29 @@ def approval(*, sequence: int = 2) -> dict:
     }
 
 
+def versioned_migration(schema_version: int) -> dict:
+    if schema_version == 5:
+        control = "f51legalpublish"
+        tenant = "f49legalauth"
+    elif schema_version == 6:
+        control = tenant = "f52provisionactivate"
+    else:
+        raise AssertionError("unsupported test migration schema")
+    return {
+        "control_base_revisions": ["z2card181nf"],
+        "control_schema_revision": control,
+        "database_scope": "control-and-tenant-fleet",
+        "fleet_preflight_sha256": "7" * 64,
+        "head_revision": control,
+        "mode": "expand-only",
+        "schema_version": schema_version,
+        "tenant_catalog_count": 1,
+        "tenant_catalog_sha256": "8" * 64,
+        "tenant_fleet_base_revisions": ["z2card181nf"],
+        "tenant_schema_revision": tenant,
+    }
+
+
 def artifact(label: str, commit_sha: str, asset_id: int) -> dict:
     repository = (
         "PluckXD/tratto-web"
@@ -243,6 +266,39 @@ def test_accepts_first_ledger_record_without_circular_commit_binding() -> None:
     assert value["ledger"]["head_sha"] == "d" * 40
     assert value["ledger"]["head_sha"] != value["ledger"]["genesis_sha"]
     assert validate(value)["ledger"]["sequence"] == 1
+
+
+@pytest.mark.parametrize("schema_version", (5, 6))
+def test_v6_envelope_preserves_exact_versioned_product_migration(
+    schema_version: int,
+) -> None:
+    value = envelope(sequence=2)
+    migration = versioned_migration(schema_version)
+    value["approval"]["manifest"]["migration"] = copy.deepcopy(migration)
+    value["approval"]["manifest_sha256"] = hashlib.sha256(
+        MODULE.APPROVAL.canonical_bytes(value["approval"]["manifest"])
+    ).hexdigest()
+    value["ledger"]["manifest_sha256"] = value["approval"][
+        "manifest_sha256"
+    ]
+    value["migration"] = copy.deepcopy(migration)
+    assert validate(value)["migration"] == migration
+
+
+def test_v6_envelope_rejects_crossed_v5_v6_migration_identity() -> None:
+    value = envelope(sequence=2)
+    migration = versioned_migration(6)
+    migration["tenant_schema_revision"] = "f49legalauth"
+    value["approval"]["manifest"]["migration"] = copy.deepcopy(migration)
+    value["approval"]["manifest_sha256"] = hashlib.sha256(
+        MODULE.APPROVAL.canonical_bytes(value["approval"]["manifest"])
+    ).hexdigest()
+    value["ledger"]["manifest_sha256"] = value["approval"][
+        "manifest_sha256"
+    ]
+    value["migration"] = copy.deepcopy(migration)
+    with pytest.raises(MODULE.EnvelopeV6Error, match="revision chain"):
+        validate(value)
 
 
 def test_approval_is_validated_historically() -> None:

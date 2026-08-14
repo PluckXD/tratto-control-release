@@ -265,6 +265,80 @@ def test_guarded_head_requires_controller_owned_exact_source_contract(
         )
 
 
+def test_each_guarded_head_has_a_bounded_head_specific_source_set() -> None:
+    expected_heads = {
+        "f42customerlink",
+        "f51legalpublish",
+        "f52provisionactivate",
+    }
+    assert set(MODULE.REQUIRED_SOURCE_PATHS_BY_MIGRATION_HEAD) == expected_heads
+    for head, paths in MODULE.REQUIRED_SOURCE_PATHS_BY_MIGRATION_HEAD.items():
+        assert paths
+        assert len(paths) <= MODULE.SOURCE_CONTRACT.MAX_FILES, head
+    assert (
+        MODULE.PRODUCTION_LINEAGE_V5_SOURCE_CONTRACT_REQUIRED_PATHS
+        < MODULE.PHYSICAL_PROVISION_V6_SOURCE_CONTRACT_REQUIRED_PATHS
+    )
+    assert (
+        MODULE.COMPONENT.APPROVED_VERSIONED_MIGRATIONS
+        == MODULE.APPROVAL_V2.APPROVED_VERSIONED_MIGRATIONS
+    )
+    approved_heads = {
+        contract["head_revision"]
+        for contract in MODULE.APPROVAL_V2.APPROVED_VERSIONED_MIGRATIONS.values()
+    }
+    assert approved_heads <= set(MODULE.REQUIRED_SOURCE_PATHS_BY_MIGRATION_HEAD)
+
+
+@pytest.mark.parametrize(
+    "migration_head",
+    ("f51legalpublish", "f52provisionactivate"),
+)
+def test_product_release_source_contract_is_canonical_and_complete(
+    migration_head: str,
+) -> None:
+    path = (
+        ROOT
+        / "contracts"
+        / "product-source"
+        / f"{migration_head}.json"
+    )
+    contract, digest = MODULE.SOURCE_CONTRACT.load(path)
+    assert digest == hashlib.sha256(path.read_bytes()).hexdigest()
+    assert contract["migration_head"] == migration_head
+    assert set(contract["files"]) == set(
+        MODULE.REQUIRED_SOURCE_PATHS_BY_MIGRATION_HEAD[migration_head]
+    )
+
+
+def test_physical_provision_source_contract_binds_frozen_f52_bytes() -> None:
+    contract, _ = MODULE.SOURCE_CONTRACT.load(
+        ROOT
+        / "contracts"
+        / "product-source"
+        / "f52provisionactivate.json"
+    )
+    assert contract["files"][
+        "alembic/versions/"
+        "f52provisionactivate_physical_provision_activation.py"
+    ] == "befd098ab4bacd65a977afd077f19a08b1b84534fa3dbfc41ff720814e94206c"
+
+
+def test_unknown_guarded_head_has_no_implicit_empty_source_contract(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(
+        MODULE.ProductArtifactError,
+        match="no controller-owned source contract definition",
+    ):
+        MODULE.validate_exact_product_sources(
+            kind="api",
+            approval={"migration": {"head_revision": "f99unknown"}},
+            repository_root=tmp_path,
+            bundle_root=tmp_path,
+        )
+
+
 def test_builder_rejects_needle_only_payment_source(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

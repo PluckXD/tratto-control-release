@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import copy
 import hashlib
 import importlib.util
 import io
@@ -1246,6 +1247,68 @@ def test_component_migration_allows_guarded_f42_but_no_intermediate_head() -> No
         match="outside the approved chain",
     ):
         COMPONENT.validate_migration(migration)
+
+
+@pytest.mark.parametrize(
+    ("schema_version", "control", "tenant"),
+    [
+        (5, "f51legalpublish", "f49legalauth"),
+        (6, "f52provisionactivate", "f52provisionactivate"),
+    ],
+)
+def test_component_migration_accepts_only_exact_versioned_product_chain(
+    schema_version: int,
+    control: str,
+    tenant: str,
+) -> None:
+    migration = {
+        "control_base_revisions": ["z2card181nf"],
+        "control_schema_revision": control,
+        "database_scope": "control-and-tenant-fleet",
+        "fleet_preflight_sha256": "a" * 64,
+        "head_revision": control,
+        "mode": "expand-only",
+        "schema_version": schema_version,
+        "tenant_catalog_count": 1,
+        "tenant_catalog_sha256": "b" * 64,
+        "tenant_fleet_base_revisions": ["z2card181nf"],
+        "tenant_schema_revision": tenant,
+    }
+    assert COMPONENT.validate_migration(migration) == migration
+
+    for field, replacement in (
+        ("control_schema_revision", "f29controlexec"),
+        ("tenant_schema_revision", "f29controlexec"),
+        ("head_revision", "f29controlexec"),
+        ("control_base_revisions", ["f29controlexec"]),
+        ("tenant_fleet_base_revisions", ["f29controlexec"]),
+    ):
+        invalid = copy.deepcopy(migration)
+        invalid[field] = replacement
+        with pytest.raises(
+            COMPONENT.ComponentManifestError,
+            match="outside the approved chain",
+        ):
+            COMPONENT.validate_migration(invalid)
+
+
+def test_component_schema_closes_legacy_v5_and_v6_migration_shapes() -> None:
+    schema = json.loads(
+        (ROOT / "schemas" / "component-manifest.schema.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert schema["$defs"]["migration"]["oneOf"] == [
+        {"$ref": "#/$defs/migrationLegacy"},
+        {"$ref": "#/$defs/migrationDemoPlatformV5"},
+        {"$ref": "#/$defs/migrationDemoPlatformV6"},
+    ]
+    for name in (
+        "migrationLegacy",
+        "migrationDemoPlatformV5",
+        "migrationDemoPlatformV6",
+    ):
+        assert schema["$defs"][name]["additionalProperties"] is False
 
 
 def test_external_control_validator_rejects_observed_bypass_and_open_actions() -> None:

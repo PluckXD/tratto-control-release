@@ -94,7 +94,7 @@ LEDGER_KEYS = {
     "repository_id",
     "sequence",
 }
-MIGRATION_KEYS = {
+MIGRATION_LEGACY_KEYS = {
     "base_revision",
     "database_scope",
     "fleet_preflight_sha256",
@@ -103,6 +103,35 @@ MIGRATION_KEYS = {
     "tenant_catalog_count",
     "tenant_catalog_sha256",
     "tenant_fleet_base_revision",
+}
+MIGRATION_VERSIONED_KEYS = {
+    "control_base_revisions",
+    "control_schema_revision",
+    "database_scope",
+    "fleet_preflight_sha256",
+    "head_revision",
+    "mode",
+    "schema_version",
+    "tenant_catalog_count",
+    "tenant_catalog_sha256",
+    "tenant_fleet_base_revisions",
+    "tenant_schema_revision",
+}
+APPROVED_VERSIONED_MIGRATIONS = {
+    5: {
+        "control_base_revisions": ["z2card181nf"],
+        "control_schema_revision": "f51legalpublish",
+        "head_revision": "f51legalpublish",
+        "tenant_fleet_base_revisions": ["z2card181nf"],
+        "tenant_schema_revision": "f49legalauth",
+    },
+    6: {
+        "control_base_revisions": ["z2card181nf"],
+        "control_schema_revision": "f52provisionactivate",
+        "head_revision": "f52provisionactivate",
+        "tenant_fleet_base_revisions": ["z2card181nf"],
+        "tenant_schema_revision": "f52provisionactivate",
+    },
 }
 POLICY_KEYS = {"digest_sha256", "name", "path", "repository"}
 
@@ -342,11 +371,40 @@ def validate_ledger(value: Any) -> None:
 
 
 def validate_migration(value: Any) -> None:
-    migration = exact_keys(value, MIGRATION_KEYS, "migration")
+    if not isinstance(value, dict):
+        reject("migration must be an object")
+    keys = set(value)
+    if keys == MIGRATION_LEGACY_KEYS:
+        _validate_legacy_migration(value)
+        return
+    if keys == MIGRATION_VERSIONED_KEYS:
+        _validate_versioned_migration(value)
+        return
+    reject("migration keys diverge from supported contracts")
+
+
+def _validate_common_migration(migration: dict[str, Any]) -> None:
     if migration["database_scope"] != "control-and-tenant-fleet":
         reject("migration.database_scope must be control-and-tenant-fleet")
     if migration["mode"] != "expand-only":
         reject("migration.mode must be expand-only")
+    require_pattern(
+        migration["tenant_catalog_sha256"],
+        SHA256_RE,
+        "migration.tenant_catalog_sha256",
+    )
+    require_pattern(
+        migration["fleet_preflight_sha256"],
+        SHA256_RE,
+        "migration.fleet_preflight_sha256",
+    )
+    count = migration["tenant_catalog_count"]
+    if type(count) is not int or not 1 <= count <= 512:
+        reject("migration tenant catalog count is invalid")
+
+
+def _validate_legacy_migration(migration: dict[str, Any]) -> None:
+    _validate_common_migration(migration)
     base = require_pattern(
         migration["base_revision"],
         REVISION_RE,
@@ -368,19 +426,25 @@ def validate_migration(value: Any) -> None:
         or head != "f29controlexec"
     ):
         reject("migration revision chain is not approved")
-    require_pattern(
-        migration["tenant_catalog_sha256"],
-        SHA256_RE,
-        "migration.tenant_catalog_sha256",
-    )
-    require_pattern(
-        migration["fleet_preflight_sha256"],
-        SHA256_RE,
-        "migration.fleet_preflight_sha256",
-    )
-    count = migration["tenant_catalog_count"]
-    if type(count) is not int or not 1 <= count <= 512:
-        reject("migration tenant catalog count is invalid")
+
+
+def _validate_versioned_migration(migration: dict[str, Any]) -> None:
+    _validate_common_migration(migration)
+    schema_version = migration.get("schema_version")
+    if type(schema_version) is not int:
+        reject("migration.schema_version must be an integer")
+    expected = APPROVED_VERSIONED_MIGRATIONS.get(schema_version)
+    if expected is None:
+        reject("migration.schema_version is not supported")
+    actual = {key: migration.get(key) for key in expected}
+    if actual != expected:
+        reject("migration revision chain is not approved")
+    for key in (
+        "control_schema_revision",
+        "tenant_schema_revision",
+        "head_revision",
+    ):
+        require_pattern(migration[key], REVISION_RE, f"migration.{key}")
 
 
 def validate_policy(value: Any) -> None:

@@ -27,7 +27,7 @@ HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 REVISION_RE = re.compile(r"^[a-z0-9][a-z0-9_]{2,63}$")
 MAX_CONTRACT_BYTES = 64 * 1024
 MAX_SOURCE_BYTES = 4 * 1024 * 1024
-MAX_FILES = 64
+MAX_FILES = 96
 EXPECTED_KEYS = {
     "artifact_kind",
     "contract",
