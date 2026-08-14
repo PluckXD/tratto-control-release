@@ -117,6 +117,32 @@
     "sha256": {
       "pattern": "^[0-9a-f]{64}$",
       "type": "string"
+    },
+    "workflowRun": {
+      "additionalProperties": false,
+      "properties": {
+        "repository_id": {
+          "maximum": 9223372036854775807,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "run_attempt": {
+          "maximum": 9223372036854775807,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "run_id": {
+          "maximum": 9223372036854775807,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "repository_id",
+        "run_attempt",
+        "run_id"
+      ],
+      "type": "object"
     }
   },
   "$id": "https://github.com/PluckXD/tratto-control-release/schemas/release-envelope-v6.schema.json",
@@ -377,14 +403,17 @@
           "const": "PluckXD/tratto-control-release"
         },
         "repository_id": {
+          "maximum": 9223372036854775807,
           "minimum": 1,
           "type": "integer"
         },
         "run_attempt": {
+          "maximum": 9223372036854775807,
           "minimum": 1,
           "type": "integer"
         },
         "run_id": {
+          "maximum": 9223372036854775807,
           "minimum": 1,
           "type": "integer"
         },
@@ -397,7 +426,10 @@
         "runner_os": {
           "const": "Linux"
         },
-        "signer_verifier_sha256": {
+        "controller_tag_signature_verifier_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "signer_freshness_verifier_sha256": {
           "$ref": "#/$defs/sha256"
         },
         "source_ref": {
@@ -438,7 +470,8 @@
         "runner_arch",
         "runner_environment",
         "runner_os",
-        "signer_verifier_sha256",
+        "controller_tag_signature_verifier_sha256",
+        "signer_freshness_verifier_sha256",
         "source_ref",
         "tag_object_sha",
         "tag_ref",
@@ -505,6 +538,9 @@
     "migration": {
       "$ref": "approval-v2.schema.json#/$defs/migration"
     },
+    "envelope_profile": {
+      "const": "control-release-permanent-v6"
+    },
     "schema_version": {
       "const": 6,
       "type": "integer"
@@ -514,6 +550,9 @@
       "properties": {
         "controller_tag_attestation_sha256": {
           "$ref": "#/$defs/sha256"
+        },
+        "evidence_model": {
+          "const": "workflow-signed-summary-v1"
         },
         "github_controls_attestation_sha256": {
           "$ref": "#/$defs/sha256"
@@ -526,14 +565,19 @@
         },
         "revalidated_immediately_before_signature": {
           "const": true
+        },
+        "workflow_run": {
+          "$ref": "#/$defs/workflowRun"
         }
       },
       "required": [
         "controller_tag_attestation_sha256",
+        "evidence_model",
         "github_controls_attestation_sha256",
         "ledger_attestation_sha256",
         "ledger_head_sha",
-        "revalidated_immediately_before_signature"
+        "revalidated_immediately_before_signature",
+        "workflow_run"
       ],
       "type": "object"
     },
@@ -556,6 +600,7 @@
     "behavioral_verification",
     "carrier",
     "controller",
+    "envelope_profile",
     "ledger",
     "migration",
     "schema_version",

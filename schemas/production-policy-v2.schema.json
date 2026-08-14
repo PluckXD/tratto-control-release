@@ -88,6 +88,11 @@
     },
     "signer_allows_source_checkout": {
       "const": false
+    },
+    "trust_epoch": {
+      "maximum": 2147483647,
+      "minimum": 0,
+      "type": "integer"
     }
   },
   "required": [
@@ -107,7 +112,8 @@
     "runtime_policy",
     "schema_version",
     "signer_allows_product_credentials",
-    "signer_allows_source_checkout"
+    "signer_allows_source_checkout",
+    "trust_epoch"
   ],
   "title": "Tratto Control production policy v2",
   "type": "object",
@@ -120,10 +126,13 @@
               "minimum": 1,
               "type": "integer"
             },
-            "tag_signature_trust_root_sha256": {
+            "controller_tag_signature_trust_root_sha256": {
               "$ref": "#/$defs/sha256"
             },
-            "tag_signature_verifier_sha256": {
+            "controller_tag_signature_verifier_sha256": {
+              "$ref": "#/$defs/sha256"
+            },
+            "signer_freshness_verifier_sha256": {
               "$ref": "#/$defs/sha256"
             },
             "workflow_sha256": {
@@ -132,8 +141,9 @@
           },
           "required": [
             "repository_id",
-            "tag_signature_trust_root_sha256",
-            "tag_signature_verifier_sha256",
+            "controller_tag_signature_trust_root_sha256",
+            "controller_tag_signature_verifier_sha256",
+            "signer_freshness_verifier_sha256",
             "workflow_sha256"
           ]
         },
@@ -151,11 +161,17 @@
             "genesis_sha",
             "repository_id"
           ]
+        },
+        "trust_epoch": {
+          "maximum": 2147483647,
+          "minimum": 1,
+          "type": "integer"
         }
       },
       "required": [
         "controller",
-        "ledger"
+        "ledger",
+        "trust_epoch"
       ]
     },
     "controller": {
@@ -186,13 +202,16 @@
         "tag_signature_claim_authorizes_release": {
           "const": false
         },
-        "tag_signature_trust_root_sha256": {
+        "controller_tag_signature_trust_root_sha256": {
           "type": "string"
         },
         "tag_signature_verification_mode": {
           "const": "local-cryptographic-annotated-tag-object"
         },
-        "tag_signature_verifier_sha256": {
+        "controller_tag_signature_verifier_sha256": {
+          "type": "string"
+        },
+        "signer_freshness_verifier_sha256": {
           "type": "string"
         },
         "workflow_path": {
@@ -211,9 +230,10 @@
         "tag_ref_pattern",
         "tag_ref_prefix",
         "tag_signature_claim_authorizes_release",
-        "tag_signature_trust_root_sha256",
+        "controller_tag_signature_trust_root_sha256",
         "tag_signature_verification_mode",
-        "tag_signature_verifier_sha256",
+        "controller_tag_signature_verifier_sha256",
+        "signer_freshness_verifier_sha256",
         "workflow_path",
         "workflow_sha256"
       ],
@@ -280,10 +300,13 @@
             "repository_id": {
               "const": 0
             },
-            "tag_signature_trust_root_sha256": {
+            "controller_tag_signature_trust_root_sha256": {
               "const": ""
             },
-            "tag_signature_verifier_sha256": {
+            "controller_tag_signature_verifier_sha256": {
+              "const": ""
+            },
+            "signer_freshness_verifier_sha256": {
               "const": ""
             },
             "workflow_sha256": {
@@ -292,8 +315,9 @@
           },
           "required": [
             "repository_id",
-            "tag_signature_trust_root_sha256",
-            "tag_signature_verifier_sha256",
+            "controller_tag_signature_trust_root_sha256",
+            "controller_tag_signature_verifier_sha256",
+            "signer_freshness_verifier_sha256",
             "workflow_sha256"
           ]
         },
@@ -310,13 +334,17 @@
             "genesis_sha",
             "repository_id"
           ]
+        },
+        "trust_epoch": {
+          "const": 0
         }
       },
       "required": [
         "controller",
-        "ledger"
+        "ledger",
+        "trust_epoch"
       ]
     }
   },
-  "$comment": "The checked-in policy is intentionally unconfigured and cannot authorize production. scripts/validate-policy-v2.py is normative, requires canonical JSON and exact keys, and only accepts a configured document when every non-circular binding matches separately audited pins. Controller commit_sha, tag_ref, tag_object_sha and immutable_release_id are deliberately forbidden here; approval/envelope bind them to independently verified GitHub evidence."
+  "$comment": "The checked-in policy is intentionally unconfigured and cannot authorize production. scripts/validate-policy-v2.py is normative, requires canonical JSON and exact keys, and only accepts a configured document when one positive trust_epoch and every non-circular binding match the same separately audited epoch tuple. Controller commit_sha, tag_ref, tag_object_sha and immutable_release_id are deliberately forbidden here; approval/envelope bind them to independently verified GitHub evidence."
 }

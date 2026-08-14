@@ -472,18 +472,66 @@ The v2/v6 candidate separates stable release authority from product source and
 from the untrusted artifact carrier:
 
 - `policies/control-production-v2.json` is validated only against
-  compile-time audited pins; its production pins are deliberately empty;
+  one compile-time audited trust-epoch tuple; the checked-in template is
+  deliberately unavailable at epoch zero with every dynamic pin empty;
 - approval schema v2 binds an immutable signed controller tag/release, the
-  exact workflow and signer-verifier bytes, and one entry in a separate
-  protected append-only ledger;
+  exact workflow, a cryptographic controller-tag verifier, the canonical
+  source-free signer-freshness verifier manifest, and one entry in a separate
+  protected append-only ledger. Those verifier roles have distinct fields and
+  inputs and cannot be substituted for each other;
 - `scripts/validate-ledger.py` replays the full linear ledger instead of
   trusting a selected JSON file;
+- the permanent envelope has the exact profile
+  `control-release-permanent-v6`; schema version 6 alone never selects it,
+  because the one-use bootstrap envelope also occupies that version number;
 - envelope schema v6 embeds the validated approval, binds the ledger head,
   immutable controller evidence, all three artifacts, behavioral evidence,
   and an exact signer-freshness block;
 - the source-free signer must obtain a second authenticated observation of the
   ledger, controller tag, and GitHub controls after environment approval and
-  immediately before requesting an OIDC signature.
+  immediately before requesting an OIDC signature. The signed
+  `workflow-signed-summary-v1` freshness block carries the exact controller
+  repository ID, workflow run ID, and run attempt; the runtime and all six
+  authenticated observations must carry that same typed scope.
+
+Signer evidence sidecars remain private inputs to the authenticated signer;
+they are not transported as host authority. The host may trust only the signed
+summary after verifying the envelope signature, policy digest, trust epoch,
+workflow identity, and both verifier pins. Whole-envelope replay protection is
+stateful and host-owned: exact repeats may be idempotent, while conflicting
+reuse of a run/attempt, release ID, or ledger sequence must fail closed.
+
+The signer validates approval v2 against its current clock immediately before
+signing and therefore rejects an expired approval. The envelope parser's
+historical mode only permits later byte verification; it does not renew
+authority. A permanent host verifier must authenticate the Sigstore signing
+time and require it to fall within the approval's inclusive `issued_at` and
+exclusive `expires_at` interval before registering the replay claim or staging
+any artifact.
+
+`signer_freshness_verifier_sha256` denotes the canonical identity manifest for
+the entire source-free verifier closure, not merely the Python entrypoint. The
+manifest must hash-bind every executed file and fixed external dependency; the
+production policy remains a separately digest-bound input to avoid a circular
+policy/manifest hash. Before executing that closure, the source-free preflight
+must bind the authorized positive trust epoch, exact production-policy digest,
+manifest digest, and distinct controller-tag verifier digest to the installed
+policy and bundle. The policy digest closes the remaining fields of the atomic
+trust-epoch tuple without copying them into workflow outputs. The review
+workflow still exits 78 until a trusted preflight can authenticate those bytes.
+
+The manifest digest is pinned only by the controller-side audited policy, which
+is outside the source-free closure. The exact detached policy file travels in a
+separate filesystem root, is excluded from the closure manifest, and is
+authenticated through its separate authorized digest. The signer must not
+execute or package as a
+closure dependency `policy-gate-v2.py` or the production policy validator whose
+compiled trust tuple contains that manifest digest: doing so would require a
+SHA-256 fixed point. The host-owned preflight instead enforces the
+`sign_release` environment gate and authenticates that explicit detached policy
+path, digest, and epoch before any manifest-bound verifier code runs. No file
+inside the closure may contain a trusted value derived from the closure's own
+manifest digest.
 
 Raw GitHub API JSON, a carrier release, an embedded `verified` flag, or a tag
 name never authorizes promotion by itself. The fixed validators and their

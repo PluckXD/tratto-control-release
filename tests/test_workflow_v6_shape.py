@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path
 from typing import Any
@@ -9,6 +10,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW_PATH = ROOT / "workflow-v6-shape.yml"
+EMITTER_PATH = ROOT / "scripts" / "emit-approval-v2-outputs.py"
 CHECKOUT = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
 SETUP_PYTHON = (
     "actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548"
@@ -93,6 +95,23 @@ def uses(job: dict[str, Any]) -> list[str]:
 def secret_names(job: dict[str, Any]) -> set[str]:
     text = repr(job)
     return set(re.findall(r"secrets\.([A-Z0-9_]+)", text))
+
+
+def emitter_output_keys() -> set[str]:
+    tree = ast.parse(EMITTER_PATH.read_bytes(), filename=str(EMITTER_PATH))
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(
+            isinstance(target, ast.Name) and target.id == "OUTPUT_KEYS"
+            for target in node.targets
+        ):
+            continue
+        value = ast.literal_eval(node.value)
+        assert isinstance(value, tuple)
+        assert all(isinstance(key, str) for key in value)
+        return set(value)
+    raise AssertionError("emitter OUTPUT_KEYS assignment is missing")
 
 
 def test_review_shape_is_not_an_active_workflow_and_parses_safely() -> None:
@@ -200,6 +219,19 @@ def test_authorize_has_exact_checkouts_and_all_v2_validations() -> None:
         "scripts/emit-approval-v2-outputs.py",
     }
     assert all(command in text for command in required_commands)
+    assert "--controller-tag-signature-verifier" in text
+    assert "scripts/verify-controller-tag.py" in text
+    assert "--signer-freshness-verifier-manifest" in text
+    assert "/opt/control-release-verifier-v6/identity.json" in text
+    assert "--signer-verifier" not in text
+    outputs = authorize["outputs"]
+    emitted = emitter_output_keys()
+    assert set(outputs) == emitted | {"controller_repository_id"}
+    for key in emitted:
+        assert outputs[key] == f"${{{{ steps.intent.outputs.{key} }}}}"
+    assert outputs["controller_repository_id"] == (
+        "${{ steps.controller_evidence.outputs.repository_id }}"
+    )
     assert "FUTURE BLOCKER" not in repr(authorize)
     assert secret_names(authorize) == {"CONTROL_CONTROLLER_AUDIT_TOKEN"}
     assert "$RUNNER_TEMP/control-evidence-v2" in text
@@ -277,9 +309,53 @@ def test_signer_is_source_free_and_revalidates_immediately_before_cosign() -> No
     assert CHECKOUT not in uses(signer)
     assert secret_names(signer) == set()
 
+    preflight = next(
+        step
+        for step in steps(signer)
+        if "source-free verifier bundle identity" in step.get("name", "")
+    )
+    assert preflight["env"] == {
+        "CONTROLLER_TAG_SIGNATURE_VERIFIER_SHA256": (
+            "${{ needs.authorize.outputs."
+            "controller_tag_signature_verifier_sha256 }}"
+        ),
+        "POLICY_SHA256": "${{ needs.authorize.outputs.policy_sha256 }}",
+        "RUNNER_ENVIRONMENT": "${{ runner.environment }}",
+        "SIGNER_FRESHNESS_VERIFIER_SHA256": (
+            "${{ needs.authorize.outputs."
+            "signer_freshness_verifier_sha256 }}"
+        ),
+        "TRUST_EPOCH": "${{ needs.authorize.outputs.trust_epoch }}",
+    }
     text = run_text(signer)
-    assert "policy-gate-v2.py" in text
+    assert "policy-gate-v2.py" not in text
+    assert "validate-policy-v2.py" not in text
     assert "--phase sign_release" in text
+    preflight_at = text.index("verify-control-release-verifier-v1")
+    assert "--expected-sha256" in text
+    assert (
+        "--policy /opt/control-release-policy-v2/"
+        "control-production-v2.json" in text
+    )
+    assert "/opt/control-release-verifier-v6/policies/" not in text
+    assert "--expected-policy-sha256" in text
+    assert "--expected-trust-epoch" in text
+    assert '--runner-environment "$RUNNER_ENVIRONMENT"' in text
+    assert "--expected-controller-tag-signature-verifier-sha256" in text
+    assert '--expected-sha256 "$SIGNER_FRESHNESS_VERIFIER_SHA256"' in text
+    assert '--expected-policy-sha256 "$POLICY_SHA256"' in text
+    assert '--expected-trust-epoch "$TRUST_EPOCH"' in text
+    assert re.search(
+        r'--expected-controller-tag-signature-verifier-sha256 \\\n'
+        r'\s+"\$CONTROLLER_TAG_SIGNATURE_VERIFIER_SHA256"',
+        text,
+    )
+    assert "CONTROLLER_TAG_SIGNATURE_VERIFIER_SHA256" in text
+    assert "POLICY_SHA256" in text
+    assert "SIGNER_FRESHNESS_VERIFIER_SHA256" in text
+    assert "TRUST_EPOCH" in text
+    assert "${{ needs.authorize.outputs.policy_sha256 }}" in repr(signer)
+    assert "${{ needs.authorize.outputs.trust_epoch }}" in repr(signer)
     tag_at = text.index("verify-controller-tag.py")
     ledger_at = text.index("validate-ledger.py")
     controls_at = text.index("verify-github-controls-v2.py")
@@ -287,7 +363,23 @@ def test_signer_is_source_free_and_revalidates_immediately_before_cosign() -> No
     closed_at = text.index(
         "reviewed Cosign verifier/identity is not provisioned"
     )
-    assert tag_at < ledger_at < controls_at < freshness_at < closed_at
+    assert preflight_at < tag_at < ledger_at < controls_at < freshness_at
+    assert freshness_at < closed_at
+    assert "authenticated fresh-evidence collector is not provisioned" in text
+    assert (
+        'test "$CONTROLLER_WORKFLOW_REPOSITORY_ID" != '
+        '"$CONTROLLER_AUTHORIZED_REPOSITORY_ID"' in text
+    )
+    assert "signer repository identity diverges" in text
+    assert (
+        '--workflow-repository-id "$CONTROLLER_WORKFLOW_REPOSITORY_ID"'
+        in text
+    )
+    assert '--workflow-run-id "$CONTROLLER_WORKFLOW_RUN_ID"' in text
+    assert '--workflow-run-attempt "$CONTROLLER_WORKFLOW_RUN_ATTEMPT"' in text
+    assert "${{ github.run_id }}" in repr(signer)
+    assert "${{ github.run_attempt }}" in repr(signer)
+    assert "${{ github.repository_id }}" in repr(signer)
     assert "exit 78" in text[closed_at:]
     assert "cosign sign" not in text.lower()
     assert "actions/checkout" not in repr(signer)

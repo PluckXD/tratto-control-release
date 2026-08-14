@@ -37,10 +37,11 @@ def approval(*, sequence: int = 1) -> dict:
         },
         "controller": {
             "commit_sha": "3" * 40,
+            "controller_tag_signature_verifier_sha256": "4" * 64,
             "immutable_release_id": 12001,
             "repository": "PluckXD/tratto-control-release",
             "repository_id": 22001,
-            "signer_verifier_sha256": "4" * 64,
+            "signer_freshness_verifier_sha256": "c" * 64,
             "tag_object_sha": "5" * 40,
             "tag_ref": "refs/tags/control-controller-v6.0.0",
             "workflow_path": ".github/workflows/control-release.yml",
@@ -79,6 +80,7 @@ def approval(*, sequence: int = 1) -> dict:
             "name": "control-production-v2",
             "path": "policies/control-production-v2.json",
             "repository": "PluckXD/tratto-control-release",
+            "trust_epoch": 1,
         },
         "release_id": "ctl-20260801T120000Z-tests",
         "schema_version": 2,
@@ -187,6 +189,14 @@ def test_schema_is_valid_json_and_closes_all_object_shapes() -> None:
     assert schema["properties"]["schema_version"]["const"] == 2
     for name in ("component", "controller", "ledger", "policy"):
         assert schema["$defs"][name]["additionalProperties"] is False
+    assert schema["$defs"]["policy"]["properties"]["trust_epoch"] == {
+        "maximum": 2147483647,
+        "minimum": 1,
+        "type": "integer",
+    }
+    controller_properties = schema["$defs"]["controller"]["properties"]
+    assert "signer_verifier_sha256" not in controller_properties
+    assert "tag_signature_verifier_sha256" not in controller_properties
     assert schema["$defs"]["migration"]["oneOf"] == [
         {"$ref": "#/$defs/migrationLegacy"},
         {"$ref": "#/$defs/migrationDemoPlatformV5"},
@@ -255,6 +265,28 @@ def test_schema_is_valid_json_and_closes_all_object_shapes() -> None:
                 {"path": "policies/control-production-v1.json"}
             ),
             "policy.path",
+        ),
+        (
+            lambda value: value["policy"].update({"trust_epoch": True}),
+            "positive integer",
+        ),
+        (
+            lambda value: value["policy"].update({"trust_epoch": 0}),
+            "positive integer",
+        ),
+        (
+            lambda value: value["policy"].update({"trust_epoch": 1.0}),
+            "positive integer",
+        ),
+        (
+            lambda value: value["policy"].update({"trust_epoch": "1"}),
+            "positive integer",
+        ),
+        (
+            lambda value: value["policy"].update(
+                {"trust_epoch": MODULE.MAX_TRUST_EPOCH + 1}
+            ),
+            "cannot exceed",
         ),
         (
             lambda value: value.update({"nonce": "too-short"}),
@@ -334,9 +366,15 @@ def test_rejects_preserved_v1_contract_drift(mutation, message: str) -> None:
         ),
         (
             lambda value: value["controller"].update(
-                {"signer_verifier_sha256": "4" * 63}
+                {"controller_tag_signature_verifier_sha256": "4" * 63}
             ),
-            "signer_verifier_sha256",
+            "controller_tag_signature_verifier_sha256",
+        ),
+        (
+            lambda value: value["controller"].update(
+                {"signer_freshness_verifier_sha256": "c" * 63}
+            ),
+            "signer_freshness_verifier_sha256",
         ),
         (
             lambda value: value["controller"].update({"extra": "field"}),
@@ -348,6 +386,35 @@ def test_rejects_controller_binding_drift(mutation, message: str) -> None:
     value = approval()
     mutation(value)
     with pytest.raises(MODULE.ApprovalV2Error, match=message):
+        validate(value)
+
+
+@pytest.mark.parametrize(
+    ("current_name", "legacy_name"),
+    [
+        ("signer_freshness_verifier_sha256", "signer_verifier_sha256"),
+        (
+            "controller_tag_signature_verifier_sha256",
+            "tag_signature_verifier_sha256",
+        ),
+    ],
+)
+def test_rejects_legacy_controller_verifier_aliases(
+    current_name: str,
+    legacy_name: str,
+) -> None:
+    value = approval()
+    value["controller"][legacy_name] = value["controller"].pop(current_name)
+    with pytest.raises(MODULE.ApprovalV2Error, match="keys diverge"):
+        validate(value)
+
+
+def test_rejects_coalesced_controller_verifier_roles() -> None:
+    value = approval()
+    value["controller"]["signer_freshness_verifier_sha256"] = value[
+        "controller"
+    ]["controller_tag_signature_verifier_sha256"]
+    with pytest.raises(MODULE.ApprovalV2Error, match="distinct digests"):
         validate(value)
 
 

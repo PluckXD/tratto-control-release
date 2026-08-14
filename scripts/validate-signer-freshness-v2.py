@@ -4,7 +4,8 @@
 This module is intentionally offline.  It binds a previously validated
 approval-v2 document and a previously validated envelope-v6 candidate to two
 authenticated observations of each external authority: the approval ledger,
-the immutable controller tag, and the GitHub control plane.
+the immutable controller tag, and the GitHub control plane.  Every observation
+is scoped to the exact repository, workflow run, and run attempt being signed.
 
 Raw JSON is never authority.  The pure API accepts attestations only after an
 injected authenticator returns a typed :class:`AttestationAuthentication`.
@@ -102,11 +103,15 @@ GITHUB_CONTROLS_KEYS = {
 }
 SIGNER_FRESHNESS_KEYS = {
     "controller_tag_attestation_sha256",
+    "evidence_model",
     "github_controls_attestation_sha256",
     "ledger_attestation_sha256",
     "ledger_head_sha",
     "revalidated_immediately_before_signature",
+    "workflow_run",
 }
+WORKFLOW_RUN_KEYS = {"repository_id", "run_attempt", "run_id"}
+EVIDENCE_MODEL = "workflow-signed-summary-v1"
 
 
 class SignerFreshnessV2Error(ValueError):
@@ -124,10 +129,42 @@ class AttestationKind(Enum):
 
 
 @dataclass(frozen=True)
+class WorkflowRunScope:
+    """Exact GitHub workflow invocation that authenticated the evidence."""
+
+    repository_id: int
+    run_id: int
+    run_attempt: int
+
+    def __post_init__(self) -> None:
+        for label, value in (
+            ("repository_id", self.repository_id),
+            ("run_id", self.run_id),
+            ("run_attempt", self.run_attempt),
+        ):
+            if (
+                type(value) is not int
+                or not 1 <= value <= MAX_OBSERVATION_SEQUENCE
+            ):
+                reject(
+                    f"workflow run {label} must be a bounded "
+                    "positive integer"
+                )
+
+    def as_dict(self) -> dict[str, int]:
+        return {
+            "repository_id": self.repository_id,
+            "run_attempt": self.run_attempt,
+            "run_id": self.run_id,
+        }
+
+
+@dataclass(frozen=True)
 class SignerRuntimeIdentity:
-    """Reviewed identity of the isolated signer runtime."""
+    """Reviewed identity and invocation of the isolated signer runtime."""
 
     value: str
+    workflow_run: WorkflowRunScope
 
     def __post_init__(self) -> None:
         if (
@@ -135,6 +172,8 @@ class SignerRuntimeIdentity:
             or IDENTITY_RE.fullmatch(self.value) is None
         ):
             reject("signer runtime identity has invalid format")
+        if type(self.workflow_run) is not WorkflowRunScope:
+            reject("signer runtime workflow run scope must be typed")
 
 
 @dataclass(frozen=True)
@@ -145,6 +184,7 @@ class AttestationAuthentication:
     digest_sha256: str
     signer_runtime_identity: str
     observation_sequence: int
+    workflow_run: WorkflowRunScope
     authenticated: bool
 
 
@@ -299,6 +339,27 @@ def require_positive_integer(
     if type(value) is not int or not 1 <= value <= maximum:
         reject(f"{label} must be a bounded positive integer")
     return value
+
+
+def workflow_run_scope(value: Any, label: str) -> WorkflowRunScope:
+    run = exact_keys(value, WORKFLOW_RUN_KEYS, label)
+    return WorkflowRunScope(
+        repository_id=require_positive_integer(
+            run["repository_id"],
+            f"{label}.repository_id",
+            maximum=MAX_OBSERVATION_SEQUENCE,
+        ),
+        run_id=require_positive_integer(
+            run["run_id"],
+            f"{label}.run_id",
+            maximum=MAX_OBSERVATION_SEQUENCE,
+        ),
+        run_attempt=require_positive_integer(
+            run["run_attempt"],
+            f"{label}.run_attempt",
+            maximum=MAX_OBSERVATION_SEQUENCE,
+        ),
+    )
 
 
 def parse_canonical_attestation(raw: bytes) -> dict[str, Any]:
@@ -511,6 +572,8 @@ def authenticate_attestation(
         "authenticated observation sequence",
         maximum=MAX_OBSERVATION_SEQUENCE,
     )
+    if type(authentication.workflow_run) is not WorkflowRunScope:
+        reject("authenticated workflow run scope must be typed")
     if type(authentication.authenticated) is not bool:
         reject("authenticated marker must be boolean")
     if authentication.authenticated is not True:
@@ -551,6 +614,8 @@ def _validate_fresh_pair(
         authentication = evidence.authentication
         if authentication.signer_runtime_identity != runtime.value:
             reject(f"{label} {kind.value} signer runtime identity diverges")
+        if authentication.workflow_run != runtime.workflow_run:
+            reject(f"{label} {kind.value} workflow run scope diverges")
     if (
         second.authentication.observation_sequence
         <= first.authentication.observation_sequence
@@ -582,6 +647,16 @@ def build_signer_freshness_block(
         AttestationKind.GITHUB_CONTROLS,
         "fresh GitHub-controls",
     )
+    workflow_runs = tuple(
+        evidence.authentication.workflow_run
+        for evidence in (ledger, controller, controls)
+    )
+    if any(type(run) is not WorkflowRunScope for run in workflow_runs):
+        reject("fresh attestation workflow run scope must be typed")
+    scopes = set(workflow_runs)
+    if len(scopes) != 1:
+        reject("fresh attestations have divergent workflow run scopes")
+    workflow_run = next(iter(scopes))
     digests = {
         "ledger_attestation_sha256": sha256_hex(ledger.canonical),
         "controller_tag_attestation_sha256": sha256_hex(
@@ -602,6 +677,7 @@ def build_signer_freshness_block(
         "controller_tag_attestation_sha256": digests[
             "controller_tag_attestation_sha256"
         ],
+        "evidence_model": EVIDENCE_MODEL,
         "github_controls_attestation_sha256": digests[
             "github_controls_attestation_sha256"
         ],
@@ -610,6 +686,7 @@ def build_signer_freshness_block(
         ],
         "ledger_head_sha": head,
         "revalidated_immediately_before_signature": True,
+        "workflow_run": workflow_run.as_dict(),
     }
 
 
@@ -738,6 +815,33 @@ def validate_signer_freshness(
     if type(signer_runtime) is not SignerRuntimeIdentity:
         reject("signer runtime identity must be typed")
 
+    approved, envelope = _bind_approval_and_envelope(
+        approval,
+        envelope_candidate,
+    )
+    controller = envelope["controller"]
+    envelope_scope = WorkflowRunScope(
+        repository_id=controller["repository_id"],
+        run_id=controller["run_id"],
+        run_attempt=controller["run_attempt"],
+    )
+    if signer_runtime.workflow_run != envelope_scope:
+        reject("signer runtime workflow run scope diverges from envelope")
+
+    candidate = exact_keys(
+        envelope["signer_freshness"],
+        SIGNER_FRESHNESS_KEYS,
+        "envelope signer_freshness",
+    )
+    if candidate["evidence_model"] != EVIDENCE_MODEL:
+        reject("envelope signer freshness evidence model diverges")
+    candidate_scope = workflow_run_scope(
+        candidate["workflow_run"],
+        "envelope signer_freshness.workflow_run",
+    )
+    if candidate_scope != envelope_scope:
+        reject("envelope signer freshness workflow run scope diverges")
+
     _, latest_ledger = _validate_fresh_pair(
         initial=initial_ledger,
         fresh=fresh_ledger,
@@ -757,10 +861,6 @@ def validate_signer_freshness(
         runtime=signer_runtime,
     )
 
-    approved, envelope = _bind_approval_and_envelope(
-        approval,
-        envelope_candidate,
-    )
     _bind_ledger(latest_ledger.value, approved, envelope)
     _bind_controller(latest_controller.value, approved, envelope)
     _bind_controls(latest_controls.value, approved, envelope)
@@ -770,8 +870,7 @@ def validate_signer_freshness(
         fresh_controller_tag=latest_controller,
         fresh_github_controls=latest_controls,
     )
-    candidate = envelope["signer_freshness"]
-    if set(candidate) != SIGNER_FRESHNESS_KEYS or dict(candidate) != result:
+    if _plain(candidate) != result:
         reject("envelope signer_freshness diverges from fresh attestations")
     return result
 
@@ -871,6 +970,17 @@ def parser() -> argparse.ArgumentParser:
     )
     argument_parser.add_argument("--approval", required=True, type=Path)
     argument_parser.add_argument("--envelope", required=True, type=Path)
+    argument_parser.add_argument(
+        "--workflow-repository-id",
+        required=True,
+        type=int,
+    )
+    argument_parser.add_argument("--workflow-run-id", required=True, type=int)
+    argument_parser.add_argument(
+        "--workflow-run-attempt",
+        required=True,
+        type=int,
+    )
     for phase in ("initial", "fresh"):
         for kind in ("ledger", "controller-tag", "github-controls"):
             argument_parser.add_argument(
@@ -884,6 +994,11 @@ def parser() -> argparse.ArgumentParser:
 def main(arguments: list[str] | None = None) -> int:
     try:
         options = parser().parse_args(arguments)
+        current_workflow_run = WorkflowRunScope(
+            repository_id=options.workflow_repository_id,
+            run_id=options.workflow_run_id,
+            run_attempt=options.workflow_run_attempt,
+        )
         approval_raw = read_stable_file(
             options.approval,
             label="approval-v2",
@@ -895,7 +1010,13 @@ def main(arguments: list[str] | None = None) -> int:
             maximum=ENVELOPE.MAX_FILE_BYTES,
         )
         validate_approval_v2_bytes(approval_raw)
-        validate_envelope_v6_bytes(envelope_raw)
+        validated_envelope = validate_envelope_v6_bytes(envelope_raw)
+        envelope_workflow_run = workflow_run_scope(
+            validated_envelope.value["signer_freshness"]["workflow_run"],
+            "envelope signer_freshness.workflow_run",
+        )
+        if current_workflow_run != envelope_workflow_run:
+            reject("current workflow run scope diverges from envelope")
 
         raw_attestations: list[tuple[AttestationKind, bytes]] = []
         for phase in ("initial", "fresh"):
