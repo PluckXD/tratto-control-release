@@ -37,10 +37,11 @@ def approval(*, sequence: int = 2) -> dict:
         },
         "controller": {
             "commit_sha": "3" * 40,
+            "controller_tag_signature_verifier_sha256": "4" * 64,
             "immutable_release_id": 12001,
             "repository": "PluckXD/tratto-control-release",
             "repository_id": 22001,
-            "signer_verifier_sha256": "4" * 64,
+            "signer_freshness_verifier_sha256": "5" * 64,
             "tag_object_sha": "5" * 40,
             "tag_ref": "refs/tags/control-controller-v6.0.0",
             "workflow_path": ".github/workflows/control-release.yml",
@@ -79,6 +80,7 @@ def approval(*, sequence: int = 2) -> dict:
             "name": "control-production-v2",
             "path": "policies/control-production-v2.json",
             "repository": "PluckXD/tratto-control-release",
+            "trust_epoch": 1,
         },
         "release_id": "ctl-20260801T120000Z-tests",
         "schema_version": 2,
@@ -205,6 +207,11 @@ def envelope(*, sequence: int = 2) -> dict:
         },
         "controller": {
             "commit_sha": controller_approval["commit_sha"],
+            "controller_tag_signature_verifier_sha256": (
+                controller_approval[
+                    "controller_tag_signature_verifier_sha256"
+                ]
+            ),
             "event_name": "workflow_dispatch",
             "github_sha": controller_approval["commit_sha"],
             "immutable_release_id": controller_approval[
@@ -218,8 +225,8 @@ def envelope(*, sequence: int = 2) -> dict:
             "runner_arch": "X64",
             "runner_environment": "github-hosted",
             "runner_os": "Linux",
-            "signer_verifier_sha256": controller_approval[
-                "signer_verifier_sha256"
+            "signer_freshness_verifier_sha256": controller_approval[
+                "signer_freshness_verifier_sha256"
             ],
             "source_ref": tag_ref,
             "tag_object_sha": controller_approval["tag_object_sha"],
@@ -239,13 +246,20 @@ def envelope(*, sequence: int = 2) -> dict:
             "record_count": sequence,
         },
         "migration": copy.deepcopy(manifest["migration"]),
+        "envelope_profile": "control-release-permanent-v6",
         "schema_version": 6,
         "signer_freshness": {
             "controller_tag_attestation_sha256": "1" * 64,
+            "evidence_model": "workflow-signed-summary-v1",
             "github_controls_attestation_sha256": "2" * 64,
             "ledger_attestation_sha256": "3" * 64,
             "ledger_head_sha": head_sha,
             "revalidated_immediately_before_signature": True,
+            "workflow_run": {
+                "repository_id": 22001,
+                "run_attempt": 1,
+                "run_id": 123,
+            },
         },
         "supplemental_inventory": {"supplemental_only": True},
     }
@@ -266,6 +280,22 @@ def test_accepts_first_ledger_record_without_circular_commit_binding() -> None:
     assert value["ledger"]["head_sha"] == "d" * 40
     assert value["ledger"]["head_sha"] != value["ledger"]["genesis_sha"]
     assert validate(value)["ledger"]["sequence"] == 1
+
+
+def test_rejects_real_bootstrap_v6_top_level_keyset() -> None:
+    bootstrap = {
+        "approval": {"mode": "single-operator-bootstrap"},
+        "artifacts": {},
+        "behavioral_verification": {},
+        "bootstrap_source_helper": {},
+        "carrier": {},
+        "controller": {},
+        "migration": {},
+        "schema_version": 6,
+        "supplemental_inventory": {},
+    }
+    with pytest.raises(MODULE.EnvelopeV6Error, match="envelope keys diverge"):
+        MODULE.validate(bootstrap)
 
 
 @pytest.mark.parametrize("schema_version", (5, 6))
@@ -326,6 +356,16 @@ def test_schema_is_valid_json_and_closes_every_inline_object() -> None:
         "const": 6,
         "type": "integer",
     }
+    assert schema["properties"]["envelope_profile"] == {
+        "const": "control-release-permanent-v6"
+    }
+    assert schema["$defs"]["workflowRun"]["additionalProperties"] is False
+    for key in ("repository_id", "run_id", "run_attempt"):
+        assert schema["$defs"]["workflowRun"]["properties"][key] == {
+            "maximum": MODULE.MAX_WORKFLOW_RUN_VALUE,
+            "minimum": 1,
+            "type": "integer",
+        }
     assert schema["properties"]["approval"]["properties"]["manifest"] == {
         "$ref": "approval-v2.schema.json"
     }
@@ -351,6 +391,16 @@ def test_schema_is_valid_json_and_closes_every_inline_object() -> None:
         (
             lambda value: value.update({"schema_version": 6.0}),
             "integer 6",
+        ),
+        (
+            lambda value: value.pop("envelope_profile"),
+            "keys diverge",
+        ),
+        (
+            lambda value: value.update(
+                {"envelope_profile": "control-release-bootstrap-v1"}
+            ),
+            "profile must be control-release-permanent-v6",
         ),
         (
             lambda value: value["approval"].update({"mode": "legacy"}),
@@ -479,7 +529,8 @@ def test_rejects_invalid_external_ledger_evidence(
         ("tag_ref", "refs/tags/control-controller-v6.0.1"),
         ("workflow_path", ".github/workflows/evil.yml"),
         ("workflow_sha256", "7" * 64),
-        ("signer_verifier_sha256", "8" * 64),
+        ("controller_tag_signature_verifier_sha256", "8" * 64),
+        ("signer_freshness_verifier_sha256", "9" * 64),
     ],
 )
 def test_rejects_every_controller_approval_binding(
@@ -492,6 +543,27 @@ def test_rejects_every_controller_approval_binding(
         MODULE.EnvelopeV6Error,
         match=rf"controller\.{key} diverges",
     ):
+        validate(value)
+
+
+def test_rejects_coalesced_controller_verifier_roles() -> None:
+    value = envelope()
+    shared_digest = "4" * 64
+    approval_controller = value["approval"]["manifest"]["controller"]
+    approval_controller["controller_tag_signature_verifier_sha256"] = (
+        shared_digest
+    )
+    approval_controller["signer_freshness_verifier_sha256"] = shared_digest
+    value["controller"]["controller_tag_signature_verifier_sha256"] = (
+        shared_digest
+    )
+    value["controller"]["signer_freshness_verifier_sha256"] = shared_digest
+    manifest_sha256 = hashlib.sha256(
+        MODULE.APPROVAL.canonical_bytes(value["approval"]["manifest"])
+    ).hexdigest()
+    value["approval"]["manifest_sha256"] = manifest_sha256
+    value["ledger"]["manifest_sha256"] = manifest_sha256
+    with pytest.raises(MODULE.EnvelopeV6Error, match="distinct digests"):
         validate(value)
 
 
@@ -588,6 +660,48 @@ def test_rejects_non_tag_or_non_owner_controller_context(
         ),
         (
             lambda value: value["signer_freshness"].update(
+                {"evidence_model": "detached-sidecars-v1"}
+            ),
+            "evidence model",
+        ),
+        (
+            lambda value: value["signer_freshness"]["workflow_run"].update(
+                {"repository_id": 99999}
+            ),
+            "controller.repository_id",
+        ),
+        (
+            lambda value: value["signer_freshness"]["workflow_run"].update(
+                {"run_id": 124}
+            ),
+            "controller.run_id",
+        ),
+        (
+            lambda value: value["signer_freshness"]["workflow_run"].update(
+                {"run_attempt": 2}
+            ),
+            "controller.run_attempt",
+        ),
+        (
+            lambda value: value["signer_freshness"]["workflow_run"].update(
+                {"run_attempt": True}
+            ),
+            "positive integer",
+        ),
+        (
+            lambda value: value["signer_freshness"]["workflow_run"].update(
+                {"unexpected": 1}
+            ),
+            "workflow_run keys diverge",
+        ),
+        (
+            lambda value: value["signer_freshness"]["workflow_run"].pop(
+                "run_id"
+            ),
+            "workflow_run keys diverge",
+        ),
+        (
+            lambda value: value["signer_freshness"].update(
                 {"unexpected": "1" * 64}
             ),
             "keys diverge",
@@ -601,6 +715,47 @@ def test_rejects_stale_or_ambiguous_signer_freshness(
     value = envelope()
     mutation(value)
     with pytest.raises(MODULE.EnvelopeV6Error, match=message):
+        validate(value)
+
+
+@pytest.mark.parametrize("key", ("repository_id", "run_id", "run_attempt"))
+def test_workflow_run_scope_uses_signed_63_bit_bounds(key: str) -> None:
+    value = envelope()
+    if key == "repository_id":
+        value["approval"]["manifest"]["controller"][key] = (
+            MODULE.MAX_WORKFLOW_RUN_VALUE
+        )
+    value["controller"][key] = MODULE.MAX_WORKFLOW_RUN_VALUE
+    value["signer_freshness"]["workflow_run"][key] = (
+        MODULE.MAX_WORKFLOW_RUN_VALUE
+    )
+    if key == "repository_id":
+        manifest_sha256 = hashlib.sha256(
+            MODULE.APPROVAL.canonical_bytes(
+                value["approval"]["manifest"]
+            )
+        ).hexdigest()
+        value["approval"]["manifest_sha256"] = manifest_sha256
+        value["ledger"]["manifest_sha256"] = manifest_sha256
+    assert validate(value)["controller"][key] == MODULE.MAX_WORKFLOW_RUN_VALUE
+
+    if key == "repository_id":
+        value["approval"]["manifest"]["controller"][key] = (
+            MODULE.MAX_WORKFLOW_RUN_VALUE + 1
+        )
+    value["controller"][key] = MODULE.MAX_WORKFLOW_RUN_VALUE + 1
+    value["signer_freshness"]["workflow_run"][key] = (
+        MODULE.MAX_WORKFLOW_RUN_VALUE + 1
+    )
+    if key == "repository_id":
+        manifest_sha256 = hashlib.sha256(
+            MODULE.APPROVAL.canonical_bytes(
+                value["approval"]["manifest"]
+            )
+        ).hexdigest()
+        value["approval"]["manifest_sha256"] = manifest_sha256
+        value["ledger"]["manifest_sha256"] = manifest_sha256
+    with pytest.raises(MODULE.EnvelopeV6Error, match="bounded positive"):
         validate(value)
 
 
@@ -764,8 +919,10 @@ def test_cli_returns_78_for_rejection_and_canonical_summary_for_success(
     assert accepted.stderr == ""
     assert json.loads(accepted.stdout) == {
         "controller_tag_ref": value["controller"]["tag_ref"],
+        "envelope_profile": "control-release-permanent-v6",
         "envelope_sha256": hashlib.sha256(raw).hexdigest(),
         "ledger_head_sha": value["ledger"]["head_sha"],
         "release_id": value["approval"]["manifest"]["release_id"],
         "schema_version": 6,
+        "trust_epoch": 1,
     }

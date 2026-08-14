@@ -31,11 +31,15 @@ jobs:
       controller_commit_sha: ${{ steps.intent.outputs.controller_commit_sha }}
       controller_release_id: ${{ steps.intent.outputs.controller_release_id }}
       controller_repository_id: ${{ steps.controller_evidence.outputs.repository_id }}
+      controller_tag_signature_verifier_sha256: ${{ steps.intent.outputs.controller_tag_signature_verifier_sha256 }}
       controller_tag_ref: ${{ steps.intent.outputs.controller_tag_ref }}
       controller_tag_object_sha: ${{ steps.intent.outputs.controller_tag_object_sha }}
       ledger_head_sha: ${{ steps.intent.outputs.ledger_head_sha }}
       ops_sha: ${{ steps.intent.outputs.ops_sha }}
+      policy_sha256: ${{ steps.intent.outputs.policy_sha256 }}
       release_id: ${{ steps.intent.outputs.release_id }}
+      signer_freshness_verifier_sha256: ${{ steps.intent.outputs.signer_freshness_verifier_sha256 }}
+      trust_epoch: ${{ steps.intent.outputs.trust_epoch }}
       web_sha: ${{ steps.intent.outputs.web_sha }}
     steps:
       - name: Authorization has no OIDC or product credentials
@@ -183,7 +187,8 @@ jobs:
             --ledger-summary "$RUNNER_TEMP/ledger-summary.json" \
             --policy policies/control-production-v2.json \
             --workflow .github/workflows/control-release.yml \
-            --signer-verifier scripts/validate-signer-freshness-v2.py \
+            --controller-tag-signature-verifier scripts/verify-controller-tag.py \
+            --signer-freshness-verifier-manifest /opt/control-release-verifier-v6/identity.json \
             --github-output "$GITHUB_OUTPUT"
 
   build_api:
@@ -378,18 +383,28 @@ jobs:
           test ! -e "$GITHUB_WORKSPACE/verifier"
 
       - name: FUTURE BLOCKER - source-free verifier bundle identity
+        env:
+          CONTROLLER_TAG_SIGNATURE_VERIFIER_SHA256: ${{ needs.authorize.outputs.controller_tag_signature_verifier_sha256 }}
+          POLICY_SHA256: ${{ needs.authorize.outputs.policy_sha256 }}
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          SIGNER_FRESHNESS_VERIFIER_SHA256: ${{ needs.authorize.outputs.signer_freshness_verifier_sha256 }}
+          TRUST_EPOCH: ${{ needs.authorize.outputs.trust_epoch }}
         run: |
-          if test ! -r /opt/control-release-verifier-v6/identity.json; then
-            echo "RELEASE_POLICY_UNAVAILABLE: source-free verifier identity is not provisioned" >&2
+          if test ! -x /usr/local/libexec/verify-control-release-verifier-v1; then
+            echo "RELEASE_POLICY_UNAVAILABLE: source-free verifier preflight is not provisioned" >&2
             exit 78
           fi
-
-      - name: Gate the source-free signer
-        env:
-          RUNNER_ENVIRONMENT: ${{ runner.environment }}
-        run: |
-          python3 -B /opt/control-release-verifier-v6/scripts/policy-gate-v2.py \
-            --phase sign_release
+          /usr/local/libexec/verify-control-release-verifier-v1 \
+            --root /opt/control-release-verifier-v6 \
+            --manifest /opt/control-release-verifier-v6/identity.json \
+            --policy /opt/control-release-policy-v2/control-production-v2.json \
+            --expected-sha256 "$SIGNER_FRESHNESS_VERIFIER_SHA256" \
+            --expected-policy-sha256 "$POLICY_SHA256" \
+            --expected-trust-epoch "$TRUST_EPOCH" \
+            --expected-controller-tag-signature-verifier-sha256 \
+              "$CONTROLLER_TAG_SIGNATURE_VERIFIER_SHA256" \
+            --phase sign_release \
+            --runner-environment "$RUNNER_ENVIRONMENT"
 
       - name: FUTURE BLOCKER - fresh authenticated authority evidence
         run: |
@@ -411,18 +426,28 @@ jobs:
               exit 78
             fi
           done
+          echo "RELEASE_POLICY_UNAVAILABLE: authenticated fresh-evidence collector is not provisioned" >&2
+          exit 78
 
       - name: Revalidate controller, ledger, and controls immediately before Cosign
         env:
           APPROVAL_PATH: ${{ inputs.approval_path }}
+          CONTROLLER_AUTHORIZED_REPOSITORY_ID: ${{ needs.authorize.outputs.controller_repository_id }}
           CONTROLLER_COMMIT_SHA: ${{ needs.authorize.outputs.controller_commit_sha }}
           CONTROLLER_RELEASE_ID: ${{ needs.authorize.outputs.controller_release_id }}
           CONTROLLER_REPOSITORY_ID: ${{ needs.authorize.outputs.controller_repository_id }}
           CONTROLLER_TAG_REF: ${{ needs.authorize.outputs.controller_tag_ref }}
           CONTROLLER_TAG_OBJECT_SHA: ${{ needs.authorize.outputs.controller_tag_object_sha }}
+          CONTROLLER_WORKFLOW_RUN_ATTEMPT: ${{ github.run_attempt }}
+          CONTROLLER_WORKFLOW_RUN_ID: ${{ github.run_id }}
+          CONTROLLER_WORKFLOW_REPOSITORY_ID: ${{ github.repository_id }}
           GITHUB_TOKEN: ${{ github.token }}
           LEDGER_HEAD_SHA: ${{ needs.authorize.outputs.ledger_head_sha }}
         run: |
+          if test "$CONTROLLER_WORKFLOW_REPOSITORY_ID" != "$CONTROLLER_AUTHORIZED_REPOSITORY_ID"; then
+            echo "RELEASE_POLICY_UNAVAILABLE: signer repository identity diverges" >&2
+            exit 78
+          fi
           python3 -B /opt/control-release-verifier-v6/scripts/verify-controller-tag.py \
             --controller-tag "${CONTROLLER_TAG_REF#refs/tags/}" \
             --tag-object-sha "$CONTROLLER_TAG_OBJECT_SHA" \
@@ -458,7 +483,10 @@ jobs:
             --initial-controller-tag-attestation /run/control-release-evidence/initial-controller-tag.json \
             --fresh-controller-tag-attestation /run/control-release-evidence/fresh-controller-tag.json \
             --initial-github-controls-attestation /run/control-release-evidence/initial-github-controls.json \
-            --fresh-github-controls-attestation /run/control-release-evidence/fresh-github-controls.json
+            --fresh-github-controls-attestation /run/control-release-evidence/fresh-github-controls.json \
+            --workflow-repository-id "$CONTROLLER_WORKFLOW_REPOSITORY_ID" \
+            --workflow-run-id "$CONTROLLER_WORKFLOW_RUN_ID" \
+            --workflow-run-attempt "$CONTROLLER_WORKFLOW_RUN_ATTEMPT"
           echo "RELEASE_POLICY_UNAVAILABLE: reviewed Cosign verifier/identity is not provisioned" >&2
           exit 78
           # FUTURE COSIGN: replace the two fail-closed lines above only after

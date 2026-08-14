@@ -28,14 +28,31 @@ SPEC.loader.exec_module(MODULE)
 
 NOW = dt.datetime(2026, 8, 1, 12, 30, tzinfo=dt.timezone.utc)
 WORKFLOW_RAW = b"name: immutable-control-release\non: workflow_dispatch\n"
-VERIFIER_RAW = b"#!/usr/bin/env python3\n# fixed local tag verifier\n"
+CONTROLLER_TAG_SIGNATURE_VERIFIER_RAW = (
+    b"#!/usr/bin/env python3\n# fixed local controller-tag verifier\n"
+)
+SIGNER_FRESHNESS_VERIFIER_MANIFEST_RAW = (
+    b'{"bundle_name":"control-release-verifier-v6",'
+    b'"format":"tratto-control-source-free-verifier-bundle-v1",'
+    b'"schema_version":1}\n'
+)
 WORKFLOW_SHA256 = hashlib.sha256(WORKFLOW_RAW).hexdigest()
-VERIFIER_SHA256 = hashlib.sha256(VERIFIER_RAW).hexdigest()
-PINS = MODULE.POLICY_V2.AuditedPins(
+CONTROLLER_TAG_SIGNATURE_VERIFIER_SHA256 = hashlib.sha256(
+    CONTROLLER_TAG_SIGNATURE_VERIFIER_RAW
+).hexdigest()
+SIGNER_FRESHNESS_VERIFIER_SHA256 = hashlib.sha256(
+    SIGNER_FRESHNESS_VERIFIER_MANIFEST_RAW
+).hexdigest()
+TRUST_EPOCH = 7
+TRUST = MODULE.POLICY_V2.AuditedTrustEpoch(
+    trust_epoch=TRUST_EPOCH,
     controller_repository_id=123456789,
     controller_workflow_sha256=WORKFLOW_SHA256,
-    controller_tag_trust_root_sha256="c" * 64,
-    controller_tag_verifier_sha256=VERIFIER_SHA256,
+    controller_tag_signature_trust_root_sha256="c" * 64,
+    controller_tag_signature_verifier_sha256=(
+        CONTROLLER_TAG_SIGNATURE_VERIFIER_SHA256
+    ),
+    signer_freshness_verifier_sha256=SIGNER_FRESHNESS_VERIFIER_SHA256,
     ledger_repository_id=234567890,
     ledger_genesis_sha="a" * 40,
 )
@@ -49,7 +66,13 @@ def approval_value(
     *,
     policy_sha256: str,
     workflow_sha256: str = WORKFLOW_SHA256,
-    verifier_sha256: str = VERIFIER_SHA256,
+    controller_tag_signature_verifier_sha256: str = (
+        CONTROLLER_TAG_SIGNATURE_VERIFIER_SHA256
+    ),
+    signer_freshness_verifier_sha256: str = (
+        SIGNER_FRESHNESS_VERIFIER_SHA256
+    ),
+    trust_epoch: int = TRUST_EPOCH,
     issued_at: dt.datetime | None = None,
 ) -> dict:
     issued = (
@@ -70,10 +93,15 @@ def approval_value(
         },
         "controller": {
             "commit_sha": "5" * 40,
+            "controller_tag_signature_verifier_sha256": (
+                controller_tag_signature_verifier_sha256
+            ),
             "immutable_release_id": 12001,
             "repository": "PluckXD/tratto-control-release",
-            "repository_id": PINS.controller_repository_id,
-            "signer_verifier_sha256": verifier_sha256,
+            "repository_id": TRUST.controller_repository_id,
+            "signer_freshness_verifier_sha256": (
+                signer_freshness_verifier_sha256
+            ),
             "tag_object_sha": "6" * 40,
             "tag_ref": "refs/tags/control-controller-v6.0.0",
             "workflow_path": ".github/workflows/control-release.yml",
@@ -82,12 +110,12 @@ def approval_value(
         "expires_at": expires.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "issued_at": issued.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "ledger": {
-            "genesis_sha": PINS.ledger_genesis_sha,
+            "genesis_sha": TRUST.ledger_genesis_sha,
             "parent_commit_sha": "7" * 40,
             "previous_manifest_sha256": "8" * 64,
             "ref": "refs/heads/main",
             "repository": "PluckXD/tratto-control-release-ledger",
-            "repository_id": PINS.ledger_repository_id,
+            "repository_id": TRUST.ledger_repository_id,
             "sequence": 2,
         },
         "migration": {
@@ -112,6 +140,7 @@ def approval_value(
             "name": "control-production-v2",
             "path": "policies/control-production-v2.json",
             "repository": "PluckXD/tratto-control-release",
+            "trust_epoch": trust_epoch,
         },
         "release_id": release_id,
         "schema_version": 2,
@@ -127,31 +156,45 @@ def approval_value(
 def materials(
     *,
     workflow_raw: bytes = WORKFLOW_RAW,
-    verifier_raw: bytes = VERIFIER_RAW,
+    controller_tag_signature_verifier_raw: bytes = (
+        CONTROLLER_TAG_SIGNATURE_VERIFIER_RAW
+    ),
+    signer_freshness_verifier_manifest_raw: bytes = (
+        SIGNER_FRESHNESS_VERIFIER_MANIFEST_RAW
+    ),
     issued_at: dt.datetime | None = None,
 ) -> dict:
-    pins = MODULE.POLICY_V2.AuditedPins(
+    trust = MODULE.POLICY_V2.AuditedTrustEpoch(
         **{
-            **PINS.__dict__,
+            **TRUST.__dict__,
             "controller_workflow_sha256": hashlib.sha256(
                 workflow_raw
             ).hexdigest(),
-            "controller_tag_verifier_sha256": hashlib.sha256(
-                verifier_raw
+            "controller_tag_signature_verifier_sha256": hashlib.sha256(
+                controller_tag_signature_verifier_raw
+            ).hexdigest(),
+            "signer_freshness_verifier_sha256": hashlib.sha256(
+                signer_freshness_verifier_manifest_raw
             ).hexdigest(),
         }
     )
-    policy = MODULE.POLICY_V2.expected_policy(pins)
+    policy = MODULE.POLICY_V2.expected_policy(trust)
     policy_raw = MODULE.POLICY_V2.canonical_bytes(policy)
     approval = approval_value(
         policy_sha256=hashlib.sha256(policy_raw).hexdigest(),
         workflow_sha256=hashlib.sha256(workflow_raw).hexdigest(),
-        verifier_sha256=hashlib.sha256(verifier_raw).hexdigest(),
+        controller_tag_signature_verifier_sha256=hashlib.sha256(
+            controller_tag_signature_verifier_raw
+        ).hexdigest(),
+        signer_freshness_verifier_sha256=hashlib.sha256(
+            signer_freshness_verifier_manifest_raw
+        ).hexdigest(),
+        trust_epoch=trust.trust_epoch,
         issued_at=issued_at,
     )
-    approval["controller"]["repository_id"] = pins.controller_repository_id
-    approval["ledger"]["repository_id"] = pins.ledger_repository_id
-    approval["ledger"]["genesis_sha"] = pins.ledger_genesis_sha
+    approval["controller"]["repository_id"] = trust.controller_repository_id
+    approval["ledger"]["repository_id"] = trust.ledger_repository_id
+    approval["ledger"]["genesis_sha"] = trust.ledger_genesis_sha
     approval_raw = canonical(approval)
     summary = {
         "genesis_sha": approval["ledger"]["genesis_sha"],
@@ -165,10 +208,15 @@ def materials(
         "approval_raw": approval_raw,
         "ledger_summary": summary,
         "ledger_summary_raw": canonical(summary),
-        "pins": pins,
+        "trust": trust,
         "policy": policy,
         "policy_raw": policy_raw,
-        "signer_verifier_raw": verifier_raw,
+        "controller_tag_signature_verifier_raw": (
+            controller_tag_signature_verifier_raw
+        ),
+        "signer_freshness_verifier_manifest_raw": (
+            signer_freshness_verifier_manifest_raw
+        ),
         "workflow_raw": workflow_raw,
     }
 
@@ -179,8 +227,13 @@ def validate(bundle: dict, *, now: dt.datetime = NOW) -> dict[str, str]:
         ledger_summary_raw=bundle["ledger_summary_raw"],
         policy_raw=bundle["policy_raw"],
         workflow_raw=bundle["workflow_raw"],
-        signer_verifier_raw=bundle["signer_verifier_raw"],
-        audited_pins=bundle["pins"],
+        controller_tag_signature_verifier_raw=(
+            bundle["controller_tag_signature_verifier_raw"]
+        ),
+        signer_freshness_verifier_manifest_raw=(
+            bundle["signer_freshness_verifier_manifest_raw"]
+        ),
+        audited_trust_epoch=bundle["trust"],
         now=now,
     )
 
@@ -203,17 +256,65 @@ def expected_outputs(bundle: dict) -> dict[str, str]:
         "approval_sha256": hashlib.sha256(
             bundle["approval_raw"]
         ).hexdigest(),
+        "policy_sha256": hashlib.sha256(
+            bundle["policy_raw"]
+        ).hexdigest(),
         "ledger_head_sha": "b" * 40,
         "controller_commit_sha": "5" * 40,
+        "controller_tag_signature_verifier_sha256": (
+            CONTROLLER_TAG_SIGNATURE_VERIFIER_SHA256
+        ),
         "controller_tag_ref": "refs/tags/control-controller-v6.0.0",
         "controller_tag_object_sha": "6" * 40,
         "controller_release_id": "12001",
+        "signer_freshness_verifier_sha256": (
+            SIGNER_FRESHNESS_VERIFIER_SHA256
+        ),
+        "trust_epoch": str(approval["policy"]["trust_epoch"]),
     }
 
 
 def test_pure_api_accepts_exact_current_cross_bound_inputs() -> None:
     bundle = materials()
     assert validate(bundle) == expected_outputs(bundle)
+
+
+def test_pure_api_rejects_identical_verifier_role_bytes() -> None:
+    shared = b'{"artifact":"must-have-one-role-only"}\n'
+    bundle = materials(
+        controller_tag_signature_verifier_raw=shared,
+        signer_freshness_verifier_manifest_raw=shared,
+    )
+    with pytest.raises(
+        MODULE.ApprovalV2OutputsError,
+        match="must use distinct bytes",
+    ):
+        validate(bundle)
+
+
+def test_pure_api_rejects_identical_verifier_role_digests(monkeypatch) -> None:
+    bundle = materials()
+    real_sha256 = MODULE.hashlib.sha256
+    role_bytes = {
+        bundle["controller_tag_signature_verifier_raw"],
+        bundle["signer_freshness_verifier_manifest_raw"],
+    }
+
+    class CollidingDigest:
+        def hexdigest(self) -> str:
+            return "f" * 64
+
+    def colliding_sha256(raw: bytes):
+        if raw in role_bytes:
+            return CollidingDigest()
+        return real_sha256(raw)
+
+    monkeypatch.setattr(MODULE.hashlib, "sha256", colliding_sha256)
+    with pytest.raises(
+        MODULE.ApprovalV2OutputsError,
+        match="must use distinct SHA-256 digests",
+    ):
+        validate(bundle)
 
 
 def test_pure_api_performs_no_file_or_environment_access(monkeypatch) -> None:
@@ -227,10 +328,15 @@ def test_pure_api_performs_no_file_or_environment_access(monkeypatch) -> None:
     assert validate(bundle) == expected_outputs(bundle)
 
 
-def test_workflow_and_verifier_are_hashed_as_bytes_not_imported_or_executed() -> None:
+def test_reviewed_artifacts_are_hashed_as_bytes_not_imported_or_executed() -> None:
     bundle = materials(
         workflow_raw=b"\0this is not YAML or executable code\n",
-        verifier_raw=b"raise RuntimeError('must never execute')\n",
+        controller_tag_signature_verifier_raw=(
+            b"raise RuntimeError('must never execute')\n"
+        ),
+        signer_freshness_verifier_manifest_raw=(
+            b'{"payload":"must never execute"}\n'
+        ),
     )
     assert validate(bundle)["controller_commit_sha"] == "5" * 40
 
@@ -410,18 +516,28 @@ def test_rejects_noncanonical_approval() -> None:
             "workflow digest",
         ),
         (
-            ("controller", "signer_verifier_sha256"),
+            ("controller", "controller_tag_signature_verifier_sha256"),
             "0" * 64,
-            "signer verifier digest",
+            "controller tag signature verifier digest",
+        ),
+        (
+            ("controller", "signer_freshness_verifier_sha256"),
+            "0" * 64,
+            "signer freshness verifier digest",
+        ),
+        (
+            ("policy", "trust_epoch"),
+            TRUST_EPOCH + 1,
+            "trust epoch",
         ),
         (
             ("controller", "repository_id"),
-            PINS.controller_repository_id + 1,
+            TRUST.controller_repository_id + 1,
             "controller binding",
         ),
         (
             ("ledger", "repository_id"),
-            PINS.ledger_repository_id + 1,
+            TRUST.ledger_repository_id + 1,
             "ledger binding",
         ),
     ],
@@ -453,21 +569,51 @@ def test_rejects_exact_workflow_bytes_changed_after_approval() -> None:
         validate(bundle)
 
 
-def test_rejects_exact_verifier_bytes_changed_after_approval() -> None:
+def test_rejects_exact_controller_tag_verifier_bytes_changed_after_approval() -> None:
     bundle = materials()
-    bundle["signer_verifier_raw"] += b"# post-approval mutation\n"
+    bundle["controller_tag_signature_verifier_raw"] += (
+        b"# post-approval mutation\n"
+    )
     with pytest.raises(
         MODULE.ApprovalV2OutputsError,
-        match="signer verifier digest",
+        match="controller tag signature verifier digest",
     ):
         validate(bundle)
 
 
-def test_rejects_verifier_that_matches_approval_but_not_audited_policy() -> None:
+def test_rejects_exact_signer_manifest_bytes_changed_after_approval() -> None:
     bundle = materials()
-    replacement = b"#!/bin/false\n"
-    bundle["signer_verifier_raw"] = replacement
-    bundle["approval"]["controller"]["signer_verifier_sha256"] = (
+    bundle["signer_freshness_verifier_manifest_raw"] += b" "
+    with pytest.raises(
+        MODULE.ApprovalV2OutputsError,
+        match="signer freshness verifier digest",
+    ):
+        validate(bundle)
+
+
+@pytest.mark.parametrize(
+    ("raw_key", "approval_key", "replacement"),
+    [
+        (
+            "controller_tag_signature_verifier_raw",
+            "controller_tag_signature_verifier_sha256",
+            b"#!/bin/false\n",
+        ),
+        (
+            "signer_freshness_verifier_manifest_raw",
+            "signer_freshness_verifier_sha256",
+            b'{"bundle_name":"attacker"}\n',
+        ),
+    ],
+)
+def test_rejects_verifier_that_matches_approval_but_not_audited_policy(
+    raw_key: str,
+    approval_key: str,
+    replacement: bytes,
+) -> None:
+    bundle = materials()
+    bundle[raw_key] = replacement
+    bundle["approval"]["controller"][approval_key] = (
         hashlib.sha256(replacement).hexdigest()
     )
     recanonicalize_approval(bundle)
@@ -482,18 +628,20 @@ def test_rejects_verifier_that_matches_approval_but_not_audited_policy() -> None
         validate(bundle)
 
 
-def test_rejects_policy_that_does_not_match_explicit_audited_pins() -> None:
+def test_rejects_policy_that_does_not_match_explicit_audited_epoch() -> None:
     bundle = materials()
-    changed_pins = MODULE.POLICY_V2.AuditedPins(
+    changed_trust = MODULE.POLICY_V2.AuditedTrustEpoch(
         **{
-            **bundle["pins"].__dict__,
-            "ledger_repository_id": bundle["pins"].ledger_repository_id + 1,
+            **bundle["trust"].__dict__,
+            "ledger_repository_id": (
+                bundle["trust"].ledger_repository_id + 1
+            ),
         }
     )
-    bundle["pins"] = changed_pins
+    bundle["trust"] = changed_trust
     with pytest.raises(
         MODULE.ApprovalV2OutputsError,
-        match="audited pins",
+        match="audited trust epoch",
     ):
         validate(bundle)
 
@@ -544,10 +692,14 @@ def prepared_files(
             tmp_path / "control-release.yml",
             selected["workflow_raw"],
         ),
-        "signer_verifier": write_file(
-            tmp_path / "signer-verifier.py",
-            selected["signer_verifier_raw"],
+        "controller_tag_signature_verifier": write_file(
+            tmp_path / "controller-tag-signature-verifier.py",
+            selected["controller_tag_signature_verifier_raw"],
             0o700,
+        ),
+        "signer_freshness_verifier_manifest": write_file(
+            tmp_path / "signer-freshness-verifier-manifest.json",
+            selected["signer_freshness_verifier_manifest_raw"],
         ),
         "github_output": write_file(
             tmp_path / "github-output",
@@ -566,8 +718,13 @@ def validate_files(
         ledger_summary_path=paths["ledger_summary"],
         policy_path=paths["policy"],
         workflow_path=paths["workflow"],
-        signer_verifier_path=paths["signer_verifier"],
-        audited_pins=bundle["pins"],
+        controller_tag_signature_verifier_path=(
+            paths["controller_tag_signature_verifier"]
+        ),
+        signer_freshness_verifier_manifest_path=(
+            paths["signer_freshness_verifier_manifest"]
+        ),
+        audited_trust_epoch=bundle["trust"],
         now=NOW,
     )
 
@@ -602,7 +759,8 @@ def test_stable_file_api_and_atomic_append_emit_only_allowlisted_lines(
         "ledger_summary",
         "policy",
         "workflow",
-        "signer_verifier",
+        "controller_tag_signature_verifier",
+        "signer_freshness_verifier_manifest",
     ],
 )
 def test_rejects_symlinked_input_files(
@@ -627,7 +785,8 @@ def test_rejects_symlinked_input_files(
         "ledger_summary",
         "policy",
         "workflow",
-        "signer_verifier",
+        "controller_tag_signature_verifier",
+        "signer_freshness_verifier_manifest",
     ],
 )
 def test_rejects_hardlinked_input_files(
@@ -652,7 +811,8 @@ def test_rejects_hardlinked_input_files(
         "ledger_summary",
         "policy",
         "workflow",
-        "signer_verifier",
+        "controller_tag_signature_verifier",
+        "signer_freshness_verifier_manifest",
     ],
 )
 def test_rejects_input_files_writable_by_other_accounts(
@@ -668,14 +828,24 @@ def test_rejects_input_files_writable_by_other_accounts(
         validate_files(bundle, paths)
 
 
+@pytest.mark.parametrize(
+    ("first_role", "second_role"),
+    [
+        ("workflow", "controller_tag_signature_verifier"),
+        (
+            "controller_tag_signature_verifier",
+            "signer_freshness_verifier_manifest",
+        ),
+    ],
+)
 def test_rejects_same_single_link_file_reused_for_two_input_roles(
     tmp_path: Path,
+    first_role: str,
+    second_role: str,
 ) -> None:
-    shared = b"shared reviewed bytes\n"
-    bundle = materials(workflow_raw=shared, verifier_raw=shared)
-    bundle, paths = prepared_files(tmp_path, bundle=bundle)
-    paths["signer_verifier"].unlink()
-    paths["signer_verifier"] = paths["workflow"]
+    bundle, paths = prepared_files(tmp_path)
+    paths[second_role].unlink()
+    paths[second_role] = paths[first_role]
     with pytest.raises(
         MODULE.ApprovalV2OutputsError,
         match="distinct identities",
@@ -964,7 +1134,64 @@ def test_cli_returns_78_for_missing_required_fixed_inputs() -> None:
     assert result.stdout == ""
 
 
-def test_cli_ignores_environment_pins_and_fails_closed_until_compiled_pins(
+def test_cli_rejects_legacy_signer_verifier_alias(capsys) -> None:
+    assert MODULE.main(["--signer-verifier", "legacy.py"]) == 78
+    captured = capsys.readouterr()
+    assert "invalid command line" in captured.err
+
+
+def test_cli_rejects_distinct_files_with_identical_verifier_role_bytes(
+    monkeypatch,
+    capsys,
+    tmp_path: Path,
+) -> None:
+    current = dt.datetime.now(dt.timezone.utc).replace(
+        microsecond=0,
+    ) - dt.timedelta(minutes=1)
+    shared = b'{"artifact":"must-have-one-role-only"}\n'
+    bundle = materials(
+        controller_tag_signature_verifier_raw=shared,
+        signer_freshness_verifier_manifest_raw=shared,
+        issued_at=current,
+    )
+    _, paths = prepared_files(tmp_path, bundle=bundle)
+    controller_identity = paths["controller_tag_signature_verifier"].stat()
+    signer_identity = paths["signer_freshness_verifier_manifest"].stat()
+    assert (controller_identity.st_dev, controller_identity.st_ino) != (
+        signer_identity.st_dev,
+        signer_identity.st_ino,
+    )
+    monkeypatch.setattr(
+        MODULE.POLICY_V2,
+        "PRODUCTION_AUDITED_TRUST_EPOCH",
+        bundle["trust"],
+    )
+    before = paths["github_output"].read_bytes()
+    result = MODULE.main(
+        [
+            "--approval",
+            str(paths["approval"]),
+            "--ledger-summary",
+            str(paths["ledger_summary"]),
+            "--policy",
+            str(paths["policy"]),
+            "--workflow",
+            str(paths["workflow"]),
+            "--controller-tag-signature-verifier",
+            str(paths["controller_tag_signature_verifier"]),
+            "--signer-freshness-verifier-manifest",
+            str(paths["signer_freshness_verifier_manifest"]),
+            "--github-output",
+            str(paths["github_output"]),
+        ]
+    )
+    assert result == 78
+    captured = capsys.readouterr()
+    assert "must use distinct bytes" in captured.err
+    assert paths["github_output"].read_bytes() == before
+
+
+def test_cli_ignores_environment_epoch_and_fails_until_compiled_epoch(
     tmp_path: Path,
 ) -> None:
     current = dt.datetime.now(dt.timezone.utc).replace(
@@ -985,8 +1212,10 @@ def test_cli_ignores_environment_pins_and_fails_closed_until_compiled_pins(
         str(paths["policy"]),
         "--workflow",
         str(paths["workflow"]),
-        "--signer-verifier",
-        str(paths["signer_verifier"]),
+        "--controller-tag-signature-verifier",
+        str(paths["controller_tag_signature_verifier"]),
+        "--signer-freshness-verifier-manifest",
+        str(paths["signer_freshness_verifier_manifest"]),
         "--github-output",
         str(paths["github_output"]),
     ]
@@ -996,10 +1225,10 @@ def test_cli_ignores_environment_pins_and_fails_closed_until_compiled_pins(
         env={
             **os.environ,
             "PYTHONDONTWRITEBYTECODE": "1",
-            "PRODUCTION_AUDITED_PINS": json.dumps(
-                bundle["pins"].__dict__,
+            "PRODUCTION_AUDITED_TRUST_EPOCH": json.dumps(
+                bundle["trust"].__dict__,
             ),
-            "CONTROL_POLICY_PINS": "attacker-controlled",
+            "CONTROL_TRUST_EPOCH": "attacker-controlled",
         },
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
@@ -1008,7 +1237,7 @@ def test_cli_ignores_environment_pins_and_fails_closed_until_compiled_pins(
         text=True,
     )
     assert result.returncode == 78
-    assert "audited production pins are unavailable" in result.stderr
+    assert "audited production trust epoch is unavailable" in result.stderr
     assert result.stdout == ""
     assert paths["github_output"].read_bytes() == before
 
@@ -1020,5 +1249,6 @@ def test_source_is_executable_and_disables_bytecode_before_imports() -> None:
     flag = source.index("sys.dont_write_bytecode = True")
     importlib_use = source.index("importlib.util.spec_from_file_location")
     assert flag < importlib_use
-    assert "PRODUCTION_AUDITED_PINS" in source
+    assert "PRODUCTION_AUDITED_TRUST_EPOCH" in source
+    assert 'add_argument("--signer-verifier"' not in source
     assert "os.environ" not in source

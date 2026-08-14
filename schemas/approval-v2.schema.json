@@ -62,7 +62,10 @@
           "minimum": 1,
           "type": "integer"
         },
-        "signer_verifier_sha256": {
+        "controller_tag_signature_verifier_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "signer_freshness_verifier_sha256": {
           "$ref": "#/$defs/sha256"
         },
         "tag_object_sha": {
@@ -84,7 +87,8 @@
         "immutable_release_id",
         "repository",
         "repository_id",
-        "signer_verifier_sha256",
+        "controller_tag_signature_verifier_sha256",
+        "signer_freshness_verifier_sha256",
         "tag_object_sha",
         "tag_ref",
         "workflow_path",
@@ -339,13 +343,19 @@
         },
         "repository": {
           "const": "PluckXD/tratto-control-release"
+        },
+        "trust_epoch": {
+          "maximum": 2147483647,
+          "minimum": 1,
+          "type": "integer"
         }
       },
       "required": [
         "digest_sha256",
         "name",
         "path",
-        "repository"
+        "repository",
+        "trust_epoch"
       ],
       "type": "object"
     },

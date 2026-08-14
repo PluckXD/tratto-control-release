@@ -46,7 +46,10 @@ CONTROLLER_REPOSITORY = "PluckXD/tratto-control-release"
 LEDGER_REPOSITORY = "PluckXD/tratto-control-release-ledger"
 CARRIER_REPOSITORY = "PluckXD/tratto-control-release-carrier"
 WORKFLOW_PATH = ".github/workflows/control-release.yml"
+ENVELOPE_PROFILE = "control-release-permanent-v6"
+FRESHNESS_EVIDENCE_MODEL = "workflow-signed-summary-v1"
 MAX_FILE_BYTES = 1024 * 1024
+MAX_WORKFLOW_RUN_VALUE = 2**63 - 1
 
 TOP_KEYS = {
     "approval",
@@ -54,6 +57,7 @@ TOP_KEYS = {
     "behavioral_verification",
     "carrier",
     "controller",
+    "envelope_profile",
     "ledger",
     "migration",
     "schema_version",
@@ -91,7 +95,8 @@ CONTROLLER_KEYS = {
     "runner_arch",
     "runner_environment",
     "runner_os",
-    "signer_verifier_sha256",
+    "controller_tag_signature_verifier_sha256",
+    "signer_freshness_verifier_sha256",
     "source_ref",
     "tag_object_sha",
     "tag_ref",
@@ -114,11 +119,14 @@ LEDGER_KEYS = {
 }
 SIGNER_FRESHNESS_KEYS = {
     "controller_tag_attestation_sha256",
+    "evidence_model",
     "github_controls_attestation_sha256",
     "ledger_attestation_sha256",
     "ledger_head_sha",
     "revalidated_immediately_before_signature",
+    "workflow_run",
 }
+WORKFLOW_RUN_KEYS = {"repository_id", "run_attempt", "run_id"}
 BEHAVIOR_KEYS = {
     "artifacts",
     "api_sha",
@@ -220,9 +228,18 @@ def require_pattern(
     return value
 
 
-def require_positive_integer(value: Any, label: str) -> int:
-    if type(value) is not int or value <= 0:
-        reject(f"{label} must be a positive integer")
+def require_positive_integer(
+    value: Any,
+    label: str,
+    *,
+    maximum: int | None = None,
+) -> int:
+    if (
+        type(value) is not int
+        or value <= 0
+        or (maximum is not None and value > maximum)
+    ):
+        reject(f"{label} must be a bounded positive integer")
     return value
 
 
@@ -394,11 +411,14 @@ def validate_controller(
     )
     expected = {
         "commit_sha": approval_controller["commit_sha"],
+        "controller_tag_signature_verifier_sha256": approval_controller[
+            "controller_tag_signature_verifier_sha256"
+        ],
         "immutable_release_id": approval_controller["immutable_release_id"],
         "repository": approval_controller["repository"],
         "repository_id": approval_controller["repository_id"],
-        "signer_verifier_sha256": approval_controller[
-            "signer_verifier_sha256"
+        "signer_freshness_verifier_sha256": approval_controller[
+            "signer_freshness_verifier_sha256"
         ],
         "tag_object_sha": approval_controller["tag_object_sha"],
         "tag_ref": tag_ref,
@@ -420,14 +440,20 @@ def validate_controller(
         or controller["owner_enforced"] is not True
     ):
         reject("controller execution identity diverges")
-    require_positive_integer(controller["run_id"], "controller.run_id")
+    require_positive_integer(
+        controller["run_id"],
+        "controller.run_id",
+        maximum=MAX_WORKFLOW_RUN_VALUE,
+    )
     require_positive_integer(
         controller["run_attempt"],
         "controller.run_attempt",
+        maximum=MAX_WORKFLOW_RUN_VALUE,
     )
     require_positive_integer(
         controller["repository_id"],
         "controller.repository_id",
+        maximum=MAX_WORKFLOW_RUN_VALUE,
     )
     require_positive_integer(
         controller["immutable_release_id"],
@@ -440,8 +466,17 @@ def validate_controller(
         "workflow_sha",
     ):
         require_pattern(controller[key], SHA1_RE, f"controller.{key}")
-    for key in ("signer_verifier_sha256", "workflow_sha256"):
+    for key in (
+        "controller_tag_signature_verifier_sha256",
+        "signer_freshness_verifier_sha256",
+        "workflow_sha256",
+    ):
         require_pattern(controller[key], SHA256_RE, f"controller.{key}")
+    if (
+        controller["controller_tag_signature_verifier_sha256"]
+        == controller["signer_freshness_verifier_sha256"]
+    ):
+        reject("controller verifier roles must use distinct digests")
     if (
         controller["github_sha"] != controller["commit_sha"]
         or controller["workflow_sha"] != controller["commit_sha"]
@@ -499,6 +534,7 @@ def validate_ledger(
 def validate_signer_freshness(
     value: Any,
     ledger_head_sha: str,
+    controller: Mapping[str, Any],
 ) -> Mapping[str, Any]:
     freshness = exact_keys(
         value,
@@ -507,6 +543,24 @@ def validate_signer_freshness(
     )
     if freshness["ledger_head_sha"] != ledger_head_sha:
         reject("signer freshness is not bound to the validated ledger head")
+    if freshness["evidence_model"] != FRESHNESS_EVIDENCE_MODEL:
+        reject("signer freshness evidence model diverges")
+    workflow_run = exact_keys(
+        freshness["workflow_run"],
+        WORKFLOW_RUN_KEYS,
+        "signer_freshness.workflow_run",
+    )
+    for key in WORKFLOW_RUN_KEYS:
+        require_positive_integer(
+            workflow_run[key],
+            f"signer_freshness.workflow_run.{key}",
+            maximum=MAX_WORKFLOW_RUN_VALUE,
+        )
+        if workflow_run[key] != controller[key]:
+            reject(
+                "signer freshness workflow run scope diverges from "
+                f"controller.{key}"
+            )
     require_pattern(
         freshness["ledger_head_sha"],
         SHA1_RE,
@@ -604,6 +658,8 @@ def validate(value: Mapping[str, Any]) -> dict[str, Any]:
         or envelope["schema_version"] != 6
     ):
         reject("envelope schema_version must be integer 6")
+    if envelope["envelope_profile"] != ENVELOPE_PROFILE:
+        reject("envelope profile must be control-release-permanent-v6")
 
     carrier = exact_keys(
         envelope["carrier"],
@@ -657,7 +713,10 @@ def validate(value: Mapping[str, Any]) -> dict[str, Any]:
     approval_ledger = validated_manifest["ledger"]
     assert isinstance(approval_controller, Mapping)
     assert isinstance(approval_ledger, Mapping)
-    validate_controller(envelope["controller"], approval_controller)
+    controller = validate_controller(
+        envelope["controller"],
+        approval_controller,
+    )
     ledger = validate_ledger(
         envelope["ledger"],
         approval_ledger,
@@ -666,6 +725,7 @@ def validate(value: Mapping[str, Any]) -> dict[str, Any]:
     validate_signer_freshness(
         envelope["signer_freshness"],
         ledger["head_sha"],
+        controller,
     )
 
     artifacts = exact_keys(
@@ -739,10 +799,14 @@ def main(arguments: list[str] | None = None) -> int:
         json.dumps(
             {
                 "controller_tag_ref": value["controller"]["tag_ref"],
+                "envelope_profile": value["envelope_profile"],
                 "envelope_sha256": hashlib.sha256(raw).hexdigest(),
                 "ledger_head_sha": value["ledger"]["head_sha"],
                 "release_id": value["approval"]["manifest"]["release_id"],
                 "schema_version": value["schema_version"],
+                "trust_epoch": value["approval"]["manifest"]["policy"][
+                    "trust_epoch"
+                ],
             },
             separators=(",", ":"),
             sort_keys=True,

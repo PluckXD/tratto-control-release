@@ -6,13 +6,14 @@ environment-specific trust pin is empty or zero.  Production activation
 requires two deliberate changes reviewed together:
 
 * replace every placeholder in ``control-production-v2.json``; and
-* replace ``PRODUCTION_AUDITED_PINS`` below with the independently audited
-  values.
+* replace ``PRODUCTION_AUDITED_TRUST_EPOCH`` below with the independently
+  audited epoch tuple.
 
-The CLI never accepts pins from arguments or the environment.  The pure
-``validate_bytes`` API accepts an explicit, typed ``AuditedPins`` value so
-offline tests and reviewers can validate a prospective configured document
-without weakening the production command.
+The CLI never accepts trust bindings from arguments or the environment.  The
+``validate_bytes`` API accepts an explicit, typed ``AuditedTrustEpoch`` value
+so offline tests and reviewers can validate a prospective configured document
+without weakening the production command.  The epoch number and every dynamic
+trust binding form one indivisible tuple: partial rotations are rejected.
 
 The controller commit SHA, concrete tag ref, annotated-tag object SHA and
 immutable release ID are intentionally absent.  A policy stored inside the
@@ -52,6 +53,7 @@ RUNTIME_POLICY_SHA256 = (
 )
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
+MAX_TRUST_EPOCH = 2_147_483_647
 
 TOP_KEYS = {
     "approval_max_seconds",
@@ -71,6 +73,7 @@ TOP_KEYS = {
     "schema_version",
     "signer_allows_product_credentials",
     "signer_allows_source_checkout",
+    "trust_epoch",
 }
 CONTROLLER_KEYS = {
     "immutable_release_required",
@@ -81,9 +84,10 @@ CONTROLLER_KEYS = {
     "tag_ref_pattern",
     "tag_ref_prefix",
     "tag_signature_claim_authorizes_release",
-    "tag_signature_trust_root_sha256",
+    "controller_tag_signature_trust_root_sha256",
     "tag_signature_verification_mode",
-    "tag_signature_verifier_sha256",
+    "controller_tag_signature_verifier_sha256",
+    "signer_freshness_verifier_sha256",
     "workflow_path",
     "workflow_sha256",
 }
@@ -102,7 +106,7 @@ RUNTIME_POLICY_KEYS = {"digest_sha256", "name", "path"}
 
 
 class ProductionPolicyError(ValueError):
-    """The policy is ambiguous, unavailable, or diverges from reviewed pins."""
+    """The policy is ambiguous, unavailable, or diverges from its epoch."""
 
 
 def reject(message: str) -> None:
@@ -110,26 +114,30 @@ def reject(message: str) -> None:
 
 
 @dataclass(frozen=True)
-class AuditedPins:
+class AuditedTrustEpoch:
+    trust_epoch: int
     controller_repository_id: int
     controller_workflow_sha256: str
-    controller_tag_trust_root_sha256: str
-    controller_tag_verifier_sha256: str
+    controller_tag_signature_trust_root_sha256: str
+    controller_tag_signature_verifier_sha256: str
+    signer_freshness_verifier_sha256: str
     ledger_repository_id: int
     ledger_genesis_sha: str
 
 
-UNCONFIGURED_PINS = AuditedPins(
+UNCONFIGURED_TRUST_EPOCH = AuditedTrustEpoch(
+    trust_epoch=0,
     controller_repository_id=0,
     controller_workflow_sha256="",
-    controller_tag_trust_root_sha256="",
-    controller_tag_verifier_sha256="",
+    controller_tag_signature_trust_root_sha256="",
+    controller_tag_signature_verifier_sha256="",
+    signer_freshness_verifier_sha256="",
     ledger_repository_id=0,
     ledger_genesis_sha="",
 )
 
 # Deliberately unavailable until all values are independently audited.
-PRODUCTION_AUDITED_PINS = UNCONFIGURED_PINS
+PRODUCTION_AUDITED_TRUST_EPOCH = UNCONFIGURED_TRUST_EPOCH
 
 
 def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -153,11 +161,11 @@ def canonical_bytes(value: dict[str, Any]) -> bytes:
     ).encode("utf-8")
 
 
-def expected_policy(pins: AuditedPins) -> dict[str, Any]:
-    """Build the sole policy value allowed for a given set of audited pins."""
+def expected_policy(trust_epoch: AuditedTrustEpoch) -> dict[str, Any]:
+    """Build the sole policy value allowed for one audited epoch tuple."""
 
-    if type(pins) is not AuditedPins:
-        reject("audited pins must use the typed contract")
+    if type(trust_epoch) is not AuditedTrustEpoch:
+        reject("audited trust epoch must use the typed contract")
     return {
         "approval_max_seconds": 86400,
         "approval_path_prefix": "approvals/",
@@ -169,33 +177,36 @@ def expected_policy(pins: AuditedPins) -> dict[str, Any]:
         "controller": {
             "immutable_release_required": True,
             "repository": CONTROLLER_REPOSITORY,
-            "repository_id": pins.controller_repository_id,
+            "repository_id": trust_epoch.controller_repository_id,
             "require_owner_enforcement": True,
             "signed_annotated_tag_required": True,
             "tag_ref_pattern": CONTROLLER_TAG_PATTERN,
             "tag_ref_prefix": CONTROLLER_TAG_PREFIX,
             "tag_signature_claim_authorizes_release": False,
-            "tag_signature_trust_root_sha256": (
-                pins.controller_tag_trust_root_sha256
+            "controller_tag_signature_trust_root_sha256": (
+                trust_epoch.controller_tag_signature_trust_root_sha256
             ),
             "tag_signature_verification_mode": (
                 "local-cryptographic-annotated-tag-object"
             ),
-            "tag_signature_verifier_sha256": (
-                pins.controller_tag_verifier_sha256
+            "controller_tag_signature_verifier_sha256": (
+                trust_epoch.controller_tag_signature_verifier_sha256
+            ),
+            "signer_freshness_verifier_sha256": (
+                trust_epoch.signer_freshness_verifier_sha256
             ),
             "workflow_path": CONTROLLER_WORKFLOW_PATH,
-            "workflow_sha256": pins.controller_workflow_sha256,
+            "workflow_sha256": trust_epoch.controller_workflow_sha256,
         },
         "controller_repository": CONTROLLER_REPOSITORY,
         "ledger": {
             "append_only": True,
             "approval_schema_version": 2,
-            "genesis_sha": pins.ledger_genesis_sha,
+            "genesis_sha": trust_epoch.ledger_genesis_sha,
             "linear_single_parent": True,
             "ref": LEDGER_REF,
             "repository": LEDGER_REPOSITORY,
-            "repository_id": pins.ledger_repository_id,
+            "repository_id": trust_epoch.ledger_repository_id,
             "require_unchanged_head_at_signature": True,
             "signer_revalidation_timing": (
                 "immediately-before-signature"
@@ -215,6 +226,7 @@ def expected_policy(pins: AuditedPins) -> dict[str, Any]:
         "schema_version": 2,
         "signer_allows_product_credentials": False,
         "signer_allows_source_checkout": False,
+        "trust_epoch": trust_epoch.trust_epoch,
     }
 
 
@@ -257,17 +269,35 @@ def configured_bindings(value: dict[str, Any]) -> bool:
     controller = value["controller"]
     ledger = value["ledger"]
     return (
-        type(controller["repository_id"]) is int
+        type(value["trust_epoch"]) is int
+        and 1 <= value["trust_epoch"] <= MAX_TRUST_EPOCH
+        and type(controller["repository_id"]) is int
         and controller["repository_id"] > 0
         and valid_sha(controller["workflow_sha256"], SHA256_RE)
         and valid_sha(
-            controller["tag_signature_trust_root_sha256"],
+            controller["controller_tag_signature_trust_root_sha256"],
             SHA256_RE,
         )
         and valid_sha(
-            controller["tag_signature_verifier_sha256"],
+            controller["controller_tag_signature_verifier_sha256"],
             SHA256_RE,
         )
+        and valid_sha(
+            controller["signer_freshness_verifier_sha256"],
+            SHA256_RE,
+        )
+        and len(
+            {
+                controller[
+                    "controller_tag_signature_trust_root_sha256"
+                ],
+                controller[
+                    "controller_tag_signature_verifier_sha256"
+                ],
+                controller["signer_freshness_verifier_sha256"],
+            }
+        )
+        == 3
         and type(ledger["repository_id"]) is int
         and ledger["repository_id"] > 0
         and valid_sha(ledger["genesis_sha"], SHA1_RE)
@@ -278,11 +308,14 @@ def unconfigured_bindings(value: dict[str, Any]) -> bool:
     controller = value["controller"]
     ledger = value["ledger"]
     return (
-        type(controller["repository_id"]) is int
+        type(value["trust_epoch"]) is int
+        and value["trust_epoch"] == 0
+        and type(controller["repository_id"]) is int
         and controller["repository_id"] == 0
         and controller["workflow_sha256"] == ""
-        and controller["tag_signature_trust_root_sha256"] == ""
-        and controller["tag_signature_verifier_sha256"] == ""
+        and controller["controller_tag_signature_trust_root_sha256"] == ""
+        and controller["controller_tag_signature_verifier_sha256"] == ""
+        and controller["signer_freshness_verifier_sha256"] == ""
         and type(ledger["repository_id"]) is int
         and ledger["repository_id"] == 0
         and ledger["genesis_sha"] == ""
@@ -303,15 +336,16 @@ def validate_shape(value: Any) -> dict[str, Any]:
         "runtime policy reference",
     )
 
-    static_expected = expected_policy(UNCONFIGURED_PINS)
+    static_expected = expected_policy(UNCONFIGURED_TRUST_EPOCH)
     dynamic_controller = {
         "repository_id",
-        "tag_signature_trust_root_sha256",
-        "tag_signature_verifier_sha256",
+        "controller_tag_signature_trust_root_sha256",
+        "controller_tag_signature_verifier_sha256",
+        "signer_freshness_verifier_sha256",
         "workflow_sha256",
     }
     dynamic_ledger = {"genesis_sha", "repository_id"}
-    for key in TOP_KEYS - {"controller", "ledger"}:
+    for key in TOP_KEYS - {"controller", "ledger", "trust_epoch"}:
         if policy[key] != static_expected[key]:
             reject(f"production policy fixed field diverges: {key}")
     for key in CONTROLLER_KEYS - dynamic_controller:
@@ -332,34 +366,36 @@ def validate_shape(value: Any) -> dict[str, Any]:
     return policy
 
 
-def validate_audited_pins(pins: AuditedPins) -> AuditedPins:
-    if type(pins) is not AuditedPins:
-        reject("audited pins must use the typed contract")
-    candidate = expected_policy(pins)
+def validate_audited_trust_epoch(
+    trust_epoch: AuditedTrustEpoch,
+) -> AuditedTrustEpoch:
+    if type(trust_epoch) is not AuditedTrustEpoch:
+        reject("audited trust epoch must use the typed contract")
+    candidate = expected_policy(trust_epoch)
     if not configured_bindings(candidate):
-        reject("audited production pins are unavailable or invalid")
-    return pins
+        reject("audited production trust epoch is unavailable or invalid")
+    return trust_epoch
 
 
 def validate_value(
     value: Any,
     *,
-    audited_pins: AuditedPins,
+    audited_trust_epoch: AuditedTrustEpoch,
 ) -> dict[str, Any]:
     policy = validate_shape(value)
-    pins = validate_audited_pins(audited_pins)
-    if policy != expected_policy(pins):
-        reject("production policy does not match the audited pins")
+    trust_epoch = validate_audited_trust_epoch(audited_trust_epoch)
+    if policy != expected_policy(trust_epoch):
+        reject("production policy does not match the audited trust epoch")
     return policy
 
 
 def validate_bytes(
     raw: bytes,
     *,
-    audited_pins: AuditedPins,
+    audited_trust_epoch: AuditedTrustEpoch,
 ) -> tuple[dict[str, Any], str]:
     value = parse_canonical(raw)
-    validate_value(value, audited_pins=audited_pins)
+    validate_value(value, audited_trust_epoch=audited_trust_epoch)
     return value, hashlib.sha256(raw).hexdigest()
 
 
@@ -367,7 +403,7 @@ def validate_template_bytes(raw: bytes) -> tuple[dict[str, Any], str]:
     """Validate the canonical unavailable template without authorizing it."""
 
     value = validate_shape(parse_canonical(raw))
-    if value != expected_policy(UNCONFIGURED_PINS):
+    if value != expected_policy(UNCONFIGURED_TRUST_EPOCH):
         reject("checked-in policy is not the unavailable template")
     return value, hashlib.sha256(raw).hexdigest()
 
@@ -464,7 +500,7 @@ def main(argv: list[str] | None = None) -> int:
         validate_shape(value)
         validate_value(
             value,
-            audited_pins=PRODUCTION_AUDITED_PINS,
+            audited_trust_epoch=PRODUCTION_AUDITED_TRUST_EPOCH,
         )
     except ProductionPolicyError as error:
         print(f"production policy rejected: {error}", file=sys.stderr)

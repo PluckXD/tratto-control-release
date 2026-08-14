@@ -28,11 +28,13 @@ sys.modules[SPEC.name] = GATE
 SPEC.loader.exec_module(GATE)
 
 
-PINS = GATE.POLICY.AuditedPins(
+TRUST_EPOCH = GATE.POLICY.AuditedTrustEpoch(
+    trust_epoch=7,
     controller_repository_id=123456789,
     controller_workflow_sha256="3" * 64,
-    controller_tag_trust_root_sha256="6" * 64,
-    controller_tag_verifier_sha256="4" * 64,
+    controller_tag_signature_trust_root_sha256="6" * 64,
+    controller_tag_signature_verifier_sha256="4" * 64,
+    signer_freshness_verifier_sha256="7" * 64,
     ledger_repository_id=234567890,
     ledger_genesis_sha="5" * 40,
 )
@@ -45,7 +47,7 @@ def canonical(value: dict) -> bytes:
 
 
 def configured_policy() -> dict:
-    return GATE.POLICY.expected_policy(PINS)
+    return GATE.POLICY.expected_policy(TRUST_EPOCH)
 
 
 def ready_readiness() -> dict:
@@ -67,7 +69,7 @@ def github_context(phase: str = "authorize") -> dict[str, str]:
         **GATE.STATIC_CONTEXT,
         "GITHUB_REF": TAG_REF,
         "GITHUB_REPOSITORY": repository,
-        "GITHUB_REPOSITORY_ID": str(PINS.controller_repository_id),
+        "GITHUB_REPOSITORY_ID": str(TRUST_EPOCH.controller_repository_id),
         "GITHUB_SHA": COMMIT_SHA,
         "GITHUB_WORKFLOW_REF": (
             f"{repository}/{workflow_path}@{TAG_REF}"
@@ -91,7 +93,7 @@ def validate(
     *,
     readiness: dict | None = None,
     policy: dict | None = None,
-    pins=PINS,
+    trust_epoch=TRUST_EPOCH,
     environment: dict[str, str] | None = None,
 ):
     return GATE.validate_release_gate(
@@ -99,7 +101,7 @@ def validate(
         policy_raw=GATE.POLICY.canonical_bytes(
             policy or configured_policy()
         ),
-        audited_pins=pins,
+        audited_trust_epoch=trust_epoch,
         phase=phase,
         environment=environment or github_context(phase),
     )
@@ -131,6 +133,7 @@ def test_checked_in_readiness_v2_is_canonical_and_unavailable() -> None:
     assert value["required_approval_schema"] == 2
     assert value["required_policy_schema"] == 2
     assert value["required_ops_install_mode"] == "atomic-quiesced"
+    assert "trust_epoch" not in value
     assert {item["id"] for item in value["blockers"]} == EXPECTED_BLOCKERS
     joined = " ".join(item["resolution"] for item in value["blockers"])
     for required in (
@@ -166,6 +169,7 @@ def test_pure_api_accepts_every_phase_with_explicit_configured_policy(
         "readiness_sha256": hashlib.sha256(
             canonical(ready_readiness())
         ).hexdigest(),
+        "trust_epoch": TRUST_EPOCH.trust_epoch,
     }
 
 
@@ -286,8 +290,14 @@ def test_readiness_file_loader_rejects_symlink_and_hardlink(
         ("GITHUB_EVENT_NAME", "push"),
         ("GITHUB_REF_TYPE", "branch"),
         ("GITHUB_REPOSITORY", "PluckXD/tratto-api"),
-        ("GITHUB_REPOSITORY_ID", str(PINS.controller_repository_id + 1)),
-        ("GITHUB_REPOSITORY_ID", f"0{PINS.controller_repository_id}"),
+        (
+            "GITHUB_REPOSITORY_ID",
+            str(TRUST_EPOCH.controller_repository_id + 1),
+        ),
+        (
+            "GITHUB_REPOSITORY_ID",
+            f"0{TRUST_EPOCH.controller_repository_id}",
+        ),
         ("RUNNER_ENVIRONMENT", "self-hosted"),
         ("RUNNER_OS", "Windows"),
         ("RUNNER_ARCH", "ARM64"),
@@ -448,30 +458,30 @@ def test_builder_may_receive_only_its_explicit_source_credential(
     validate(phase, environment=environment)
 
 
-def test_policy_must_be_configured_and_match_explicit_audited_pins() -> None:
+def test_policy_must_match_one_explicit_audited_trust_epoch() -> None:
     template_raw = POLICY_PATH.read_bytes()
     with pytest.raises(
         GATE.GateV2Error,
-        match="audited production pins are unavailable",
+        match="audited production trust epoch is unavailable",
     ):
         GATE.validate_release_gate(
             readiness_raw=canonical(ready_readiness()),
             policy_raw=template_raw,
-            audited_pins=GATE.POLICY.PRODUCTION_AUDITED_PINS,
+            audited_trust_epoch=(
+                GATE.POLICY.PRODUCTION_AUDITED_TRUST_EPOCH
+            ),
             phase="authorize",
             environment=github_context(),
         )
 
-    wrong_pins = GATE.POLICY.AuditedPins(
+    wrong_epoch = GATE.POLICY.AuditedTrustEpoch(
         **{
-            **PINS.__dict__,
-            "controller_repository_id": (
-                PINS.controller_repository_id + 1
-            ),
+            **TRUST_EPOCH.__dict__,
+            "trust_epoch": TRUST_EPOCH.trust_epoch + 1,
         }
     )
-    with pytest.raises(GATE.GateV2Error, match="audited pins"):
-        validate(pins=wrong_pins)
+    with pytest.raises(GATE.GateV2Error, match="audited trust epoch"):
+        validate(trust_epoch=wrong_epoch)
 
 
 def test_readiness_and_policy_schema_bindings_must_match() -> None:
@@ -492,10 +502,10 @@ def test_cli_uses_only_checked_in_unavailable_policy_and_returns_78() -> None:
         **os.environ,
         **github_context(),
         "CONTROL_CONTROLLER_REPOSITORY_ID": str(
-            PINS.controller_repository_id
+            TRUST_EPOCH.controller_repository_id
         ),
-        "CONTROL_LEDGER_GENESIS_SHA": PINS.ledger_genesis_sha,
-        "CONTROL_POLICY_PINS_JSON": json.dumps(PINS.__dict__),
+        "CONTROL_LEDGER_GENESIS_SHA": TRUST_EPOCH.ledger_genesis_sha,
+        "CONTROL_POLICY_TRUST_EPOCH_JSON": json.dumps(TRUST_EPOCH.__dict__),
     }
     completed = subprocess.run(
         [
@@ -512,7 +522,9 @@ def test_cli_uses_only_checked_in_unavailable_policy_and_returns_78() -> None:
         text=True,
     )
     assert completed.returncode == 78
-    assert "audited production pins are unavailable" in completed.stderr
+    assert (
+        "audited production trust epoch is unavailable" in completed.stderr
+    )
     assert not completed.stdout
 
 
@@ -521,8 +533,8 @@ def test_cli_uses_only_checked_in_unavailable_policy_and_returns_78() -> None:
     [
         ["--readiness", "/tmp/ready.json"],
         ["--policy", "/tmp/policy.json"],
-        ["--repository-id", str(PINS.controller_repository_id)],
-        ["--ledger-genesis-sha", PINS.ledger_genesis_sha],
+        ["--repository-id", str(TRUST_EPOCH.controller_repository_id)],
+        ["--ledger-genesis-sha", TRUST_EPOCH.ledger_genesis_sha],
     ],
 )
 def test_cli_accepts_no_document_or_trust_pin_overrides(

@@ -3,15 +3,16 @@
 
 The ledger summary is evidence produced by the independent ledger validator,
 not an authority by itself.  This module binds that evidence to a current
-canonical approval, the separately audited production policy, and the exact
-reviewed workflow/verifier bytes before exposing a deliberately small set of
-single-line GitHub outputs.
+canonical approval, the separately audited production policy and trust epoch,
+the exact reviewed workflow and controller-tag verifier bytes, and the exact
+canonical source-free signer-freshness verifier manifest bytes before exposing
+a deliberately small set of single-line GitHub outputs.
 
 The command-line interface never accepts trust pins from arguments or the
 environment.  Production remains unavailable while
-``validate-policy-v2.py::PRODUCTION_AUDITED_PINS`` is unconfigured.  The pure
-``validate_inputs`` API accepts explicit typed pins for offline tests and
-independent review.
+``validate-policy-v2.py::PRODUCTION_AUDITED_TRUST_EPOCH`` is unconfigured.  The
+pure ``validate_inputs`` API accepts an explicit typed ``AuditedTrustEpoch`` for
+offline tests and independent review.
 """
 
 from __future__ import annotations
@@ -56,6 +57,7 @@ POLICY_V2 = load_fixed_module(
     "control_release_emit_policy_v2_validator",
     "validate-policy-v2.py",
 )
+AuditedTrustEpoch = POLICY_V2.AuditedTrustEpoch
 
 SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -82,11 +84,15 @@ OUTPUT_KEYS = (
     "web_sha",
     "release_id",
     "approval_sha256",
+    "policy_sha256",
     "ledger_head_sha",
     "controller_commit_sha",
+    "controller_tag_signature_verifier_sha256",
     "controller_tag_ref",
     "controller_tag_object_sha",
     "controller_release_id",
+    "signer_freshness_verifier_sha256",
+    "trust_epoch",
 )
 OUTPUT_PATTERNS = {
     "api_sha": SHA1_RE,
@@ -94,11 +100,15 @@ OUTPUT_PATTERNS = {
     "web_sha": SHA1_RE,
     "release_id": RELEASE_ID_RE,
     "approval_sha256": SHA256_RE,
+    "policy_sha256": SHA256_RE,
     "ledger_head_sha": SHA1_RE,
     "controller_commit_sha": SHA1_RE,
+    "controller_tag_signature_verifier_sha256": SHA256_RE,
     "controller_tag_ref": CONTROLLER_TAG_RE,
     "controller_tag_object_sha": SHA1_RE,
     "controller_release_id": re.compile(r"^[1-9][0-9]{0,18}$"),
+    "signer_freshness_verifier_sha256": SHA256_RE,
+    "trust_epoch": re.compile(r"^[1-9][0-9]*$"),
 }
 
 
@@ -190,8 +200,14 @@ def validate_policy_bindings(
     approval_controller = approval["controller"]
     policy_controller = policy["controller"]
     controller_bindings = {
+        "controller_tag_signature_verifier_sha256": (
+            "controller_tag_signature_verifier_sha256"
+        ),
         "repository": "repository",
         "repository_id": "repository_id",
+        "signer_freshness_verifier_sha256": (
+            "signer_freshness_verifier_sha256"
+        ),
         "workflow_path": "workflow_path",
         "workflow_sha256": "workflow_sha256",
     }
@@ -204,12 +220,9 @@ def validate_policy_bindings(
                 "approval controller binding diverges from audited policy: "
                 f"{approval_key}"
             )
-    if (
-        approval_controller["signer_verifier_sha256"]
-        != policy_controller["tag_signature_verifier_sha256"]
-    ):
+    if approval["policy"]["trust_epoch"] != policy["trust_epoch"]:
         reject(
-            "approval signer verifier binding diverges from audited policy"
+            "approval trust epoch diverges from audited policy"
         )
 
     approval_ledger = approval["ledger"]
@@ -228,15 +241,16 @@ def validate_inputs(
     ledger_summary_raw: bytes,
     policy_raw: bytes,
     workflow_raw: bytes,
-    signer_verifier_raw: bytes,
-    audited_pins: Any,
+    controller_tag_signature_verifier_raw: bytes,
+    signer_freshness_verifier_manifest_raw: bytes,
+    audited_trust_epoch: AuditedTrustEpoch,
     now: dt.datetime | None = None,
 ) -> dict[str, str]:
     """Validate immutable input bytes and return the sole allowed outputs.
 
     This function performs no filesystem, environment, subprocess, network, or
-    output operations.  Callers must provide the typed ``AuditedPins`` contract
-    defined by the fixed production-policy validator.
+    output operations.  Callers must provide the typed ``AuditedTrustEpoch``
+    contract defined by the fixed production-policy validator.
     """
 
     for raw, maximum, label in (
@@ -253,13 +267,26 @@ def validate_inputs(
             "controller workflow",
         ),
         (
-            signer_verifier_raw,
+            controller_tag_signature_verifier_raw,
             MAX_REVIEWED_SOURCE_BYTES,
-            "signer verifier",
+            "controller tag signature verifier",
+        ),
+        (
+            signer_freshness_verifier_manifest_raw,
+            MAX_REVIEWED_SOURCE_BYTES,
+            "signer freshness verifier manifest",
         ),
     ):
         if type(raw) is not bytes or not 0 < len(raw) <= maximum:
             reject(f"{label} bytes have an invalid size")
+    if (
+        controller_tag_signature_verifier_raw
+        == signer_freshness_verifier_manifest_raw
+    ):
+        reject(
+            "controller tag signature verifier and signer freshness verifier "
+            "manifest must use distinct bytes"
+        )
 
     try:
         approval = APPROVAL_V2.validate_bytes(
@@ -274,7 +301,7 @@ def validate_inputs(
     try:
         policy, policy_sha256 = POLICY_V2.validate_bytes(
             policy_raw,
-            audited_pins=audited_pins,
+            audited_trust_epoch=audited_trust_epoch,
         )
     except POLICY_V2.ProductionPolicyError as error:
         reject(f"production policy rejected: {error}")
@@ -284,9 +311,20 @@ def validate_inputs(
     summary = parse_ledger_summary(ledger_summary_raw)
     approval_sha256 = hashlib.sha256(approval_raw).hexdigest()
     workflow_sha256 = hashlib.sha256(workflow_raw).hexdigest()
-    signer_verifier_sha256 = hashlib.sha256(
-        signer_verifier_raw
+    controller_tag_signature_verifier_sha256 = hashlib.sha256(
+        controller_tag_signature_verifier_raw
     ).hexdigest()
+    signer_freshness_verifier_sha256 = hashlib.sha256(
+        signer_freshness_verifier_manifest_raw
+    ).hexdigest()
+    if (
+        controller_tag_signature_verifier_sha256
+        == signer_freshness_verifier_sha256
+    ):
+        reject(
+            "controller tag signature verifier and signer freshness verifier "
+            "manifest must use distinct SHA-256 digests"
+        )
 
     if approval["policy"]["digest_sha256"] != policy_sha256:
         reject("approval policy digest diverges from exact policy bytes")
@@ -294,9 +332,21 @@ def validate_inputs(
     controller = approval["controller"]
     if controller["workflow_sha256"] != workflow_sha256:
         reject("approval workflow digest diverges from exact workflow bytes")
-    if controller["signer_verifier_sha256"] != signer_verifier_sha256:
+    if (
+        controller["controller_tag_signature_verifier_sha256"]
+        != controller_tag_signature_verifier_sha256
+    ):
         reject(
-            "approval signer verifier digest diverges from exact verifier bytes"
+            "approval controller tag signature verifier digest diverges from "
+            "exact verifier bytes"
+        )
+    if (
+        controller["signer_freshness_verifier_sha256"]
+        != signer_freshness_verifier_sha256
+    ):
+        reject(
+            "approval signer freshness verifier digest diverges from exact "
+            "source-free manifest bytes"
         )
     validate_policy_bindings(approval, policy)
 
@@ -329,11 +379,19 @@ def validate_inputs(
         "web_sha": approval["web"]["commit_sha"],
         "release_id": approval["release_id"],
         "approval_sha256": approval_sha256,
+        "policy_sha256": policy_sha256,
         "ledger_head_sha": summary["head_sha"],
         "controller_commit_sha": controller["commit_sha"],
+        "controller_tag_signature_verifier_sha256": (
+            controller_tag_signature_verifier_sha256
+        ),
         "controller_tag_ref": controller["tag_ref"],
         "controller_tag_object_sha": controller["tag_object_sha"],
         "controller_release_id": str(release_number),
+        "signer_freshness_verifier_sha256": (
+            signer_freshness_verifier_sha256
+        ),
+        "trust_epoch": str(approval["policy"]["trust_epoch"]),
     }
     validate_output_values(outputs)
     return outputs
@@ -580,8 +638,9 @@ def validate_files(
     ledger_summary_path: Path,
     policy_path: Path,
     workflow_path: Path,
-    signer_verifier_path: Path,
-    audited_pins: Any,
+    controller_tag_signature_verifier_path: Path,
+    signer_freshness_verifier_manifest_path: Path,
+    audited_trust_epoch: AuditedTrustEpoch,
     now: dt.datetime | None = None,
 ) -> tuple[dict[str, str], tuple[tuple[int, int], ...]]:
     inputs = (
@@ -598,8 +657,13 @@ def validate_files(
             MAX_REVIEWED_SOURCE_BYTES,
         ),
         (
-            "signer verifier",
-            signer_verifier_path,
+            "controller tag signature verifier",
+            controller_tag_signature_verifier_path,
+            MAX_REVIEWED_SOURCE_BYTES,
+        ),
+        (
+            "signer freshness verifier manifest",
+            signer_freshness_verifier_manifest_path,
             MAX_REVIEWED_SOURCE_BYTES,
         ),
     )
@@ -620,8 +684,9 @@ def validate_files(
         ledger_summary_raw=raw_values[1],
         policy_raw=raw_values[2],
         workflow_raw=raw_values[3],
-        signer_verifier_raw=raw_values[4],
-        audited_pins=audited_pins,
+        controller_tag_signature_verifier_raw=raw_values[4],
+        signer_freshness_verifier_manifest_raw=raw_values[5],
+        audited_trust_epoch=audited_trust_epoch,
         now=now,
     )
     return outputs, tuple(identities)
@@ -638,7 +703,16 @@ def main(arguments: list[str] | None = None) -> int:
     parser.add_argument("--ledger-summary", required=True, type=Path)
     parser.add_argument("--policy", required=True, type=Path)
     parser.add_argument("--workflow", required=True, type=Path)
-    parser.add_argument("--signer-verifier", required=True, type=Path)
+    parser.add_argument(
+        "--controller-tag-signature-verifier",
+        required=True,
+        type=Path,
+    )
+    parser.add_argument(
+        "--signer-freshness-verifier-manifest",
+        required=True,
+        type=Path,
+    )
     parser.add_argument("--github-output", required=True, type=Path)
     try:
         args = parser.parse_args(arguments)
@@ -647,8 +721,13 @@ def main(arguments: list[str] | None = None) -> int:
             ledger_summary_path=args.ledger_summary,
             policy_path=args.policy,
             workflow_path=args.workflow,
-            signer_verifier_path=args.signer_verifier,
-            audited_pins=POLICY_V2.PRODUCTION_AUDITED_PINS,
+            controller_tag_signature_verifier_path=(
+                args.controller_tag_signature_verifier
+            ),
+            signer_freshness_verifier_manifest_path=(
+                args.signer_freshness_verifier_manifest
+            ),
+            audited_trust_epoch=POLICY_V2.PRODUCTION_AUDITED_TRUST_EPOCH,
         )
         append_github_outputs(
             args.github_output,

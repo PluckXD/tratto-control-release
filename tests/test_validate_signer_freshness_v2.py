@@ -40,6 +40,11 @@ FIXTURE_SPEC.loader.exec_module(FIXTURES)
 
 NOW = dt.datetime(2026, 8, 1, 12, 30, tzinfo=dt.timezone.utc)
 RUNTIME_IDENTITY = "tratto-signer-runtime/v2@test"
+DEFAULT_WORKFLOW_RUN = MODULE.WorkflowRunScope(
+    repository_id=22001,
+    run_id=123,
+    run_attempt=1,
+)
 
 
 def canonical(value: dict[str, Any]) -> bytes:
@@ -95,6 +100,7 @@ def authenticated(
     sequence: int,
     *,
     identity: str = RUNTIME_IDENTITY,
+    workflow_run: MODULE.WorkflowRunScope = DEFAULT_WORKFLOW_RUN,
     authentication_overrides: dict[str, Any] | None = None,
 ) -> MODULE.AuthenticatedAttestation:
     raw = canonical(value)
@@ -109,6 +115,7 @@ def authenticated(
             "kind": received_kind,
             "observation_sequence": sequence,
             "signer_runtime_identity": identity,
+            "workflow_run": workflow_run,
         }
         fields.update(authentication_overrides or {})
         return MODULE.AttestationAuthentication(**fields)
@@ -127,50 +134,87 @@ def case(
     fresh_sequences: tuple[int, int, int] = (2, 2, 2),
     fresh_identity: str = RUNTIME_IDENTITY,
     candidate_override: dict[str, Any] | None = None,
+    observation_scope_overrides: (
+        dict[str, MODULE.WorkflowRunScope] | None
+    ) = None,
+    runtime_scope: MODULE.WorkflowRunScope | None = None,
 ) -> dict[str, Any]:
     approval, envelope = base_documents()
     ledger = ledger_attestation(approval, envelope)
     controller = controller_attestation(approval)
     controls = controls_attestation(approval)
+    workflow_run = MODULE.WorkflowRunScope(
+        repository_id=envelope["controller"]["repository_id"],
+        run_id=envelope["controller"]["run_id"],
+        run_attempt=envelope["controller"]["run_attempt"],
+    )
+    scopes = observation_scope_overrides or {}
 
     initial_ledger = authenticated(
         MODULE.AttestationKind.LEDGER,
         initial_ledger_value or ledger,
         1,
+        workflow_run=scopes.get("initial_ledger", workflow_run),
     )
     fresh_ledger = authenticated(
         MODULE.AttestationKind.LEDGER,
         fresh_ledger_value or ledger,
         fresh_sequences[0],
         identity=fresh_identity,
+        workflow_run=scopes.get("fresh_ledger", workflow_run),
     )
     initial_controller = authenticated(
         MODULE.AttestationKind.CONTROLLER_TAG,
         initial_controller_value or controller,
         1,
+        workflow_run=scopes.get("initial_controller_tag", workflow_run),
     )
     fresh_controller = authenticated(
         MODULE.AttestationKind.CONTROLLER_TAG,
         fresh_controller_value or controller,
         fresh_sequences[1],
         identity=fresh_identity,
+        workflow_run=scopes.get("fresh_controller_tag", workflow_run),
     )
     initial_controls = authenticated(
         MODULE.AttestationKind.GITHUB_CONTROLS,
         initial_controls_value or controls,
         1,
+        workflow_run=scopes.get("initial_github_controls", workflow_run),
     )
     fresh_controls = authenticated(
         MODULE.AttestationKind.GITHUB_CONTROLS,
         fresh_controls_value or controls,
         fresh_sequences[2],
         identity=fresh_identity,
+        workflow_run=scopes.get("fresh_github_controls", workflow_run),
     )
 
+    # The envelope declares the current run.  Build that independently from
+    # the supplied observations so negative tests can model replayed evidence
+    # from a different run without making the envelope itself malformed.
+    summary_ledger = authenticated(
+        MODULE.AttestationKind.LEDGER,
+        ledger,
+        2,
+        workflow_run=workflow_run,
+    )
+    summary_controller = authenticated(
+        MODULE.AttestationKind.CONTROLLER_TAG,
+        controller,
+        2,
+        workflow_run=workflow_run,
+    )
+    summary_controls = authenticated(
+        MODULE.AttestationKind.GITHUB_CONTROLS,
+        controls,
+        2,
+        workflow_run=workflow_run,
+    )
     derived_block = MODULE.build_signer_freshness_block(
-            fresh_ledger=fresh_ledger,
-            fresh_controller_tag=fresh_controller,
-            fresh_github_controls=fresh_controls,
+        fresh_ledger=summary_ledger,
+        fresh_controller_tag=summary_controller,
+        fresh_github_controls=summary_controls,
     )
     # A candidate envelope is independently valid only when its declared
     # ledger head remains the envelope's validated head.  The signer validator
@@ -191,7 +235,10 @@ def case(
         "initial_controller_tag": initial_controller,
         "initial_github_controls": initial_controls,
         "initial_ledger": initial_ledger,
-        "signer_runtime": MODULE.SignerRuntimeIdentity(RUNTIME_IDENTITY),
+        "signer_runtime": MODULE.SignerRuntimeIdentity(
+            RUNTIME_IDENTITY,
+            runtime_scope or workflow_run,
+        ),
     }
 
 
@@ -208,7 +255,13 @@ def test_accepts_unchanged_fresh_authorities_and_returns_exact_block() -> None:
     )
     assert validate(values) == expected
     assert expected["ledger_head_sha"] == "d" * 40
+    assert expected["evidence_model"] == "workflow-signed-summary-v1"
     assert expected["revalidated_immediately_before_signature"] is True
+    assert expected["workflow_run"] == {
+        "repository_id": 22001,
+        "run_attempt": 1,
+        "run_id": 123,
+    }
     assert len(
         {
             expected["ledger_attestation_sha256"],
@@ -324,6 +377,79 @@ def test_attestation_parser_is_bounded() -> None:
 
 
 @pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("repository_id", True),
+        ("run_id", True),
+        ("run_attempt", True),
+        ("repository_id", 0),
+        ("run_id", 0),
+        ("run_attempt", 0),
+        ("repository_id", MODULE.MAX_OBSERVATION_SEQUENCE + 1),
+        ("run_id", MODULE.MAX_OBSERVATION_SEQUENCE + 1),
+        ("run_attempt", MODULE.MAX_OBSERVATION_SEQUENCE + 1),
+    ],
+)
+def test_workflow_run_scope_requires_strict_positive_integers(
+    field: str,
+    replacement: int | bool,
+) -> None:
+    values = DEFAULT_WORKFLOW_RUN.as_dict()
+    values[field] = replacement
+    with pytest.raises(
+        MODULE.SignerFreshnessV2Error,
+        match=rf"workflow run {field} must be a bounded positive integer",
+    ):
+        MODULE.WorkflowRunScope(
+            repository_id=values["repository_id"],
+            run_id=values["run_id"],
+            run_attempt=values["run_attempt"],
+        )
+
+
+def test_workflow_run_scope_accepts_exact_signed_63_bit_maximum() -> None:
+    maximum = MODULE.MAX_OBSERVATION_SEQUENCE
+    scope = MODULE.WorkflowRunScope(
+        repository_id=maximum,
+        run_id=maximum,
+        run_attempt=maximum,
+    )
+    assert scope.as_dict() == {
+        "repository_id": maximum,
+        "run_attempt": maximum,
+        "run_id": maximum,
+    }
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        {"repository_id": 22001, "run_id": 123},
+        {
+            "repository_id": 22001,
+            "run_attempt": 1,
+            "run_id": 123,
+            "unknown": 1,
+        },
+        [],
+    ],
+)
+def test_workflow_run_wire_scope_requires_exact_object_shape(
+    value: Any,
+) -> None:
+    with pytest.raises(MODULE.SignerFreshnessV2Error):
+        MODULE.workflow_run_scope(value, "test workflow run")
+
+
+def test_signer_runtime_requires_typed_workflow_run_scope() -> None:
+    with pytest.raises(MODULE.SignerFreshnessV2Error, match="must be typed"):
+        MODULE.SignerRuntimeIdentity(
+            RUNTIME_IDENTITY,
+            DEFAULT_WORKFLOW_RUN.as_dict(),
+        )
+
+
+@pytest.mark.parametrize(
     ("overrides", "message"),
     [
         ({"authenticated": 1}, "marker must be boolean"),
@@ -332,6 +458,10 @@ def test_attestation_parser_is_bounded() -> None:
         ({"kind": MODULE.AttestationKind.CONTROLLER_TAG}, "kind diverges"),
         ({"observation_sequence": True}, "bounded positive integer"),
         ({"signer_runtime_identity": "bad"}, "invalid format"),
+        (
+            {"workflow_run": DEFAULT_WORKFLOW_RUN.as_dict()},
+            "scope must be typed",
+        ),
     ],
 )
 def test_authenticator_result_is_strictly_typed_and_bound(
@@ -391,6 +521,108 @@ def test_rejects_fresh_observation_from_another_signer_runtime() -> None:
     with pytest.raises(
         MODULE.SignerFreshnessV2Error,
         match="runtime identity diverges",
+    ):
+        validate(values)
+
+
+OBSERVATION_FIELDS = (
+    "initial_ledger",
+    "fresh_ledger",
+    "initial_controller_tag",
+    "fresh_controller_tag",
+    "initial_github_controls",
+    "fresh_github_controls",
+)
+
+
+@pytest.mark.parametrize("field", OBSERVATION_FIELDS)
+@pytest.mark.parametrize(
+    "foreign_scope",
+    [
+        MODULE.WorkflowRunScope(
+            repository_id=22002,
+            run_id=123,
+            run_attempt=1,
+        ),
+        MODULE.WorkflowRunScope(
+            repository_id=22001,
+            run_id=124,
+            run_attempt=1,
+        ),
+        MODULE.WorkflowRunScope(
+            repository_id=22001,
+            run_id=123,
+            run_attempt=2,
+        ),
+    ],
+)
+def test_rejects_every_observation_from_another_workflow_scope(
+    field: str,
+    foreign_scope: MODULE.WorkflowRunScope,
+) -> None:
+    values = case(
+        observation_scope_overrides={field: foreign_scope},
+    )
+    with pytest.raises(
+        MODULE.SignerFreshnessV2Error,
+        match="workflow run scope diverges",
+    ):
+        validate(values)
+
+
+def test_rejects_complete_cross_attempt_evidence_replay() -> None:
+    foreign_attempt = MODULE.WorkflowRunScope(
+        repository_id=22001,
+        run_id=123,
+        run_attempt=2,
+    )
+    values = case(
+        observation_scope_overrides={
+            field: foreign_attempt for field in OBSERVATION_FIELDS
+        },
+    )
+    with pytest.raises(
+        MODULE.SignerFreshnessV2Error,
+        match="workflow run scope diverges",
+    ):
+        validate(values)
+
+
+def test_freshness_builder_rejects_divergent_fresh_run_scopes() -> None:
+    values = case()
+    approval, envelope = base_documents()
+    foreign_ledger = authenticated(
+        MODULE.AttestationKind.LEDGER,
+        ledger_attestation(approval, envelope),
+        2,
+        workflow_run=MODULE.WorkflowRunScope(22001, 123, 2),
+    )
+    with pytest.raises(
+        MODULE.SignerFreshnessV2Error,
+        match="divergent workflow run scopes",
+    ):
+        MODULE.build_signer_freshness_block(
+            fresh_ledger=foreign_ledger,
+            fresh_controller_tag=values["fresh_controller_tag"],
+            fresh_github_controls=values["fresh_github_controls"],
+        )
+
+
+@pytest.mark.parametrize(
+    "runtime_scope",
+    [
+        MODULE.WorkflowRunScope(22002, 123, 1),
+        MODULE.WorkflowRunScope(22001, 124, 1),
+        MODULE.WorkflowRunScope(22001, 123, 2),
+    ],
+)
+def test_rejects_signer_runtime_scope_divergent_from_envelope(
+    runtime_scope: MODULE.WorkflowRunScope,
+) -> None:
+    values = case(runtime_scope=runtime_scope)
+    with pytest.raises(
+        MODULE.SignerFreshnessV2Error,
+        match="signer runtime workflow run scope diverges from envelope",
     ):
         validate(values)
 
@@ -504,10 +736,12 @@ def test_rejects_validated_approval_different_from_envelope_approval() -> None:
 def test_rejects_candidate_freshness_block_not_derived_from_fresh_bytes() -> None:
     wrong = {
         "controller_tag_attestation_sha256": "1" * 64,
+        "evidence_model": "workflow-signed-summary-v1",
         "github_controls_attestation_sha256": "2" * 64,
         "ledger_attestation_sha256": "3" * 64,
         "ledger_head_sha": "d" * 40,
         "revalidated_immediately_before_signature": True,
+        "workflow_run": DEFAULT_WORKFLOW_RUN.as_dict(),
     }
     values = case(candidate_override=wrong)
     with pytest.raises(
@@ -626,6 +860,12 @@ def test_cli_validates_files_but_fails_closed_without_pins(
         str(tmp_path / "approval.json"),
         "--envelope",
         str(tmp_path / "envelope.json"),
+        "--workflow-repository-id",
+        "22001",
+        "--workflow-run-id",
+        "123",
+        "--workflow-run-attempt",
+        "1",
     ]
     for phase in ("initial", "fresh"):
         for kind in ("ledger", "controller-tag", "github-controls"):
@@ -677,6 +917,12 @@ def test_cli_rejects_symlink_before_pin_check(tmp_path: Path) -> None:
             str(tmp_path / "approval.json"),
             "--envelope",
             str(tmp_path / "envelope.json"),
+            "--workflow-repository-id",
+            "22001",
+            "--workflow-run-id",
+            "123",
+            "--workflow-run-attempt",
+            "1",
             "--initial-ledger-attestation",
             str(tmp_path / "missing"),
             "--fresh-ledger-attestation",
@@ -713,6 +959,15 @@ def test_cli_arguments_fail_closed_with_exit_78() -> None:
     )
     assert result.returncode == 78
     assert result.stdout == b""
+
+
+def test_cli_parser_requires_the_exact_current_workflow_scope() -> None:
+    actions = {action.dest for action in MODULE.parser()._actions}
+    assert {
+        "workflow_repository_id",
+        "workflow_run_id",
+        "workflow_run_attempt",
+    } <= actions
 
 
 def test_source_is_offline_no_bytecode_and_production_unavailable() -> None:

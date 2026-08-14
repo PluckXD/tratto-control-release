@@ -76,10 +76,11 @@ COMPONENT_KEYS = {
 }
 CONTROLLER_KEYS = {
     "commit_sha",
+    "controller_tag_signature_verifier_sha256",
     "immutable_release_id",
     "repository",
     "repository_id",
-    "signer_verifier_sha256",
+    "signer_freshness_verifier_sha256",
     "tag_object_sha",
     "tag_ref",
     "workflow_path",
@@ -133,13 +134,20 @@ APPROVED_VERSIONED_MIGRATIONS = {
         "tenant_schema_revision": "f52provisionactivate",
     },
 }
-POLICY_KEYS = {"digest_sha256", "name", "path", "repository"}
+POLICY_KEYS = {
+    "digest_sha256",
+    "name",
+    "path",
+    "repository",
+    "trust_epoch",
+}
 
 ZERO_SHA256 = "0" * 64
 MAX_FILE_BYTES = 64 * 1024
 MAX_VALIDITY = dt.timedelta(hours=24)
 MAX_FUTURE_SKEW = dt.timedelta(minutes=5)
 MAX_LEDGER_SEQUENCE = 100_000
+MAX_TRUST_EPOCH = 2_147_483_647
 
 
 class ApprovalV2Error(ValueError):
@@ -325,10 +333,20 @@ def validate_controller(value: Any) -> None:
         "controller.workflow_sha256",
     )
     require_pattern(
-        controller["signer_verifier_sha256"],
+        controller["controller_tag_signature_verifier_sha256"],
         SHA256_RE,
-        "controller.signer_verifier_sha256",
+        "controller.controller_tag_signature_verifier_sha256",
     )
+    require_pattern(
+        controller["signer_freshness_verifier_sha256"],
+        SHA256_RE,
+        "controller.signer_freshness_verifier_sha256",
+    )
+    if (
+        controller["controller_tag_signature_verifier_sha256"]
+        == controller["signer_freshness_verifier_sha256"]
+    ):
+        reject("controller verifier roles must use distinct digests")
 
 
 def validate_ledger(value: Any) -> None:
@@ -460,6 +478,12 @@ def validate_policy(value: Any) -> None:
         SHA256_RE,
         "policy.digest_sha256",
     )
+    trust_epoch = require_positive_integer(
+        policy["trust_epoch"],
+        "policy.trust_epoch",
+    )
+    if trust_epoch > MAX_TRUST_EPOCH:
+        reject(f"policy.trust_epoch cannot exceed {MAX_TRUST_EPOCH}")
 
 
 def validate_shape(

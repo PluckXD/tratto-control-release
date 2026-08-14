@@ -2,13 +2,14 @@
 """Fail-closed readiness and execution-context gate for Control v6.
 
 The command-line interface deliberately uses only the checked-in v2
-readiness and production-policy documents and the separately audited pins in
-``validate-policy-v2.py``.  It accepts no trust pins or document paths from
-arguments or environment variables.
+readiness and production-policy documents and the separately audited trust
+epoch in ``validate-policy-v2.py``.  It accepts no trust tuple or document
+paths from arguments or environment variables.
 
-The pure API accepts explicit canonical policy bytes and typed audited pins so
-tests and reviewers can exercise a prospective fully configured policy without
-turning the checked-in unavailable template into an authorization source.
+The pure API accepts explicit canonical policy bytes and a typed audited trust
+epoch so tests and reviewers can exercise a prospective fully configured
+policy without turning the checked-in unavailable template into an
+authorization source.
 """
 
 from __future__ import annotations
@@ -126,14 +127,16 @@ class GateV2Attestation:
     phase: str
     policy_sha256: str
     readiness_sha256: str
+    trust_epoch: int
 
-    def as_dict(self) -> dict[str, str]:
+    def as_dict(self) -> dict[str, str | int]:
         return {
             "controller_commit_sha": self.controller_commit_sha,
             "controller_ref": self.controller_ref,
             "phase": self.phase,
             "policy_sha256": self.policy_sha256,
             "readiness_sha256": self.readiness_sha256,
+            "trust_epoch": self.trust_epoch,
         }
 
 
@@ -388,7 +391,7 @@ def validate_release_gate(
     *,
     readiness_raw: bytes,
     policy_raw: bytes,
-    audited_pins: Any,
+    audited_trust_epoch: Any,
     phase: str,
     environment: Mapping[str, str],
 ) -> GateV2Attestation:
@@ -398,7 +401,7 @@ def validate_release_gate(
     try:
         policy, policy_digest = POLICY.validate_bytes(
             policy_raw,
-            audited_pins=audited_pins,
+            audited_trust_epoch=audited_trust_epoch,
         )
     except POLICY.ProductionPolicyError as error:
         reject(f"production policy rejected: {error}")
@@ -424,6 +427,7 @@ def validate_release_gate(
         phase=phase,
         policy_sha256=policy_digest,
         readiness_sha256=readiness_digest,
+        trust_epoch=policy["trust_epoch"],
     )
 
 
@@ -439,7 +443,7 @@ def main(argv: list[str] | None = None) -> int:
         result = validate_release_gate(
             readiness_raw=readiness_raw,
             policy_raw=policy_raw,
-            audited_pins=POLICY.PRODUCTION_AUDITED_PINS,
+            audited_trust_epoch=POLICY.PRODUCTION_AUDITED_TRUST_EPOCH,
             phase=args.phase,
             environment=dict(os.environ),
         )
