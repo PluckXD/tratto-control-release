@@ -33,6 +33,14 @@ if SPEC is None or SPEC.loader is None:
     raise SystemExit("approval validator unavailable")
 APPROVAL = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(APPROVAL)
+APPROVAL_V2_SPEC = importlib.util.spec_from_file_location(
+    "control_release_ops_approval_v2",
+    HERE / "validate-approval-v2.py",
+)
+if APPROVAL_V2_SPEC is None or APPROVAL_V2_SPEC.loader is None:
+    raise SystemExit("approval-v2 validator unavailable")
+APPROVAL_V2 = importlib.util.module_from_spec(APPROVAL_V2_SPEC)
+APPROVAL_V2_SPEC.loader.exec_module(APPROVAL_V2)
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
@@ -97,10 +105,19 @@ def git(root: Path, arguments: list[str], *, binary: bool = False) -> bytes | st
 def load_approval(path: Path, release_sha: str) -> tuple[dict, bytes]:
     try:
         raw = path.read_bytes()
-        value = APPROVAL.parse_json(raw, "approval")
-        APPROVAL.require_canonical(raw, value, "approval")
-        APPROVAL.validate_shape(value, now=None, historical=True)
-    except (OSError, APPROVAL.ApprovalError) as error:
+        dispatch = json.loads(raw)
+        if isinstance(dispatch, dict) and dispatch.get("schema_version") == 2:
+            value = APPROVAL_V2.validate_bytes(raw, historical=False)
+        else:
+            value = APPROVAL.parse_json(raw, "approval")
+            APPROVAL.require_canonical(raw, value, "approval")
+            APPROVAL.validate_shape(value, now=None, historical=True)
+    except (
+        OSError,
+        json.JSONDecodeError,
+        APPROVAL.ApprovalError,
+        APPROVAL_V2.ApprovalV2Error,
+    ) as error:
         reject(f"approval is invalid: {error}")
     if (
         value["api"]["commit_sha"] != release_sha

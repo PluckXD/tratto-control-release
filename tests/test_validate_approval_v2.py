@@ -91,6 +91,29 @@ def approval(*, sequence: int = 1) -> dict:
     }
 
 
+def versioned_migration(schema_version: int) -> dict:
+    if schema_version == 5:
+        control = "f51legalpublish"
+        tenant = "f49legalauth"
+    elif schema_version == 6:
+        control = tenant = "f52provisionactivate"
+    else:
+        raise AssertionError("test requested an unsupported migration version")
+    return {
+        "control_base_revisions": ["z2card181nf"],
+        "control_schema_revision": control,
+        "database_scope": "control-and-tenant-fleet",
+        "fleet_preflight_sha256": "7" * 64,
+        "head_revision": control,
+        "mode": "expand-only",
+        "schema_version": schema_version,
+        "tenant_catalog_count": 1,
+        "tenant_catalog_sha256": "8" * 64,
+        "tenant_fleet_base_revisions": ["z2card181nf"],
+        "tenant_schema_revision": tenant,
+    }
+
+
 def validate(value: dict, *, now: dt.datetime = NOW) -> dict:
     return MODULE.validate_bytes(MODULE.canonical_bytes(value), now=now)
 
@@ -105,6 +128,52 @@ def test_accepts_complete_later_ledger_authorization() -> None:
     assert validate(value)["ledger"]["sequence"] == 2
 
 
+@pytest.mark.parametrize("schema_version", (5, 6))
+def test_accepts_exact_versioned_product_migration_contract(
+    schema_version: int,
+) -> None:
+    value = approval()
+    value["migration"] = versioned_migration(schema_version)
+    assert validate(value)["migration"] == value["migration"]
+
+
+@pytest.mark.parametrize(
+    ("schema_version", "field", "replacement"),
+    [
+        (5, "tenant_schema_revision", "f52provisionactivate"),
+        (5, "control_schema_revision", "f52provisionactivate"),
+        (5, "head_revision", "f52provisionactivate"),
+        (6, "tenant_schema_revision", "f49legalauth"),
+        (6, "control_schema_revision", "f51legalpublish"),
+        (6, "head_revision", "f51legalpublish"),
+        (6, "control_base_revisions", ["f51legalpublish"]),
+        (6, "tenant_fleet_base_revisions", ["f49legalauth"]),
+    ],
+)
+def test_rejects_mixed_versioned_product_migration_contract(
+    schema_version: int,
+    field: str,
+    replacement,
+) -> None:
+    value = approval()
+    value["migration"] = versioned_migration(schema_version)
+    value["migration"][field] = replacement
+    with pytest.raises(MODULE.ApprovalV2Error, match="revision chain"):
+        validate(value)
+
+
+def test_rejects_unsupported_or_non_integer_versioned_migration() -> None:
+    for schema_version in (4, 7, True, 6.0):
+        value = approval()
+        value["migration"] = versioned_migration(6)
+        value["migration"]["schema_version"] = schema_version
+        with pytest.raises(
+            MODULE.ApprovalV2Error,
+            match="schema_version",
+        ):
+            validate(value)
+
+
 def test_controller_tag_object_and_commit_may_share_the_same_sha() -> None:
     value = approval()
     value["controller"]["tag_object_sha"] = value["controller"]["commit_sha"]
@@ -116,7 +185,18 @@ def test_schema_is_valid_json_and_closes_all_object_shapes() -> None:
     assert schema["$schema"] == "https://json-schema.org/draft/2020-12/schema"
     assert schema["additionalProperties"] is False
     assert schema["properties"]["schema_version"]["const"] == 2
-    for name in ("component", "controller", "ledger", "migration", "policy"):
+    for name in ("component", "controller", "ledger", "policy"):
+        assert schema["$defs"][name]["additionalProperties"] is False
+    assert schema["$defs"]["migration"]["oneOf"] == [
+        {"$ref": "#/$defs/migrationLegacy"},
+        {"$ref": "#/$defs/migrationDemoPlatformV5"},
+        {"$ref": "#/$defs/migrationDemoPlatformV6"},
+    ]
+    for name in (
+        "migrationLegacy",
+        "migrationDemoPlatformV5",
+        "migrationDemoPlatformV6",
+    ):
         assert schema["$defs"][name]["additionalProperties"] is False
 
 

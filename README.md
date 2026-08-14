@@ -22,6 +22,21 @@ manual-only and fail-closed. `workflow-v6-shape.yml` is deliberately outside
 that directory: it is a review artifact, not an executable workflow. Neither
 candidate can currently build, verify, sign, stage, or deploy a release.
 
+The v2 review shape now has a bounded read-only GitHub evidence collector,
+approval-v2-aware deterministic artifact packagers/runtime verification, an
+offline exact-main source verifier, and a numeric-ID/digest/size-bound carrier
+client. These are implementation artifacts only; they do not turn transport
+or API responses into release authority. As observed on 2026-08-09, Selected
+Actions and full-SHA pinning are enabled and the allowlist contains exactly the
+reviewed `checkout` and `setup-python` revisions. Fresh release evidence must
+revalidate that external control. Controller `main` currently requires zero
+approvals and omits CODEOWNERS and last-push review. Production also remains
+unavailable because
+there is no second independent reviewer, no builder/carrier/signer identity
+or secret set, no pinned builder/verifier image set or tag-signature trust
+root, immutable releases are not owner-enforced, the signer evidence channel
+is not provisioned, and the real Ubuntu HML kill/resume record is absent.
+
 ## Initial one-shot bootstrap
 
 The permanent multi-review release controller remains unavailable. The first

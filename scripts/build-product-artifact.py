@@ -43,6 +43,138 @@ if APPROVAL_SPEC is None or APPROVAL_SPEC.loader is None:
     raise SystemExit("approval validator unavailable")
 APPROVAL = importlib.util.module_from_spec(APPROVAL_SPEC)
 APPROVAL_SPEC.loader.exec_module(APPROVAL)
+APPROVAL_V2_SPEC = importlib.util.spec_from_file_location(
+    "control_release_product_approval_v2",
+    HERE / "validate-approval-v2.py",
+)
+if APPROVAL_V2_SPEC is None or APPROVAL_V2_SPEC.loader is None:
+    raise SystemExit("approval-v2 validator unavailable")
+APPROVAL_V2 = importlib.util.module_from_spec(APPROVAL_V2_SPEC)
+APPROVAL_V2_SPEC.loader.exec_module(APPROVAL_V2)
+SOURCE_CONTRACT_SPEC = importlib.util.spec_from_file_location(
+    "control_release_product_source_contract",
+    HERE / "product-source-contract.py",
+)
+if SOURCE_CONTRACT_SPEC is None or SOURCE_CONTRACT_SPEC.loader is None:
+    raise SystemExit("product source contract verifier unavailable")
+SOURCE_CONTRACT = importlib.util.module_from_spec(SOURCE_CONTRACT_SPEC)
+SOURCE_CONTRACT_SPEC.loader.exec_module(SOURCE_CONTRACT)
+SOURCE_CONTRACT_ROOT = HERE.parent / "contracts" / "product-source"
+LEGACY_SOURCE_CONTRACT_EXEMPT_HEADS = {"j1transpcod", "f29controlexec"}
+PAYMENT_SOURCE_CONTRACT_REQUIRED_PATHS = frozenset(
+    {
+        "alembic/env.py",
+        "alembic/versions/f39paymentfence_cobranca_external_unica.py",
+        (
+            "alembic/versions/"
+            "f40asaasfence_preflight_parcelamento_asaas.py"
+        ),
+        "alembic/versions/f41paymentintent_intent_state_machine.py",
+        (
+            "alembic/versions/"
+            "f42customerlink_pagamento_cliente_vinculo.py"
+        ),
+        "app/core/config.py",
+        "app/main.py",
+        "app/models/__init__.py",
+        "app/models/pagamento.py",
+        "app/pagamento/asaas.py",
+        "app/pagamento/base.py",
+        "app/pagamento/registry.py",
+        "app/routers/loja.py",
+        "app/routers/loja_admin.py",
+        "app/routers/pagamentos.py",
+        "app/services/erp_worker.py",
+        "app/services/pagamento.py",
+        "app/services/pagamento_intent_worker.py",
+        "ops/control/scripts/run-control-fleet-migration.py",
+        "ops/control/scripts/validate-artifact.py",
+        "ops/control/scripts/validate-bundle.py",
+        "ops/control/scripts/verify-control-stack-quiescent.py",
+        "scripts/migrate_all_tenants.py",
+    }
+)
+PRODUCTION_LINEAGE_V5_SOURCE_CONTRACT_REQUIRED_PATHS = frozenset(
+    {
+        "alembic/env.py",
+        "alembic/versions/z2card181_historico_nf_lookup.py",
+        "alembic/versions/f42customerlink_pagamento_cliente_vinculo.py",
+        "alembic/versions/f43card115_numero_pedido_compra_generico.py",
+        "alembic/versions/f44erppolicy_erp_policy_evidence.py",
+        "alembic/versions/f45legalinactive_disable_draft_legal.py",
+        "alembic/versions/f46lineage_merge_control_prod.py",
+        "alembic/versions/f47tenantguard_aprovacao_email_rls_guard.py",
+        "alembic/versions/f48tenantprovision_control_tenant_provision_broker.py",
+        "alembic/versions/f48provisionv3_control_tenant_provision_broker_v3.py",
+        "alembic/versions/f49legalauth_demo_legal_authority.py",
+        "alembic/versions/f50legalfence_demo_legal_enforcement_fence.py",
+        "alembic/versions/f51legalpublish_demo_legal_bundle_publication.py",
+        "app/core/control_v5_catalog_postcheck.py",
+        "app/core/final_v5_schema_attestation.py",
+        "app/core/tenant_lineage_schema.py",
+        "app/core/tenant_provisioning_contract.py",
+        "app/core/tenant_provisioning_contract_v3.py",
+        "app/core/tenant_provisioning_target_attestation.py",
+        "app/core/tenant_schema_policy.py",
+        "app/models/demo_journey.py",
+        "app/models/legal_acceptance.py",
+        "app/models/tenant_provisioning.py",
+        "app/services/control_db_rpc.py",
+        "app/services/control_fleet_attestation.py",
+        "app/services/demo_worker.py",
+        "app/services/legal_runtime_contract.py",
+        "app/services/tenant_provisioning.py",
+        "deploy/scripts/tratto_apply.sh",
+        "scripts/migrate_all_tenants.py",
+        "ops/control/release-root/schemas/approval.schema.json",
+        "ops/control/release-root/schemas/component-manifest.schema.json",
+        "ops/control/release-root/scripts/component_manifest.py",
+        "ops/control/release-root/scripts/validate-approval.py",
+        "ops/control/scripts/lib/common.sh",
+        "ops/control/scripts/lib/release_migration_contract.py",
+        "ops/control/scripts/run-control-fleet-migration.py",
+        "ops/control/scripts/run-control-migration.py",
+        "ops/control/scripts/stage-release.sh",
+        "ops/control/scripts/validate-artifact.py",
+        "ops/control/scripts/validate-bundle.py",
+    }
+)
+PHYSICAL_PROVISION_V6_SOURCE_CONTRACT_REQUIRED_PATHS = (
+    PRODUCTION_LINEAGE_V5_SOURCE_CONTRACT_REQUIRED_PATHS
+    | frozenset(
+        {
+            "alembic/versions/f52provisionactivate_physical_provision_activation.py",
+            "app/core/control_v6_catalog_postcheck.py",
+            "app/core/final_v6_schema_attestation.py",
+            "app/models/__init__.py",
+            "app/services/demo_capability_reissue_worker.py",
+            "app/services/email.py",
+            "app/services/tenant_provision_broker.py",
+            "app/services/tenant_provision_seed.py",
+            "scripts/tenant_provision_broker.py",
+            "scripts/verify_signed_migration_head_v6.py",
+            "ops/control/release-root/scripts/control_ops_tree.py",
+            "ops/control/scripts/activate-release.sh",
+            "ops/control/scripts/check-tenant-provision-release-drain.py",
+            "ops/control/scripts/control-rpc-membership.sh",
+            "ops/control/scripts/cutover-demo-provisioner-role.py",
+            "ops/control/scripts/install-host.sh",
+            "ops/control/scripts/lib/control_fleet_v6_overlay.py",
+            "ops/control/scripts/link-runtime-contract.sh",
+            "ops/control/scripts/migrate-control-db.sh",
+            "ops/control/scripts/migrate-control-fleet-inner.sh",
+            "ops/control/scripts/prepare-control-fleet-migration.py",
+            "ops/control/scripts/recover-interrupted.sh",
+            "ops/control/scripts/refresh-control-fleet-readiness.py",
+            "ops/control/scripts/run-tenant-provision-broker.py",
+        }
+    )
+)
+REQUIRED_SOURCE_PATHS_BY_MIGRATION_HEAD = {
+    "f42customerlink": PAYMENT_SOURCE_CONTRACT_REQUIRED_PATHS,
+    "f51legalpublish": PRODUCTION_LINEAGE_V5_SOURCE_CONTRACT_REQUIRED_PATHS,
+    "f52provisionactivate": PHYSICAL_PROVISION_V6_SOURCE_CONTRACT_REQUIRED_PATHS,
+}
 
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 MAX_MEMBERS = 350_000
@@ -167,14 +299,28 @@ def load_approval(
 ) -> tuple[dict[str, Any], bytes]:
     try:
         raw = path.read_bytes()
-        value = APPROVAL.parse_json(raw, "approval")
-        APPROVAL.require_canonical(raw, value, "approval")
-        APPROVAL.validate_shape(
-            value,
-            now=dt.datetime.now(dt.timezone.utc),
-            historical=False,
-        )
-    except (OSError, APPROVAL.ApprovalError) as error:
+        dispatch = json.loads(raw)
+        if isinstance(dispatch, dict) and dispatch.get("schema_version") == 2:
+            value = APPROVAL_V2.parse_canonical_json(raw)
+            APPROVAL_V2.validate_shape(
+                value,
+                now=dt.datetime.now(dt.timezone.utc),
+                historical=False,
+            )
+        else:
+            value = APPROVAL.parse_json(raw, "approval")
+            APPROVAL.require_canonical(raw, value, "approval")
+            APPROVAL.validate_shape(
+                value,
+                now=dt.datetime.now(dt.timezone.utc),
+                historical=False,
+            )
+    except (
+        OSError,
+        json.JSONDecodeError,
+        APPROVAL.ApprovalError,
+        APPROVAL_V2.ApprovalV2Error,
+    ) as error:
         reject(f"approval is invalid: {error}")
     approved = value["api" if kind == "api" else "web"]["commit_sha"]
     if approved != release_sha:
@@ -194,6 +340,55 @@ def validate_source(root: Path, release_sha: str) -> str:
     if SHA_RE.fullmatch(tree_sha) is None:
         reject("source tree SHA is invalid")
     return tree_sha
+
+
+def validate_exact_product_sources(
+    *,
+    kind: str,
+    approval: dict[str, Any],
+    repository_root: Path,
+    bundle_root: Path,
+) -> str | None:
+    """Apply the controller-owned contract to guarded migration heads.
+
+    Selection is derived exclusively from the approved migration head.  A
+    workflow input therefore cannot substitute a contract that blesses
+    attacker-chosen source bytes.
+    """
+
+    if kind != "api":
+        return None
+    migration = approval.get("migration")
+    if not isinstance(migration, dict):
+        reject("approval migration contract is invalid")
+    migration_head = migration.get("head_revision")
+    if not isinstance(migration_head, str):
+        reject("approval migration head is invalid")
+    if migration_head in LEGACY_SOURCE_CONTRACT_EXEMPT_HEADS:
+        return None
+    required_files = REQUIRED_SOURCE_PATHS_BY_MIGRATION_HEAD.get(
+        migration_head
+    )
+    if required_files is None:
+        reject(
+            "guarded API migration head has no controller-owned source "
+            "contract definition"
+        )
+    contract_path = SOURCE_CONTRACT_ROOT / f"{migration_head}.json"
+    if not contract_path.is_file():
+        reject(
+            "guarded API migration head requires its controller-owned "
+            "exact source contract"
+        )
+    contract, digest = SOURCE_CONTRACT.load(contract_path)
+    SOURCE_CONTRACT.verify(
+        contract,
+        repository_root=repository_root,
+        bundle_root=bundle_root,
+        expected_migration_head=migration_head,
+        required_files=required_files,
+    )
+    return digest
 
 
 def canonical_path(value: str) -> str:
@@ -513,6 +708,12 @@ def main() -> int:
             release_sha=args.release_sha,
         )
         tree_sha = validate_source(args.repository_root, args.release_sha)
+        validate_exact_product_sources(
+            kind=args.kind,
+            approval=approval,
+            repository_root=args.repository_root,
+            bundle_root=args.bundle_root,
+        )
         runtime_policy, runtime_policy_digest = RUNTIME.load(
             args.runtime_policy
         )
@@ -612,7 +813,9 @@ def main() -> int:
         UnicodeDecodeError,
         subprocess.SubprocessError,
         APPROVAL.ApprovalError,
+        APPROVAL_V2.ApprovalV2Error,
         COMPONENT.ComponentManifestError,
+        SOURCE_CONTRACT.ProductSourceContractError,
         RUNTIME.RuntimePolicyError,
         ProductArtifactError,
     ) as error:

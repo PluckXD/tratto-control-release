@@ -93,10 +93,17 @@ jobs:
           PY
 
       - id: controller_evidence
-        name: FUTURE BLOCKER - produce canonical immutable-tag evidence
+        name: Collect canonical read-only controller and controls evidence
+        working-directory: controller
+        env:
+          CONTROL_CONTROLLER_AUDIT_TOKEN: ${{ secrets.CONTROL_CONTROLLER_AUDIT_TOKEN }}
         run: |
-          echo "RELEASE_POLICY_UNAVAILABLE: reviewed immutable-tag evidence producer is not provisioned" >&2
-          exit 78
+          umask 077
+          mkdir "$RUNNER_TEMP/control-evidence-v2"
+          python3 -B scripts/collect-github-evidence-v2.py \
+            --controller-root "$GITHUB_WORKSPACE/controller" \
+            --output-directory "$RUNNER_TEMP/control-evidence-v2" \
+            --github-output "$GITHUB_OUTPUT"
 
       - name: Validate the signed annotated tag and immutable release
         working-directory: controller
@@ -113,24 +120,18 @@ jobs:
             --commit-sha "$CONTROLLER_COMMIT_SHA" \
             --release-id "$CONTROLLER_RELEASE_ID" \
             --repository-id "$CONTROLLER_REPOSITORY_ID" \
-            --github-context "$RUNNER_TEMP/controller-context.json" \
-            --local-git-tag "$RUNNER_TEMP/controller-local-tag.json" \
-            --release-response "$RUNNER_TEMP/controller-release.json" \
-            --immutable-releases-response "$RUNNER_TEMP/controller-immutable-releases.json" \
+            --github-context "$RUNNER_TEMP/control-evidence-v2/controller-context.json" \
+            --local-git-tag "$RUNNER_TEMP/control-evidence-v2/controller-local-tag.json" \
+            --release-response "$RUNNER_TEMP/control-evidence-v2/controller-release.json" \
+            --immutable-releases-response "$RUNNER_TEMP/control-evidence-v2/controller-immutable-releases.json" \
             >"$RUNNER_TEMP/controller-tag-attestation.json"
-
-      - id: controls_evidence
-        name: FUTURE BLOCKER - produce canonical GitHub controls v2 evidence
-        run: |
-          echo "RELEASE_POLICY_UNAVAILABLE: reviewed GitHub controls evidence producer is not provisioned" >&2
-          exit 78
 
       - name: Verify GitHub controls v2
         working-directory: controller
         run: |
           python3 -B scripts/verify-github-controls-v2.py \
-            --controller-evidence "$RUNNER_TEMP/controller-controls-v2.json" \
-            --ledger-evidence "$RUNNER_TEMP/ledger-controls-v2.json" \
+            --controller-evidence "$RUNNER_TEMP/control-evidence-v2/controller-controls-v2.json" \
+            --ledger-evidence "$RUNNER_TEMP/control-evidence-v2/ledger-controls-v2.json" \
             >"$RUNNER_TEMP/github-controls-v2-attestation.json"
 
       - name: Checkout the protected approval ledger in isolation

@@ -20,7 +20,7 @@ HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 REVISION_RE = re.compile(r"^[a-z0-9][a-z0-9_]{2,63}$")
 MAX_MANIFEST_BYTES = 64 * 1024
-MIGRATION_KEYS = {
+MIGRATION_LEGACY_KEYS = {
     "base_revision",
     "database_scope",
     "fleet_preflight_sha256",
@@ -29,6 +29,39 @@ MIGRATION_KEYS = {
     "tenant_catalog_count",
     "tenant_catalog_sha256",
     "tenant_fleet_base_revision",
+}
+MIGRATION_VERSIONED_KEYS = {
+    "control_base_revisions",
+    "control_schema_revision",
+    "database_scope",
+    "fleet_preflight_sha256",
+    "head_revision",
+    "mode",
+    "schema_version",
+    "tenant_catalog_count",
+    "tenant_catalog_sha256",
+    "tenant_fleet_base_revisions",
+    "tenant_schema_revision",
+}
+APPROVED_LEGACY_MIGRATION_HEADS = {
+    "f29controlexec",
+    "f42customerlink",
+}
+APPROVED_VERSIONED_MIGRATIONS = {
+    5: {
+        "control_base_revisions": ["z2card181nf"],
+        "control_schema_revision": "f51legalpublish",
+        "head_revision": "f51legalpublish",
+        "tenant_fleet_base_revisions": ["z2card181nf"],
+        "tenant_schema_revision": "f49legalauth",
+    },
+    6: {
+        "control_base_revisions": ["z2card181nf"],
+        "control_schema_revision": "f52provisionactivate",
+        "head_revision": "f52provisionactivate",
+        "tenant_fleet_base_revisions": ["z2card181nf"],
+        "tenant_schema_revision": "f52provisionactivate",
+    },
 }
 
 
@@ -120,14 +153,22 @@ def load(path: Path, label: str) -> tuple[bytes, dict[str, Any], str]:
 
 
 def validate_migration(value: Any) -> dict[str, Any]:
-    if not isinstance(value, dict) or set(value) != MIGRATION_KEYS:
+    if not isinstance(value, dict):
+        reject("component migration contract must be an object")
+    keys = set(value)
+    if keys == MIGRATION_LEGACY_KEYS:
+        _validate_legacy_migration(value)
+    elif keys == MIGRATION_VERSIONED_KEYS:
+        _validate_versioned_migration(value)
+    else:
         reject("component migration contract has invalid keys")
+    return value
+
+
+def _validate_common_migration(value: dict[str, Any]) -> None:
     count = value["tenant_catalog_count"]
     if (
         value["database_scope"] != "control-and-tenant-fleet"
-        or value["base_revision"] != "j1transpcod"
-        or value["tenant_fleet_base_revision"] != "j1transpcod"
-        or value["head_revision"] != "f29controlexec"
         or value["mode"] != "expand-only"
         or type(count) is not int
         or not 1 <= count <= 512
@@ -139,13 +180,45 @@ def validate_migration(value: Any) -> dict[str, Any]:
             or HASH_RE.fullmatch(value[key]) is None
         ):
             reject(f"component migration digest is invalid: {key}")
+
+
+def _validate_legacy_migration(value: dict[str, Any]) -> None:
+    _validate_common_migration(value)
+    if (
+        value["base_revision"] != "j1transpcod"
+        or value["tenant_fleet_base_revision"] != "j1transpcod"
+        or value["head_revision"] not in APPROVED_LEGACY_MIGRATION_HEADS
+    ):
+        reject("component migration contract is outside the approved chain")
     for key in ("base_revision", "tenant_fleet_base_revision", "head_revision"):
         if (
             not isinstance(value[key], str)
             or REVISION_RE.fullmatch(value[key]) is None
         ):
             reject(f"component migration revision is invalid: {key}")
-    return value
+
+
+def _validate_versioned_migration(value: dict[str, Any]) -> None:
+    _validate_common_migration(value)
+    schema_version = value.get("schema_version")
+    if type(schema_version) is not int:
+        reject("component migration schema_version must be an integer")
+    expected = APPROVED_VERSIONED_MIGRATIONS.get(schema_version)
+    if expected is None:
+        reject("component migration schema_version is not supported")
+    actual = {key: value.get(key) for key in expected}
+    if actual != expected:
+        reject("component migration contract is outside the approved chain")
+    for key in (
+        "control_schema_revision",
+        "tenant_schema_revision",
+        "head_revision",
+    ):
+        if (
+            not isinstance(value[key], str)
+            or REVISION_RE.fullmatch(value[key]) is None
+        ):
+            reject(f"component migration revision is invalid: {key}")
 
 
 def validate(

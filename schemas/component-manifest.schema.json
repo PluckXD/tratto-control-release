@@ -201,6 +201,113 @@
   "type": "object",
   "$defs": {
     "migration": {
+      "oneOf": [
+        {"$ref": "#/$defs/migrationLegacy"},
+        {"$ref": "#/$defs/migrationDemoPlatformV5"},
+        {"$ref": "#/$defs/migrationDemoPlatformV6"}
+      ]
+    },
+    "migrationDemoPlatformV5": {
+      "additionalProperties": false,
+      "properties": {
+        "control_base_revisions": {
+          "items": false,
+          "maxItems": 1,
+          "minItems": 1,
+          "prefixItems": [
+            {"const": "z2card181nf"}
+          ],
+          "type": "array"
+        },
+        "control_schema_revision": {"const": "f51legalpublish"},
+        "database_scope": {"const": "control-and-tenant-fleet"},
+        "fleet_preflight_sha256": {"$ref": "#/$defs/sha256"},
+        "head_revision": {"const": "f51legalpublish"},
+        "mode": {"const": "expand-only"},
+        "schema_version": {"const": 5, "type": "integer"},
+        "tenant_catalog_count": {
+          "maximum": 512,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "tenant_catalog_sha256": {"$ref": "#/$defs/sha256"},
+        "tenant_fleet_base_revisions": {
+          "items": false,
+          "maxItems": 1,
+          "minItems": 1,
+          "prefixItems": [
+            {"const": "z2card181nf"}
+          ],
+          "type": "array"
+        },
+        "tenant_schema_revision": {"const": "f49legalauth"}
+      },
+      "required": [
+        "control_base_revisions",
+        "control_schema_revision",
+        "database_scope",
+        "fleet_preflight_sha256",
+        "head_revision",
+        "mode",
+        "schema_version",
+        "tenant_catalog_count",
+        "tenant_catalog_sha256",
+        "tenant_fleet_base_revisions",
+        "tenant_schema_revision"
+      ],
+      "type": "object"
+    },
+    "migrationDemoPlatformV6": {
+      "additionalProperties": false,
+      "properties": {
+        "control_base_revisions": {
+          "items": false,
+          "maxItems": 1,
+          "minItems": 1,
+          "prefixItems": [
+            {"const": "z2card181nf"}
+          ],
+          "type": "array"
+        },
+        "control_schema_revision": {"const": "f52provisionactivate"},
+        "database_scope": {"const": "control-and-tenant-fleet"},
+        "fleet_preflight_sha256": {"$ref": "#/$defs/sha256"},
+        "head_revision": {"const": "f52provisionactivate"},
+        "mode": {"const": "expand-only"},
+        "schema_version": {"const": 6, "type": "integer"},
+        "tenant_catalog_count": {
+          "maximum": 512,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "tenant_catalog_sha256": {"$ref": "#/$defs/sha256"},
+        "tenant_fleet_base_revisions": {
+          "items": false,
+          "maxItems": 1,
+          "minItems": 1,
+          "prefixItems": [
+            {"const": "z2card181nf"}
+          ],
+          "type": "array"
+        },
+        "tenant_schema_revision": {"const": "f52provisionactivate"}
+      },
+      "required": [
+        "control_base_revisions",
+        "control_schema_revision",
+        "database_scope",
+        "fleet_preflight_sha256",
+        "head_revision",
+        "mode",
+        "schema_version",
+        "tenant_catalog_count",
+        "tenant_catalog_sha256",
+        "tenant_fleet_base_revisions",
+        "tenant_schema_revision"
+      ],
+      "type": "object"
+    },
+    "migrationLegacy": {
       "additionalProperties": false,
       "properties": {
         "base_revision": {

@@ -216,3 +216,208 @@ def test_product_builder_rejects_expired_approval(
             kind="api",
             release_sha="1" * 40,
         )
+
+
+def _source_contract(
+    path: Path,
+    files: dict[str, bytes],
+    *,
+    migration_head: str = "f42customerlink",
+) -> None:
+    value = {
+        "artifact_kind": "api",
+        "contract": "tratto-product-source-exact-bytes",
+        "files": {
+            relative: hashlib.sha256(payload).hexdigest()
+            for relative, payload in sorted(files.items())
+        },
+        "migration_head": migration_head,
+        "schema_version": 1,
+    }
+    path.write_bytes(MODULE.SOURCE_CONTRACT.canonical_bytes(value))
+    path.chmod(0o440)
+
+
+def test_guarded_head_requires_controller_owned_exact_source_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(MODULE, "SOURCE_CONTRACT_ROOT", tmp_path / "contracts")
+    approval = {
+        "migration": {
+            "head_revision": "f42customerlink",
+        }
+    }
+    repository = tmp_path / "repository"
+    bundle = tmp_path / "bundle"
+    repository.mkdir()
+    bundle.mkdir()
+
+    with pytest.raises(
+        MODULE.ProductArtifactError,
+        match="controller-owned exact source contract",
+    ):
+        MODULE.validate_exact_product_sources(
+            kind="api",
+            approval=approval,
+            repository_root=repository,
+            bundle_root=bundle,
+        )
+
+
+def test_each_guarded_head_has_a_bounded_head_specific_source_set() -> None:
+    expected_heads = {
+        "f42customerlink",
+        "f51legalpublish",
+        "f52provisionactivate",
+    }
+    assert set(MODULE.REQUIRED_SOURCE_PATHS_BY_MIGRATION_HEAD) == expected_heads
+    for head, paths in MODULE.REQUIRED_SOURCE_PATHS_BY_MIGRATION_HEAD.items():
+        assert paths
+        assert len(paths) <= MODULE.SOURCE_CONTRACT.MAX_FILES, head
+    assert (
+        MODULE.PRODUCTION_LINEAGE_V5_SOURCE_CONTRACT_REQUIRED_PATHS
+        < MODULE.PHYSICAL_PROVISION_V6_SOURCE_CONTRACT_REQUIRED_PATHS
+    )
+    assert (
+        MODULE.COMPONENT.APPROVED_VERSIONED_MIGRATIONS
+        == MODULE.APPROVAL_V2.APPROVED_VERSIONED_MIGRATIONS
+    )
+    approved_heads = {
+        contract["head_revision"]
+        for contract in MODULE.APPROVAL_V2.APPROVED_VERSIONED_MIGRATIONS.values()
+    }
+    assert approved_heads <= set(MODULE.REQUIRED_SOURCE_PATHS_BY_MIGRATION_HEAD)
+
+
+@pytest.mark.parametrize(
+    "migration_head",
+    ("f51legalpublish", "f52provisionactivate"),
+)
+def test_product_release_source_contract_is_canonical_and_complete(
+    migration_head: str,
+) -> None:
+    path = (
+        ROOT
+        / "contracts"
+        / "product-source"
+        / f"{migration_head}.json"
+    )
+    contract, digest = MODULE.SOURCE_CONTRACT.load(path)
+    assert digest == hashlib.sha256(path.read_bytes()).hexdigest()
+    assert contract["migration_head"] == migration_head
+    assert set(contract["files"]) == set(
+        MODULE.REQUIRED_SOURCE_PATHS_BY_MIGRATION_HEAD[migration_head]
+    )
+
+
+def test_physical_provision_source_contract_binds_frozen_f52_bytes() -> None:
+    contract, _ = MODULE.SOURCE_CONTRACT.load(
+        ROOT
+        / "contracts"
+        / "product-source"
+        / "f52provisionactivate.json"
+    )
+    assert contract["files"][
+        "alembic/versions/"
+        "f52provisionactivate_physical_provision_activation.py"
+    ] == "befd098ab4bacd65a977afd077f19a08b1b84534fa3dbfc41ff720814e94206c"
+
+
+def test_unknown_guarded_head_has_no_implicit_empty_source_contract(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(
+        MODULE.ProductArtifactError,
+        match="no controller-owned source contract definition",
+    ):
+        MODULE.validate_exact_product_sources(
+            kind="api",
+            approval={"migration": {"head_revision": "f99unknown"}},
+            repository_root=tmp_path,
+            bundle_root=tmp_path,
+        )
+
+
+def test_builder_rejects_needle_only_payment_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    relative = "app/services/pagamento.py"
+    reviewed = b"def reconcile():\n    return 'safe'\n"
+    fake = b"# return 'safe'\ndef reconcile():\n    return 'post-again'\n"
+    reviewed_files = {
+        path: (reviewed if path == relative else f"{path}\n".encode())
+        for path in MODULE.PAYMENT_SOURCE_CONTRACT_REQUIRED_PATHS
+    }
+    repository = tmp_path / "repository"
+    bundle = tmp_path / "bundle"
+    repository.mkdir()
+    bundle.mkdir()
+    for root in (repository, bundle):
+        for path, payload in reviewed_files.items():
+            write(root / path, fake if path == relative else payload)
+            (root / path).chmod(0o440)
+    contract_root = tmp_path / "contracts"
+    contract_root.mkdir()
+    contract = contract_root / "f42customerlink.json"
+    _source_contract(contract, reviewed_files)
+    monkeypatch.setattr(MODULE, "SOURCE_CONTRACT_ROOT", contract_root)
+
+    with pytest.raises(
+        MODULE.SOURCE_CONTRACT.ProductSourceContractError,
+        match="security-critical source diverges",
+    ):
+        MODULE.validate_exact_product_sources(
+            kind="api",
+            approval={
+                "migration": {
+                    "head_revision": "f42customerlink",
+                }
+            },
+            repository_root=repository,
+            bundle_root=bundle,
+        )
+
+
+def test_guarded_contract_cannot_omit_a_required_payment_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    required = sorted(MODULE.PAYMENT_SOURCE_CONTRACT_REQUIRED_PATHS)
+    omitted = required[-1]
+    files = {path: f"{path}\n".encode() for path in required if path != omitted}
+    repository = tmp_path / "repository"
+    bundle = tmp_path / "bundle"
+    for root in (repository, bundle):
+        root.mkdir()
+        for path, payload in files.items():
+            write(root / path, payload)
+            (root / path).chmod(0o440)
+    contract_root = tmp_path / "contracts"
+    contract_root.mkdir()
+    _source_contract(contract_root / "f42customerlink.json", files)
+    monkeypatch.setattr(MODULE, "SOURCE_CONTRACT_ROOT", contract_root)
+
+    with pytest.raises(
+        MODULE.SOURCE_CONTRACT.ProductSourceContractError,
+        match="omits required security-critical source",
+    ):
+        MODULE.validate_exact_product_sources(
+            kind="api",
+            approval={
+                "migration": {"head_revision": "f42customerlink"}
+            },
+            repository_root=repository,
+            bundle_root=bundle,
+        )
+
+
+def test_web_and_unguarded_api_do_not_select_a_contract(tmp_path: Path) -> None:
+    for kind, head in (("web", "f42customerlink"), ("api", "f29controlexec")):
+        assert MODULE.validate_exact_product_sources(
+            kind=kind,
+            approval={"migration": {"head_revision": head}},
+            repository_root=tmp_path,
+            bundle_root=tmp_path,
+        ) is None
